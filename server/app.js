@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const { meetingsRouter } = require('./lib/meetings');
 
 function createApp({ db, auth }) {
   const app = express();
@@ -25,7 +26,7 @@ function createApp({ db, auth }) {
   });
   app.use('/api', auth);
 
-  // API routers are mounted here (Task 5).
+  if (db) app.use('/api', meetingsRouter(db));
 
   app.use((err, _req, res, _next) => {
     console.error(err);

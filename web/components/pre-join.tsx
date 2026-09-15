@@ -114,7 +114,11 @@ export function PreJoin({ code, onJoin }: Props) {
     };
   }, [api, code]);
 
+  // Only ask for the camera once the meeting exists and can still be joined.
+  const canPreview = load.status === 'ready' && load.meeting.status !== 'ended';
+
   useEffect(() => {
+    if (!canPreview) return;
     let cancelled = false;
     let acquired: MediaStream | null = null;
     // Wrapped in a promise so a missing mediaDevices API becomes a normal rejection.
@@ -138,7 +142,7 @@ export function PreJoin({ code, onJoin }: Props) {
       cancelled = true;
       acquired?.getTracks().forEach((t) => t.stop());
     };
-  }, []);
+  }, [canPreview]);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = stream;

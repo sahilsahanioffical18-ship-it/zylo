@@ -32,7 +32,7 @@ export function useApi() {
           },
         });
       } catch {
-        throw new ApiError(0, `Can't reach the ${brand.product} server. Check that it's running.`);
+        throw new ApiError(0, `Can’t reach the ${brand.product} server. Check that it’s running.`);
       }
       if (res.status === 204) return undefined as T;
       const body = await res.json().catch(() => ({}));

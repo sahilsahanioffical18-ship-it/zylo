@@ -1,0 +1,21 @@
+{
+  "name": "zylo-server",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@clerk/express": "^2.1.67",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  }
+}

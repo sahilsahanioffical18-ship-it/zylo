@@ -1,3 +1,7 @@
+> **Zylo status (2026-09-15):** this file is the original CoThink planning note, kept for history.
+> The build now follows [`superpowers/specs/2026-09-14-zylo-design.md`](superpowers/specs/2026-09-14-zylo-design.md).
+> **Phase 1 (sign-in, dashboard, meetings API, pre-join) is complete.** Phase numbering below is the old one.
+
 # CoThink — Build Plan
 
 > **How this differs from `architecture.md`:** that document explains *why* the

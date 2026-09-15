@@ -1,3 +1,7 @@
+> **Zylo status (2026-09-15):** superseded by [`superpowers/specs/2026-09-14-zylo-design.md`](superpowers/specs/2026-09-14-zylo-design.md).
+> What is built today: Clerk sign-in, Express 5 meetings API on PostgreSQL, and the Next.js dashboard and pre-join.
+> No peer-to-peer calls: every ZyloRoom will run on LiveKit. PDF summaries were removed from scope.
+
 # CoThink — Architecture & Build Spec (Resume-Scale Edition)
 
 > This document is written to be executed, not just read. If you are an AI coding

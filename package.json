@@ -1,0 +1,11 @@
+{
+  "name": "zylo",
+  "private": true,
+  "scripts": {
+    "db:up": "docker compose up -d --wait db",
+    "db:down": "docker compose down",
+    "dev:server": "npm --prefix server run dev",
+    "dev:web": "npm --prefix web run dev",
+    "dev": "npm run dev:server & npm run dev:web"
+  }
+}

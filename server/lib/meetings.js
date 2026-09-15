@@ -49,7 +49,7 @@ function meetingsRouter(db) {
           OR EXISTS (SELECT 1 FROM meeting_invites i
                      WHERE i.meeting_id = m.id AND i.email = (SELECT email FROM users WHERE id = $1))
           OR EXISTS (SELECT 1 FROM meeting_participants p WHERE p.meeting_id = m.id AND p.user_id = $1)
-       ORDER BY COALESCE(m.ended_at, m.scheduled_for, m.created_at) DESC
+       ORDER BY (m.ended_at IS NULL) DESC, COALESCE(m.ended_at, m.scheduled_for, m.created_at) DESC
        LIMIT 200`,
       [req.userId],
     );

@@ -2,9 +2,15 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useUser } from '@clerk/nextjs';
+import { CalendarClock, LogIn, PhoneCall } from 'lucide-react';
 import { toast } from 'sonner';
+import { JoinWithCode } from '@/components/join-with-code';
 import { MeetingsSection } from '@/components/meetings-section';
+import { ScheduleDialog } from '@/components/schedule-dialog';
+import { StartZyloCallButton } from '@/components/start-zylocall-button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { useApi } from '@/lib/api';
+import { brand } from '@/lib/brand';
 import type { Dashboard } from '@/lib/types';
 
 function greeting(hour: number) {
@@ -62,7 +68,44 @@ export function DashboardView() {
         </p>
       </div>
 
-      {/* ACTION-ROW */}
+      <section aria-label="Start or join a meeting" className="grid gap-4 md:grid-cols-3">
+        <Card>
+          <CardHeader className="space-y-2">
+            <span className="grid size-10 place-items-center rounded-xl bg-primary text-primary-foreground">
+              <PhoneCall className="size-5" aria-hidden="true" />
+            </span>
+            <CardTitle className="text-base font-bold">{brand.call}</CardTitle>
+            <CardDescription>Start an instant meeting and share the link.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <StartZyloCallButton />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="space-y-2">
+            <span className="grid size-10 place-items-center rounded-xl bg-accent text-accent-foreground">
+              <CalendarClock className="size-5" aria-hidden="true" />
+            </span>
+            <CardTitle className="text-base font-bold">{brand.meet}</CardTitle>
+            <CardDescription>Schedule for later and invite people by email.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ScheduleDialog onScheduled={() => void load()} />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="space-y-2">
+            <span className="grid size-10 place-items-center rounded-xl bg-accent text-accent-foreground">
+              <LogIn className="size-5" aria-hidden="true" />
+            </span>
+            <CardTitle className="text-base font-bold">Join with code</CardTitle>
+            <CardDescription>Enter a code or paste a meeting link.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <JoinWithCode />
+          </CardContent>
+        </Card>
+      </section>
 
       <MeetingsSection
         dashboard={dashboard}

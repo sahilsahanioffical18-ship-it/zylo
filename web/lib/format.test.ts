@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatDuration, formatWhen, initials, normalizeCode } from './format.ts';
+import { formatDuration, formatWhen, initials, normalizeCode, parseInviteEmails, toDateTimeLocalValue } from './format.ts';
 
 const now = new Date('2026-09-15T10:00:00Z');
 const opts = ['en-US', 'UTC'] as const;
@@ -31,4 +31,16 @@ test('initials', () => {
   assert.equal(initials('sam'), 'S');
   assert.equal(initials('  Ana Maria Lopez '), 'AL');
   assert.equal(initials(''), '?');
+});
+
+test('toDateTimeLocalValue pads local date and time', () => {
+  assert.equal(toDateTimeLocalValue(new Date(2026, 8, 5, 7, 3)), '2026-09-05T07:03');
+});
+
+test('parseInviteEmails splits, lowercases, de-duplicates and flags invalid entries', () => {
+  assert.deepEqual(parseInviteEmails(' Priya@Example.com, sam@example.org;priya@example.com\nnot-an-email '), {
+    emails: ['priya@example.com', 'sam@example.org', 'not-an-email'],
+    invalid: ['not-an-email'],
+  });
+  assert.deepEqual(parseInviteEmails('   '), { emails: [], invalid: [] });
 });

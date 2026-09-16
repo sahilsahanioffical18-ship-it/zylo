@@ -8,9 +8,9 @@ function clerkConfigured() {
 // picked up on the next server restart. Add a Clerk webhook if that ever matters.
 const syncedUsers = new Set();
 
-async function ensureUser(db, userId, fetchUser = (id) => clerkClient.users.getUser(id)) {
+async function ensureUser(db, userId) {
   if (syncedUsers.has(userId)) return;
-  const user = await fetchUser(userId);
+  const user = await clerkClient.users.getUser(userId);
   const email = user.primaryEmailAddress?.emailAddress?.toLowerCase();
   // The Clerk app only allows Email and Google sign-in, so every user has an email.
   if (!email) throw new Error(`Clerk user ${userId} has no primary email`);

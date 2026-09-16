@@ -29,8 +29,11 @@ function createApp({ db, auth }) {
   if (db) app.use('/api', meetingsRouter(db));
 
   app.use((err, _req, res, _next) => {
-    console.error(err);
-    res.status(500).json({ error: 'Something went wrong on the server.' });
+    const status = err.status || err.statusCode || 500;
+    if (status >= 500) console.error(err);
+    res.status(status).json({
+      error: status < 500 ? 'That request could not be read.' : 'Something went wrong on the server.',
+    });
   });
 
   return app;

@@ -77,7 +77,7 @@ export function MeetingRow({ meeting, onCancel }: { meeting: MeetingCard; onCanc
       </div>
 
       {shown.length > 0 && (
-        <div className="flex -space-x-2" aria-label={`${meeting.participants.length} participants`}>
+        <div className="flex -space-x-2" role="img" aria-label={`${meeting.participants.length} participants`}>
           {shown.map((p, i) => (
             <Avatar key={`${p.name}-${i}`} className="size-8 ring-2 ring-card">
               {p.imageUrl && <AvatarImage src={p.imageUrl} alt="" />}
@@ -135,10 +135,7 @@ export function MeetingRow({ meeting, onCancel }: { meeting: MeetingCard; onCanc
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Keep meeting</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={() => onCancel(meeting.id)}
-            >
+            <AlertDialogAction variant="destructive" onClick={() => onCancel(meeting.id)}>
               Cancel meeting
             </AlertDialogAction>
           </AlertDialogFooter>

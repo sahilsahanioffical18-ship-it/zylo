@@ -61,3 +61,15 @@ test('/api returns 401 without a session token', () =>
       await close();
     },
   ));
+
+test('malformed JSON body returns 400, not 500', async () => {
+  const { base, close } = await listen(createApp({ db: fakeDb, auth: (_req, _res, next) => next() }));
+  const res = await fetch(`${base}/api/meetings`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{not json',
+  });
+  assert.equal(res.status, 400);
+  assert.equal(typeof (await res.json()).error, 'string');
+  await close();
+});

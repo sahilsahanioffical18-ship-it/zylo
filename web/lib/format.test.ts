@@ -24,6 +24,8 @@ test('normalizeCode accepts codes and links, rejects junk', () => {
   assert.equal(normalizeCode('http://localhost:3000/m/abc-defg-hij'), 'abc-defg-hij');
   assert.equal(normalizeCode('abc-def-ghi'), null);
   assert.equal(normalizeCode(''), null);
+  assert.equal(normalizeCode('abcd-defg-hijk'), null);
+  assert.equal(normalizeCode('xabc-defg-hijz'), null);
 });
 
 test('initials', () => {

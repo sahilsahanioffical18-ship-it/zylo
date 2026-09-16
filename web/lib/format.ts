@@ -26,8 +26,8 @@ export function formatDuration(startIso: string, endIso: string): string {
 }
 
 export function normalizeCode(input: string): string | null {
-  const match = input.trim().toLowerCase().match(/[a-z]{3}-[a-z]{4}-[a-z]{3}/);
-  return match ? match[0] : null;
+  const segment = input.trim().toLowerCase().split(/[/?#]/).pop() ?? '';
+  return /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(segment) ? segment : null;
 }
 
 export function initials(name: string): string {

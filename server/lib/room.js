@@ -136,6 +136,18 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
     liveMeetings.delete(meetingId);
   }
 
+  // Every host-only event runs through this. Authorization is a server check:
+  // whether the client renders the button is irrelevant.
+  function hostGuard(socket) {
+    const { meetingId, userId } = socket.data;
+    const meta = meetingId ? liveMeetings.get(meetingId) : null;
+    if (!meta || meta.hostId !== userId) {
+      socket.emit('error:forbidden');
+      return null;
+    }
+    return { meetingId, meta };
+  }
+
   // Socket.IO does not catch rejections from async handlers, and one unhandled
   // rejection would take the process down. One wrapper covers every handler.
   const on = (socket, event, handler) =>
@@ -194,6 +206,69 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       socket.disconnect(true);
     });
 
+    on(socket, 'lobby:admit', async ({ userId } = {}, ack) => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      const { meetingId, meta } = guard;
+      const entry = seats.queuedEntries(meetingId).find((e) => e.userId === userId);
+      if (!entry) return ack?.({ ok: false, reason: 'gone' });
+
+      const result = seats.tryTakeSeat(meetingId, { ...entry, isHost: false, max: meta.maxParticipants });
+      // Full: the host is told, and the person keeps their place in the lobby so
+      // they can be admitted when a seat frees.
+      if (!result.ok) return ack?.({ ok: false, reason: 'full' });
+
+      seats.removeFromQueue(meetingId, userId);
+      const waiting = io.sockets.sockets.get(entry.socketId);
+      if (!waiting) {
+        seats.releaseSeat(meetingId, userId, { immediate: true });
+        broadcastLobby(meetingId);
+        return ack?.({ ok: false, reason: 'gone' });
+      }
+      await admit(waiting, meetingId, false, result);
+      ack?.({ ok: true });
+      broadcastPresence(meetingId);
+      broadcastLobby(meetingId);
+    });
+
+    on(socket, 'lobby:deny', ({ userId } = {}) => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      const { meetingId } = guard;
+      const entry = seats.queuedEntries(meetingId).find((e) => e.userId === userId);
+      if (!entry) return;
+      seats.removeFromQueue(meetingId, userId);
+      const waiting = io.sockets.sockets.get(entry.socketId);
+      if (waiting) {
+        waiting.data.meetingId = null;
+        waiting.emit('meeting:denied', { reason: 'denied' });
+      }
+      broadcastLobby(meetingId);
+    });
+
+    on(socket, 'host:set-admission', async ({ mode } = {}) => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      const { meetingId, meta } = guard;
+      // The host is authenticated, so a malformed payload is a client bug, not an
+      // authorization failure: ignore it rather than emit error:forbidden.
+      if (mode !== 'auto' && mode !== 'manual') return;
+
+      meta.admission = mode;
+      await db.query('UPDATE meetings SET admission = $1 WHERE id = $2', [mode, meetingId]);
+      io.to(roomChannel(meetingId)).emit('meeting:settings', {
+        admission: mode,
+        screenSharePolicy: meta.screenSharePolicy,
+      });
+      if (mode === 'auto') {
+        for (const entry of seats.drainQueue(meetingId, meta.maxParticipants)) {
+          await admitDrained(entry, meetingId);
+        }
+        broadcastPresence(meetingId);
+      }
+      broadcastLobby(meetingId);
+    });
+
     on(socket, 'disconnect', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
@@ -214,4 +289,10 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
   });
 }
 
-module.exports = { registerRoomHandlers, roomChannel };
+// Seat state lives in memory, so anything still marked started-but-not-ended
+// belongs to a process that is gone. Run once on boot.
+async function closeStaleMeetings(db) {
+  await db.query('UPDATE meetings SET ended_at = now() WHERE started_at IS NOT NULL AND ended_at IS NULL');
+}
+
+module.exports = { registerRoomHandlers, closeStaleMeetings, roomChannel };

@@ -93,6 +93,8 @@ avatar, with audio always on.
 | `--destructive` (Leave / End / Kick) | `#DC2626` | `#FFFFFF` |
 | `--ring` | `#6366F1` | — |
 
+> **Implemented deviation (Phase 1):** shadcn's `--accent` is the hover/selected surface (`#e0e7ff` light, primary tint dark); the design system's green CTA and amber are exposed as `--success` and `--warning` tokens instead. See `web/app/globals.css`.
+
 **Dark palette** (ZyloRoom, which is always dark like Meet/Zoom, and the dashboard's dark mode):
 plugin dark palette with the **same indigo + green pair** on slate. It's filed under the plugin's
 "Fasting timer" product, but was chosen only because its brand colors match exactly.

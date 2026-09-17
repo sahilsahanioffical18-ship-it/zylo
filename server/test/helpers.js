@@ -1,6 +1,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createDb } = require('../lib/db');
+const http = require('node:http');
+const { Server } = require('socket.io');
+const { io: ioClient } = require('socket.io-client');
 
 async function listen(app) {
   const server = app.listen(0);
@@ -24,4 +27,62 @@ async function setupTestDb() {
   return db;
 }
 
-module.exports = { listen, fakeAuth, setupTestDb };
+// Test-only socket auth: trusts the handshake's userId. Production always uses
+// clerkSocketAuth.
+function fakeSocketAuth(socket, next) {
+  const userId = socket.handshake.auth?.userId;
+  if (!userId) return next(new Error('Sign in required.'));
+  socket.data.userId = userId;
+  next();
+}
+
+async function startSocketServer(configureIo) {
+  const httpServer = http.createServer();
+  const io = new Server(httpServer);
+  configureIo(io);
+  httpServer.listen(0);
+  await new Promise((resolve) => httpServer.once('listening', resolve));
+  return {
+    url: `http://127.0.0.1:${httpServer.address().port}`,
+    close: () =>
+      new Promise((resolve) => {
+        io.close();
+        httpServer.close(resolve);
+      }),
+  };
+}
+
+function connectClient(url, userId) {
+  return ioClient(url, { auth: { userId }, forceNew: true, transports: ['websocket'] });
+}
+
+function waitForEvent(socket, event) {
+  return new Promise((resolve) => socket.once(event, resolve));
+}
+
+function insertUser(db, { id, email, name, imageUrl = null }) {
+  return db.query(
+    `INSERT INTO users (id, email, name, image_url) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (id) DO NOTHING`,
+    [id, email, name, imageUrl],
+  );
+}
+
+function insertMeeting(db, { id, hostId, title = 'ZyloCall', admission = 'auto', maxParticipants = 20 }) {
+  return db.query(
+    `INSERT INTO meetings (id, host_id, title, admission, max_participants) VALUES ($1, $2, $3, $4, $5)`,
+    [id, hostId, title, admission, maxParticipants],
+  );
+}
+
+module.exports = {
+  listen,
+  fakeAuth,
+  setupTestDb,
+  fakeSocketAuth,
+  startSocketServer,
+  connectClient,
+  waitForEvent,
+  insertUser,
+  insertMeeting,
+};

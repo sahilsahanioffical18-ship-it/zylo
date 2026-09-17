@@ -1,4 +1,4 @@
-const { clerkMiddleware, getAuth, clerkClient } = require('@clerk/express');
+const { clerkMiddleware, getAuth, clerkClient, verifyToken } = require('@clerk/express');
 
 function clerkConfigured() {
   return Boolean(process.env.CLERK_SECRET_KEY && process.env.CLERK_PUBLISHABLE_KEY);
@@ -41,4 +41,28 @@ function clerkAuth({ db }) {
   return [verifySession, requireUser];
 }
 
-module.exports = { clerkAuth, ensureUser };
+// The socket twin of clerkAuth. Socket.IO has no Express req, so the client puts
+// a fresh short-lived Clerk token in the handshake and we verify it by hand.
+function clerkSocketAuth({ db }) {
+  if (!clerkConfigured()) {
+    return (_socket, next) =>
+      next(new Error('Auth is not configured on the server (CLERK_SECRET_KEY / CLERK_PUBLISHABLE_KEY).'));
+  }
+  return async (socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error('Sign in required.'));
+    try {
+      const { sub: userId } = await verifyToken(token, {
+        secretKey: process.env.CLERK_SECRET_KEY,
+        authorizedParties: [process.env.CLIENT_ORIGIN || 'http://localhost:3000'],
+      });
+      await ensureUser(db, userId);
+      socket.data.userId = userId;
+      next();
+    } catch {
+      next(new Error('Sign in required.'));
+    }
+  };
+}
+
+module.exports = { clerkAuth, clerkSocketAuth, ensureUser };

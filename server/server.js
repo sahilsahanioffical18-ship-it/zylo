@@ -1,12 +1,16 @@
 require('dotenv').config({ quiet: true });
 
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
+const { Server } = require('socket.io');
 const { createApp } = require('./app');
 const { createDb } = require('./lib/db');
-const { clerkAuth } = require('./lib/auth');
+const { clerkAuth, clerkSocketAuth } = require('./lib/auth');
+const { registerRoomHandlers, closeStaleMeetings } = require('./lib/room');
 
 const PORT = Number(process.env.PORT) || 4000;
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:3000';
 
 async function main() {
   const db = createDb(process.env.DATABASE_URL);
@@ -18,13 +22,21 @@ async function main() {
   if (db) {
     try {
       await db.query(fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8'));
+      // A crash leaves meetings marked live; in-memory seats did not survive it.
+      await closeStaleMeetings(db);
     } catch (err) {
       console.warn(`WARNING: could not apply db/schema.sql (${err.message}). Is Postgres running? Try: npm run db:up`);
     }
   }
 
   const app = createApp({ db, auth: clerkAuth({ db }) });
-  app.listen(PORT, () => console.log(`Zylo API listening on :${PORT}`));
+  const httpServer = http.createServer(app);
+  const io = new Server(httpServer, { cors: { origin: CLIENT_ORIGIN } });
+  io.use(clerkSocketAuth({ db }));
+  if (db) registerRoomHandlers(io, { db });
+  else console.warn('WARNING: DATABASE_URL is not set — ZyloRoom sockets will refuse every join request.');
+
+  httpServer.listen(PORT, () => console.log(`Zylo API listening on :${PORT}`));
 }
 
 main();

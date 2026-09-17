@@ -1,0 +1,95 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useAuth } from '@clerk/nextjs';
+import { io, type Socket } from 'socket.io-client';
+import { toast } from 'sonner';
+import { SERVER_URL } from '@/lib/api';
+import { brand } from '@/lib/brand';
+import type { Admission } from '@/lib/types';
+
+export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean };
+export type LobbyEntry = { userId: string; name: string; imageUrl: string | null };
+export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied';
+
+export type MeetingState =
+  | { status: 'connecting' }
+  | { status: 'offline' }
+  | { status: 'waiting'; position: number; manual: boolean }
+  | { status: 'admitted'; people: Person[] }
+  | { status: 'denied'; reason: DeniedReason }
+  | { status: 'replaced' };
+
+type AdmitAck = { ok: boolean; reason?: 'full' | 'gone' };
+
+/**
+ * Joins a ZyloRoom over Socket.IO. Pass `null` while the user is still on the
+ * pre-join screen: no socket opens, so nobody takes a seat before pressing Join.
+ */
+export function useMeeting(meetingId: string | null) {
+  const { getToken } = useAuth();
+  const socketRef = useRef<Socket | null>(null);
+  const [state, setState] = useState<MeetingState>({ status: 'connecting' });
+  const [lobby, setLobby] = useState<LobbyEntry[]>([]);
+  const [admission, setAdmission] = useState<Admission | null>(null);
+
+  useEffect(() => {
+    if (!meetingId) return;
+    // Deferred a tick so this reset isn't a synchronous setState-in-effect
+    // (matches the async-callback pattern the rest of this codebase uses).
+    Promise.resolve().then(() => {
+      setState({ status: 'connecting' });
+      setLobby([]);
+    });
+
+    const socket = io(SERVER_URL, {
+      // The callback form runs again on every reconnect, so the server always
+      // gets a fresh short-lived Clerk token instead of an expired one.
+      auth: (cb) => {
+        getToken().then((token) => cb({ token: token ?? '' }));
+      },
+    });
+    socketRef.current = socket;
+
+    socket.on('connect', () => socket.emit('meeting:join-request', { meetingId }));
+    // The server is down or the token was refused. Never dress this up as a
+    // missing meeting — socket.io keeps retrying, and 'connect' recovers us.
+    socket.on('connect_error', () => setState({ status: 'offline' }));
+    socket.on('meeting:waiting', ({ position, manual }: { position: number; manual: boolean }) =>
+      setState({ status: 'waiting', position, manual }),
+    );
+    // room:presence always follows meeting:admitted and carries the roster, so it
+    // is what flips us into the room — admitted on its own would render empty.
+    socket.on('room:presence', ({ people }: { people: Person[] }) => setState({ status: 'admitted', people }));
+    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => setState({ status: 'denied', reason }));
+    socket.on('meeting:replaced', () => setState({ status: 'replaced' }));
+    socket.on('lobby:update', ({ waiting }: { waiting: LobbyEntry[] }) => setLobby(waiting));
+    socket.on('meeting:settings', (settings: { admission: Admission }) => setAdmission(settings.admission));
+
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [meetingId, getToken]);
+
+  const leave = useCallback(() => {
+    socketRef.current?.emit('meeting:leave');
+  }, []);
+
+  const admitFromLobby = useCallback((userId: string) => {
+    socketRef.current?.emit('lobby:admit', { userId }, (ack?: AdmitAck) => {
+      if (!ack || ack.ok) return;
+      toast.error(ack.reason === 'full' ? `${brand.room} is full.` : 'They already left the lobby.');
+    });
+  }, []);
+
+  const denyFromLobby = useCallback((userId: string) => {
+    socketRef.current?.emit('lobby:deny', { userId });
+  }, []);
+
+  const setAdmissionMode = useCallback((mode: Admission) => {
+    socketRef.current?.emit('host:set-admission', { mode });
+  }, []);
+
+  return { state, lobby, admission, leave, admitFromLobby, denyFromLobby, setAdmissionMode };
+}

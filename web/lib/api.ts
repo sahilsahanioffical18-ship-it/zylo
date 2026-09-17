@@ -4,7 +4,7 @@ import { useCallback } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import { brand } from '@/lib/brand';
 
-const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL ?? 'http://localhost:4000';
+export const SERVER_URL = process.env.NEXT_PUBLIC_SERVER_URL ?? 'http://localhost:4000';
 
 export class ApiError extends Error {
   status: number;

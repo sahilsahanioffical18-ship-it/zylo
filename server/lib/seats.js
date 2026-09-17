@@ -91,6 +91,11 @@ function enqueue(meetingId, { userId, socketId, name, imageUrl }) {
   return s.queue.length;
 }
 
+function queueSocketId(meetingId, userId) {
+  const s = meetings.get(meetingId);
+  return s?.queue.find((e) => e.userId === userId)?.socketId ?? null;
+}
+
 function removeFromQueue(meetingId, userId) {
   const s = meetings.get(meetingId);
   if (!s) return false;
@@ -141,6 +146,7 @@ module.exports = {
   listSeats,
   releaseSeat,
   enqueue,
+  queueSocketId,
   removeFromQueue,
   queuePosition,
   queuedEntries,

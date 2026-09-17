@@ -197,9 +197,12 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
     on(socket, 'disconnect', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
-      if (seats.removeFromQueue(meetingId, userId)) broadcastLobby(meetingId);
-      // A newer connection may already hold this seat (two tabs). Never pull it
-      // out from under them.
+      // A newer connection may already hold this queue entry (two tabs). Never
+      // pull it out from under them.
+      if (seats.queueSocketId(meetingId, userId) === socket.id && seats.removeFromQueue(meetingId, userId)) {
+        broadcastLobby(meetingId);
+      }
+      // Same guard for the seat itself.
       if (seats.seatSocketId(meetingId, userId) !== socket.id) return;
       seats.releaseSeat(meetingId, userId, {
         graceMs,

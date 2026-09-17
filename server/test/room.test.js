@@ -222,3 +222,52 @@ test('a removed user cannot rejoin', async (t) => {
   c.emit('meeting:join-request', { meetingId });
   assert.deepEqual(await denied, { reason: 'removed' });
 });
+
+test('a stale tab dropping out of the queue does not evict a newer tab for the same user', async (t) => {
+  const db = await setupTestDb();
+  // max 2 so host + p1 fill the room's one non-host slot, putting p2 in the queue.
+  const { meetingId, server } = await scenario(db, { maxParticipants: 2 });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  for (const userId of ['host', 'p1']) {
+    const c = connectClient(server.url, userId);
+    clients.push(c);
+    const admitted = waitForEvent(c, 'meeting:admitted');
+    c.emit('meeting:join-request', { meetingId });
+    await admitted;
+  }
+  const [, p1] = clients;
+
+  // p2 opens tab A and queues, then opens tab B for the same account while still
+  // queued — enqueue() refreshes the one queue entry in place, so it now points
+  // at tab B's socket even though tab A is still connected.
+  const tabA = connectClient(server.url, 'p2');
+  clients.push(tabA);
+  const waitingA = waitForEvent(tabA, 'meeting:waiting');
+  tabA.emit('meeting:join-request', { meetingId });
+  await waitingA;
+
+  const tabB = connectClient(server.url, 'p2');
+  clients.push(tabB);
+  const waitingB = waitForEvent(tabB, 'meeting:waiting');
+  tabB.emit('meeting:join-request', { meetingId });
+  await waitingB;
+
+  // Tab A's now-stale connection drops (a network blip finally timing out).
+  // It must not evict tab B's queue entry.
+  tabA.disconnect();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(seats.queuedEntries(meetingId).length, 1);
+  assert.equal(seats.queueSocketId(meetingId, 'p2'), tabB.id);
+
+  // When a seat frees, tab B — not the dropped tab A — is the one admitted.
+  const admittedB = waitForEvent(tabB, 'meeting:admitted');
+  p1.emit('meeting:leave');
+  await admittedB;
+});

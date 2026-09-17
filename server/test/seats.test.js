@@ -51,6 +51,16 @@ test('the queue hands out FIFO positions and shifts as people are admitted', () 
   seats.clearMeeting(id);
 });
 
+test('queueSocketId reports the current entry, refreshed by re-enqueuing', () => {
+  const id = 'm-queue-socket';
+  assert.equal(seats.queueSocketId(id, 'u1'), null); // not queued at all
+  seats.enqueue(id, person(1));
+  assert.equal(seats.queueSocketId(id, 'u1'), 's1');
+  seats.enqueue(id, { ...person(1), socketId: 's1b' });
+  assert.equal(seats.queueSocketId(id, 'u1'), 's1b');
+  seats.clearMeeting(id);
+});
+
 test('manual to auto: draining admits in order until seats run out', () => {
   const id = 'm-drain';
   seats.tryTakeSeat(id, { ...person(1), isHost: true, max: 4 });

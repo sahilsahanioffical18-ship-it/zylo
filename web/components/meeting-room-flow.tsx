@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { useUser } from '@clerk/nextjs';
 import { Loader2 } from 'lucide-react';
 import { Notice, PreJoin } from '@/components/pre-join';
@@ -30,6 +31,7 @@ const DENIED_COPY: Record<DeniedReason, { title: string; text: string }> = {
 };
 
 export function MeetingRoomFlow({ code }: { code: string }) {
+  const router = useRouter();
   const { user } = useUser();
   const [meeting, setMeeting] = useState<MeetingCard | null>(null);
   // The socket only opens once Join is pressed, so nobody takes a seat while
@@ -37,6 +39,15 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   const { state, lobby, admission, leave, admitFromLobby, denyFromLobby, setAdmissionMode } = useMeeting(
     meeting ? code : null,
   );
+
+  // Tells the server first (releases the seat), then tears down locally right
+  // away rather than waiting on a socket round-trip: setting meeting to null
+  // unmounts useMeeting's effect, which disconnects the socket in cleanup.
+  function handleLeave() {
+    leave();
+    setMeeting(null);
+    router.push('/dashboard');
+  }
 
   if (!meeting) return <PreJoin code={code} onJoin={(loaded) => setMeeting(loaded)} />;
 
@@ -69,7 +80,7 @@ export function MeetingRoomFlow({ code }: { code: string }) {
     );
   }
   if (state.status === 'waiting') {
-    return <WaitingCard manual={state.manual} position={state.position} onLeave={leave} />;
+    return <WaitingCard manual={state.manual} position={state.position} onLeave={handleLeave} />;
   }
 
   return (
@@ -83,7 +94,7 @@ export function MeetingRoomFlow({ code }: { code: string }) {
       onAdmit={admitFromLobby}
       onDeny={denyFromLobby}
       onSetAdmission={setAdmissionMode}
-      onLeave={leave}
+      onLeave={handleLeave}
     />
   );
 }

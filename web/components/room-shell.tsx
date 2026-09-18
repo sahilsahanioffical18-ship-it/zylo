@@ -15,7 +15,7 @@ import type { LobbyEntry, Person } from '@/lib/use-meeting';
 // Phase 3, and the mic / camera / ZyloLive / ZyloChat controls arrive with it.
 function Tile({ person }: { person: Person }) {
   return (
-    <div className="relative grid min-h-40 place-items-center rounded-2xl border border-border bg-card">
+    <div className="relative grid aspect-video place-items-center rounded-2xl border border-border bg-card">
       <span className="grid size-20 place-items-center rounded-full bg-muted text-2xl font-bold text-muted-foreground">
         {initials(person.name)}
       </span>
@@ -77,7 +77,7 @@ export function RoomShell({
       <div className="flex min-h-0 flex-1 gap-4 p-4">
         <main
           aria-label={`${brand.room} stage`}
-          className="grid min-h-0 flex-1 auto-rows-fr grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
+          className="grid min-h-0 flex-1 auto-rows-max content-center grid-cols-1 gap-4 overflow-y-auto sm:grid-cols-2 lg:grid-cols-3"
         >
           {people.map((person) => (
             <Tile key={person.userId} person={person} />

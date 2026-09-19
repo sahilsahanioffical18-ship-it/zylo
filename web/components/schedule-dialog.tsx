@@ -13,11 +13,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog';
-import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field';
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Textarea } from '@/components/ui/textarea';
+import { ADMISSION_OPTIONS, ChoiceGroup } from '@/components/choice-group';
 import { useApi } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { parseInviteEmails, toDateTimeLocalValue } from '@/lib/format';
@@ -32,41 +31,6 @@ function nextHalfHour(): Date {
   const date = new Date();
   date.setMinutes(date.getMinutes() < 30 ? 30 : 60, 0, 0);
   return date;
-}
-
-function ChoiceGroup<T extends string>({
-  legend,
-  name,
-  value,
-  onChange,
-  options,
-}: {
-  legend: string;
-  name: string;
-  value: T;
-  onChange: (value: T) => void;
-  options: { value: T; label: string; hint: string }[];
-}) {
-  return (
-    <FieldSet>
-      <FieldLegend>{legend}</FieldLegend>
-      <RadioGroup value={value} onValueChange={(v) => onChange(v as T)} className="grid gap-2 sm:grid-cols-2">
-        {options.map((option) => (
-          <Label
-            key={option.value}
-            htmlFor={`${name}-${option.value}`}
-            className="flex cursor-pointer items-start gap-3 rounded-lg border border-border p-3 transition-colors duration-150 has-data-[state=checked]:border-primary has-data-[state=checked]:bg-accent"
-          >
-            <RadioGroupItem id={`${name}-${option.value}`} value={option.value} className="mt-0.5" />
-            <span className="space-y-0.5">
-              <span className="block font-semibold">{option.label}</span>
-              <span className="block text-xs font-normal text-muted-foreground">{option.hint}</span>
-            </span>
-          </Label>
-        ))}
-      </RadioGroup>
-    </FieldSet>
-  );
 }
 
 export function ScheduleDialog({ onScheduled }: { onScheduled: () => void }) {
@@ -192,10 +156,7 @@ export function ScheduleDialog({ onScheduled }: { onScheduled: () => void }) {
               name="admission"
               value={admission}
               onChange={setAdmission}
-              options={[
-                { value: 'auto', label: 'Join instantly', hint: 'People enter until the room is full.' },
-                { value: 'manual', label: 'Host admits', hint: 'People wait in the lobby for you.' },
-              ]}
+              options={ADMISSION_OPTIONS}
             />
 
             <ChoiceGroup

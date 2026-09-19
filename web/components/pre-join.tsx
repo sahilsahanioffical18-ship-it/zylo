@@ -20,7 +20,10 @@ type LoadState =
   | { status: 'ready'; meeting: MeetingCard }
   | { status: 'error'; notFound: boolean; message: string };
 
-type Props = { code: string; onJoin?: (prefs: { micOn: boolean; camOn: boolean }) => void };
+type Props = {
+  code: string;
+  onJoin: (meeting: MeetingCard, prefs: { micOn: boolean; camOn: boolean }) => void;
+};
 
 function mediaErrorMessage(err: unknown): string {
   const name = err instanceof DOMException ? err.name : '';
@@ -30,7 +33,7 @@ function mediaErrorMessage(err: unknown): string {
   return `This browser can’t use a camera on this page. Open ${brand.product} over HTTPS or on localhost.`;
 }
 
-function Notice({ title, text }: { title: string; text: string }) {
+export function Notice({ title, text }: { title: string; text: string }) {
   return (
     <main className="flex min-h-dvh flex-col items-center justify-center gap-6 px-4 text-center">
       <ZyloLogo href="/dashboard" />
@@ -238,20 +241,13 @@ export function PreJoin({ code, onJoin }: Props) {
               Joining as <span className="font-semibold text-foreground">{name}</span>
             </p>
 
-            <div className="space-y-2">
-              <Button
-                className="h-12 w-full text-base"
-                disabled={!meeting || !onJoin}
-                onClick={() => onJoin?.({ micOn, camOn })}
-              >
-                Join {brand.room}
-              </Button>
-              {!onJoin && (
-                <p className="text-center text-sm text-muted-foreground">
-                  Joining a {brand.room} arrives with admission and seats (Phase 2).
-                </p>
-              )}
-            </div>
+            <Button
+              className="h-12 w-full text-base"
+              disabled={!meeting}
+              onClick={() => meeting && onJoin(meeting, { micOn, camOn })}
+            >
+              Join {brand.room}
+            </Button>
 
             <Button asChild variant="ghost" className="h-11 w-full">
               <Link href="/dashboard">Back to dashboard</Link>

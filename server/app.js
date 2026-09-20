@@ -2,22 +2,28 @@ const express = require('express');
 const cors = require('cors');
 const { meetingsRouter } = require('./lib/meetings');
 
-function createApp({ db, auth }) {
+// Both probes mean "can we actually reach it", not "is it configured" — a
+// health endpoint that calls a configured-but-dead dependency healthy is a lie
+// that costs an operator an hour.
+// ponytail: neither probe has a timeout, matching the existing SELECT 1. If a
+// wedged dependency ever hangs the probe, wrap both in
+// Promise.race([p, AbortSignal.timeout(1000)]).
+async function reachable(probe) {
+  if (!probe) return false;
+  try { await probe(); return true; } catch { return false; }
+}
+
+function createApp({ db, auth, livekit }) {
   const app = express();
   app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000' }));
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/health', async (_req, res) => {
-    let dbOk = false;
-    if (db) {
-      try {
-        await db.query('SELECT 1');
-        dbOk = true;
-      } catch {
-        dbOk = false;
-      }
-    }
-    res.json({ ok: true, db: dbOk });
+    const [dbOk, livekitOk] = await Promise.all([
+      reachable(db ? () => db.query('SELECT 1') : null),
+      reachable(livekit ? () => livekit.ping() : null),
+    ]);
+    res.json({ ok: true, db: dbOk, livekit: livekitOk });
   });
 
   app.use('/api', (_req, res, next) => {
@@ -26,7 +32,7 @@ function createApp({ db, auth }) {
   });
   app.use('/api', auth);
 
-  if (db) app.use('/api', meetingsRouter(db));
+  if (db) app.use('/api', meetingsRouter(db, livekit));
 
   app.use((err, _req, res, _next) => {
     const status = err.status || err.statusCode || 500;

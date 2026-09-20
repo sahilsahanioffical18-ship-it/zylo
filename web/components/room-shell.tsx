@@ -44,11 +44,8 @@ export function RoomShell({
   onDeny,
   onSetAdmission,
   onLeave,
-  // Optional and defaulted: Task 10 owns meeting-room-flow.tsx, which is where the
-  // live socket's `messages`/`sendChat` (from useMeeting) get threaded in here. Until
-  // that wiring lands, the tab renders but stays a no-op rather than a dead control.
-  messages = [],
-  sendChat = () => {},
+  messages,
+  sendChat,
 }: {
   title: string;
   maxParticipants: number;
@@ -60,8 +57,8 @@ export function RoomShell({
   onDeny: (userId: string) => void;
   onSetAdmission: (mode: Admission) => void;
   onLeave: () => void;
-  messages?: ChatMessage[];
-  sendChat?: (text: string) => void;
+  messages: ChatMessage[];
+  sendChat: (text: string) => void;
 }) {
   const { user } = useUser();
   const [tab, setTab] = useState<PanelTab>('people'); // People is the default: the host's

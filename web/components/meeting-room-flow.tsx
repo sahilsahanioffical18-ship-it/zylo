@@ -36,9 +36,8 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   const [meeting, setMeeting] = useState<MeetingCard | null>(null);
   // The socket only opens once Join is pressed, so nobody takes a seat while
   // they are still setting up their camera.
-  const { state, lobby, admission, leave, admitFromLobby, denyFromLobby, setAdmissionMode } = useMeeting(
-    meeting ? code : null,
-  );
+  const { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat } =
+    useMeeting(meeting ? code : null);
 
   // Tells the server first (releases the seat), then tears down locally right
   // away rather than waiting on a socket round-trip: setting meeting to null
@@ -95,6 +94,8 @@ export function MeetingRoomFlow({ code }: { code: string }) {
       onDeny={denyFromLobby}
       onSetAdmission={setAdmissionMode}
       onLeave={handleLeave}
+      messages={messages}
+      sendChat={sendChat}
     />
   );
 }

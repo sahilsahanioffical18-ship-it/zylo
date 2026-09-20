@@ -511,6 +511,259 @@ test('everyone leaving ends the meeting in the database', async (t) => {
   ]);
 });
 
+// A second live meeting, only for the cross-meeting leak test — inserted
+// alongside MEETING_ID and cleared alongside it in that test's t.after.
+const OTHER_MEETING_ID = 'klm-nopq-rst';
+
+test('ZyloChat reaches seated members only, with the name taken from the seat', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await scenario(db, { admission: 'manual' });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  const host = connectClient(server.url, 'host');
+  clients.push(host);
+  const hostAdmitted = waitForEvent(host, 'meeting:admitted');
+  // Drain the host's own (empty) lobby update, same as the other manual-mode
+  // tests, so it can't be caught by a later 'lobby:update' listener.
+  const hostOwnLobby = waitForEvent(host, 'lobby:update');
+  host.emit('meeting:join-request', { meetingId });
+  await hostAdmitted;
+  await hostOwnLobby;
+
+  const p1 = connectClient(server.url, 'p1');
+  clients.push(p1);
+  const p1Waiting = waitForEvent(p1, 'meeting:waiting');
+  const hostLobby = waitForEvent(host, 'lobby:update');
+  p1.emit('meeting:join-request', { meetingId });
+  await p1Waiting;
+  await hostLobby;
+
+  const p1Admitted = waitForEvent(p1, 'meeting:admitted');
+  host.emit('lobby:admit', { userId: 'p1' });
+  await p1Admitted;
+
+  const p2 = connectClient(server.url, 'p2');
+  clients.push(p2);
+  const p2Waiting = waitForEvent(p2, 'meeting:waiting');
+  p2.emit('meeting:join-request', { meetingId });
+  await p2Waiting;
+
+  // Listeners go up before the emit, and we settle on a timer rather than
+  // waitForEvent — p2 not receiving anything can't be proven by a race.
+  const hostChat = [];
+  const p1Chat = [];
+  const p2Chat = [];
+  host.on('chat:message', (m) => hostChat.push(m));
+  p1.on('chat:message', (m) => p1Chat.push(m));
+  p2.on('chat:message', (m) => p2Chat.push(m));
+
+  // userId/name in the payload are forged; the server must ignore them and use
+  // the seat's own identity instead.
+  p1.emit('chat:message', { text: '  hello ZyloRoom  ', userId: 'host', name: 'Impostor' });
+  await new Promise((r) => setTimeout(r, 60));
+
+  // The broadcast reaches the sender too, so p1 gets its own message once.
+  assert.equal(hostChat.length, 1);
+  assert.equal(p1Chat.length, 1);
+  assert.equal(p2Chat.length, 0);
+  assert.deepEqual(hostChat[0], p1Chat[0]);
+  assert.equal(hostChat[0].userId, 'p1');
+  assert.equal(hostChat[0].name, 'Priya One');
+  assert.equal(hostChat[0].text, 'hello ZyloRoom');
+  assert.equal(typeof hostChat[0].ts, 'number');
+});
+
+test('a waiting user cannot send ZyloChat', async (t) => {
+  const db = await setupTestDb();
+  // max 2 so host + p1 fill the one non-host slot, putting p2 in the queue
+  // with socket.data.meetingId set but no seat — the case the handler must
+  // not trust.
+  const { meetingId, server } = await scenario(db, { maxParticipants: 2 });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  for (const userId of ['host', 'p1']) {
+    const c = connectClient(server.url, userId);
+    clients.push(c);
+    const admitted = waitForEvent(c, 'meeting:admitted');
+    c.emit('meeting:join-request', { meetingId });
+    await admitted;
+  }
+  const [host, p1] = clients;
+
+  const p2 = connectClient(server.url, 'p2');
+  clients.push(p2);
+  const waiting = waitForEvent(p2, 'meeting:waiting');
+  p2.emit('meeting:join-request', { meetingId });
+  await waiting;
+
+  const hostChat = [];
+  const p1Chat = [];
+  host.on('chat:message', (m) => hostChat.push(m));
+  p1.on('chat:message', (m) => p1Chat.push(m));
+
+  p2.emit('chat:message', { text: 'let me in' });
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal(hostChat.length, 0);
+  assert.equal(p1Chat.length, 0);
+});
+
+test('ZyloChat drops everything that fails validation, silently', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await scenario(db);
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  const host = connectClient(server.url, 'host');
+  clients.push(host);
+  const admitted = waitForEvent(host, 'meeting:admitted');
+  host.emit('meeting:join-request', { meetingId });
+  await admitted;
+
+  const chat = [];
+  const forbidden = [];
+  const denied = [];
+  host.on('chat:message', (m) => chat.push(m));
+  host.on('error:forbidden', (m) => forbidden.push(m));
+  host.on('meeting:denied', (m) => denied.push(m));
+
+  host.emit('chat:message', {});
+  host.emit('chat:message', { text: 42 });
+  host.emit('chat:message', { text: '   ' });
+  host.emit('chat:message', { text: 'x'.repeat(2001) });
+  host.emit('chat:message', { text: 'y'.repeat(2000) });
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal(chat.length, 1);
+  assert.equal(chat[0].text.length, 2000);
+  assert.equal(forbidden.length, 0);
+  assert.equal(denied.length, 0);
+});
+
+test("a message never reaches a different meeting's ZyloRoom", async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await scenario(db);
+  await insertMeeting(db, { id: OTHER_MEETING_ID, hostId: 'p2', admission: 'auto', maxParticipants: 3 });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    seats.clearMeeting(OTHER_MEETING_ID);
+    await db.close();
+  });
+
+  const host = connectClient(server.url, 'host');
+  clients.push(host);
+  const hostAdmitted = waitForEvent(host, 'meeting:admitted');
+  host.emit('meeting:join-request', { meetingId });
+  await hostAdmitted;
+
+  const other = connectClient(server.url, 'p2');
+  clients.push(other);
+  const otherAdmitted = waitForEvent(other, 'meeting:admitted');
+  other.emit('meeting:join-request', { meetingId: OTHER_MEETING_ID });
+  await otherAdmitted;
+
+  const otherChat = [];
+  other.on('chat:message', (m) => otherChat.push(m));
+
+  host.emit('chat:message', { text: 'hello meeting A' });
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal(otherChat.length, 0);
+});
+
+test('a tab that was replaced cannot post to ZyloChat', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await scenario(db);
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  const host = connectClient(server.url, 'host');
+  clients.push(host);
+  const hostAdmitted = waitForEvent(host, 'meeting:admitted');
+  host.emit('meeting:join-request', { meetingId });
+  await hostAdmitted;
+
+  const first = connectClient(server.url, 'p1');
+  clients.push(first);
+  const firstAdmitted = waitForEvent(first, 'meeting:admitted');
+  first.emit('meeting:join-request', { meetingId });
+  await firstAdmitted;
+
+  const second = connectClient(server.url, 'p1');
+  clients.push(second);
+  const replaced = waitForEvent(first, 'meeting:replaced');
+  const secondAdmitted = waitForEvent(second, 'meeting:admitted');
+  second.emit('meeting:join-request', { meetingId });
+  await Promise.all([replaced, secondAdmitted]);
+
+  const hostChat = [];
+  host.on('chat:message', (m) => hostChat.push(m));
+
+  first.emit('chat:message', { text: 'from the replaced tab' });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(hostChat.length, 0);
+
+  second.emit('chat:message', { text: 'from the active tab' });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(hostChat.length, 1);
+  assert.equal(hostChat[0].text, 'from the active tab');
+});
+
+test('a socket that never joined a meeting cannot post', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await scenario(db);
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  const host = connectClient(server.url, 'host');
+  clients.push(host);
+  const hostAdmitted = waitForEvent(host, 'meeting:admitted');
+  host.emit('meeting:join-request', { meetingId });
+  await hostAdmitted;
+
+  const ghost = connectClient(server.url, 'ghost');
+  clients.push(ghost);
+  await waitForEvent(ghost, 'connect');
+
+  const hostChat = [];
+  host.on('chat:message', (m) => hostChat.push(m));
+
+  ghost.emit('chat:message', { text: 'hello' });
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal(hostChat.length, 0);
+});
+
 test('the boot sweep closes meetings a crash left open', async (t) => {
   const db = await setupTestDb();
   t.after(async () => db.close());

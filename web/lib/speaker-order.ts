@@ -4,7 +4,7 @@ export const LIVE_VIDEO_LIMIT = 5;
 export function promote(order: string[], identities: string[]): string[] {
   const promoted = new Set(identities);
   const rest = order.filter((id) => !promoted.has(id));
-  return [...identities, ...rest];
+  return [...promoted, ...rest];
 }
 
 // ponytail: no `forget` — order only ever grows, ceiling is the number of distinct

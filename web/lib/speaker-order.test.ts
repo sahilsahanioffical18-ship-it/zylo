@@ -22,6 +22,11 @@ test('re-promoting a current speaker moves them to the front without duplicating
   const result = promote(['a', 'b', 'c'], ['c']);
   assert.deepEqual(result, ['c', 'a', 'b']);
   assert.equal(result.length, 3);
+
+  // A duplicated identities argument must not inject duplicates into order.
+  const deduped = promote(['a', 'b', 'c'], ['c', 'c']);
+  assert.deepEqual(deduped, ['c', 'a', 'b']);
+  assert.equal(deduped.length, 3);
 });
 
 test('promote keeps the relative order of everyone it did not name', () => {

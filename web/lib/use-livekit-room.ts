@@ -40,6 +40,13 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
   // survive the effect re-running when `attempt` bumps for that same retry.
   const retriedRef = useRef(false);
 
+  // Pre-join mic/cam is an INITIAL condition, not an invariant to re-impose on
+  // every reconnect: seed micOn/camOn from prefsRef exactly once per hook
+  // instance. Without this a network blip that triggers the auto-retry (or a
+  // manual retry()) would silently flip a self-muted user's mic back on, since
+  // every successful connect() would otherwise re-read the pre-join prefs.
+  const hasSeededRef = useRef(false);
+
   const [status, setStatus] = useState<LiveKitStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -131,6 +138,10 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
       }
     }
 
+    // None of these listeners individually check `cancelled` — that's safe,
+    // not an oversight: cleanup calls room.removeAllListeners() synchronously
+    // before disconnect(), so once a connection is torn down none of them can
+    // fire again, stale or otherwise.
     room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
       order = promote(
         order,
@@ -197,9 +208,16 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
         apply();
         snapshot();
         setStatus('connected');
-        // Seeded from the ref, not the `prefs` argument — see prefsRef above.
-        setMicOn(prefsRef.current.micOn);
-        setCamOn(prefsRef.current.camOn);
+        // Seed mic/cam from the pre-join prefs once, ever — not on every
+        // reconnect. After the first connect this is a no-op: micOn/camOn
+        // already hold the user's latest in-meeting choice, and the two media
+        // effects below reapply that choice to the fresh Room on their own
+        // once `status` cycles back to 'connected'.
+        if (!hasSeededRef.current) {
+          hasSeededRef.current = true;
+          setMicOn(prefsRef.current.micOn);
+          setCamOn(prefsRef.current.camOn);
+        }
       } catch (err) {
         if (cancelled) return;
         setStatus('error');

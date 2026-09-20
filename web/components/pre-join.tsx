@@ -13,6 +13,7 @@ import { ZyloLogo } from '@/components/zylo-logo';
 import { ApiError, useApi } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { initials } from '@/lib/format';
+import { mediaErrorMessage } from '@/lib/media-error';
 import type { MeetingCard } from '@/lib/types';
 
 type LoadState =
@@ -24,14 +25,6 @@ type Props = {
   code: string;
   onJoin: (meeting: MeetingCard, prefs: { micOn: boolean; camOn: boolean }) => void;
 };
-
-function mediaErrorMessage(err: unknown): string {
-  const name = err instanceof DOMException ? err.name : '';
-  if (name === 'NotAllowedError') return 'Camera and microphone are blocked. Allow them in your browser’s site settings, then reload.';
-  if (name === 'NotFoundError') return 'No camera or microphone found. You can still join with them off.';
-  if (name === 'NotReadableError') return 'Your camera or microphone is in use by another app.';
-  return `This browser can’t use a camera on this page. Open ${brand.product} over HTTPS or on localhost.`;
-}
 
 export function Notice({ title, text }: { title: string; text: string }) {
   return (
@@ -137,7 +130,7 @@ export function PreJoin({ code, onJoin }: Props) {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setMediaError(mediaErrorMessage(err));
+        setMediaError(mediaErrorMessage(err, brand.product));
         setMicOn(false);
         setCamOn(false);
       });

@@ -9,7 +9,12 @@ import { RoomShell } from '@/components/room-shell';
 import { WaitingCard } from '@/components/waiting-card';
 import { brand } from '@/lib/brand';
 import type { MeetingCard } from '@/lib/types';
+import { useLiveKitRoom, type MediaPrefs } from '@/lib/use-livekit-room';
 import { useMeeting, type DeniedReason } from '@/lib/use-meeting';
+
+// Module-level so it's a stable reference — allocating a fresh object per render
+// would needlessly re-run any effect that has it in a dependency array.
+const MEDIA_OFF: MediaPrefs = Object.freeze({ micOn: false, camOn: false });
 
 const DENIED_COPY: Record<DeniedReason, { title: string; text: string }> = {
   not_found: {
@@ -33,22 +38,29 @@ const DENIED_COPY: Record<DeniedReason, { title: string; text: string }> = {
 export function MeetingRoomFlow({ code }: { code: string }) {
   const router = useRouter();
   const { user } = useUser();
-  const [meeting, setMeeting] = useState<MeetingCard | null>(null);
+  const [joined, setJoined] = useState<{ meeting: MeetingCard; prefs: MediaPrefs } | null>(null);
   // The socket only opens once Join is pressed, so nobody takes a seat while
   // they are still setting up their camera.
   const { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat } =
-    useMeeting(meeting ? code : null);
+    useMeeting(joined ? code : null);
+  // One expression decides both "which screen" and "is LiveKit connected", so they
+  // can never disagree. Seat lost for any reason -> this flips to null -> the connect
+  // effect's cleanup runs -> room.disconnect(). A transient socket blip is NOT one of
+  // these paths: use-meeting.ts only flips state away from 'admitted' on connect_error,
+  // not on a bare 'disconnect', so a reconnecting socket keeps video up.
+  const media = useLiveKitRoom(state.status === 'admitted' ? code : null, joined?.prefs ?? MEDIA_OFF);
 
   // Tells the server first (releases the seat), then tears down locally right
-  // away rather than waiting on a socket round-trip: setting meeting to null
-  // unmounts useMeeting's effect, which disconnects the socket in cleanup.
+  // away rather than waiting on a socket round-trip: setting joined to null
+  // unmounts useMeeting's effect (disconnects the socket) and flips the
+  // useLiveKitRoom meeting id to null (disconnects the room), both in cleanup.
   function handleLeave() {
     leave();
-    setMeeting(null);
+    setJoined(null);
     router.push('/dashboard');
   }
 
-  if (!meeting) return <PreJoin code={code} onJoin={(loaded) => setMeeting(loaded)} />;
+  if (!joined) return <PreJoin code={code} onJoin={(meeting, prefs) => setJoined({ meeting, prefs })} />;
 
   if (state.status === 'denied') {
     const { title, text } = DENIED_COPY[state.reason];
@@ -84,18 +96,20 @@ export function MeetingRoomFlow({ code }: { code: string }) {
 
   return (
     <RoomShell
-      title={meeting.title}
-      maxParticipants={meeting.maxParticipants}
+      title={joined.meeting.title}
+      maxParticipants={joined.meeting.maxParticipants}
       people={state.people}
       lobby={lobby}
-      admission={admission ?? meeting.admission}
+      admission={admission ?? joined.meeting.admission}
       isHost={state.people.find((p) => p.userId === user?.id)?.isHost ?? false}
+      selfUserId={user?.id ?? ''}
+      media={media}
       onAdmit={admitFromLobby}
       onDeny={denyFromLobby}
       onSetAdmission={setAdmissionMode}
       onLeave={handleLeave}
       messages={messages}
-      sendChat={sendChat}
+      onSendChat={sendChat}
     />
   );
 }

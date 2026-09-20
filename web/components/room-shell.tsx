@@ -1,37 +1,18 @@
 'use client';
 
 import { useState } from 'react';
-import { useUser } from '@clerk/nextjs';
-import { Users } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { ChatPanel } from '@/components/chat-panel';
+import { ControlBar, type PanelTab } from '@/components/control-bar';
 import { PeoplePanel } from '@/components/people-panel';
+import { VideoStage } from '@/components/video-stage';
 import { brand } from '@/lib/brand';
-import { initials } from '@/lib/format';
 import type { Admission } from '@/lib/types';
+import type { useLiveKitRoom } from '@/lib/use-livekit-room';
 import type { ChatMessage, LobbyEntry, Person } from '@/lib/use-meeting';
-
-type PanelTab = 'chat' | 'people';
-
-// Phase 2 has no media: a tile is an initials circle. VideoStage replaces this in
-// Phase 3, and the mic / camera / ZyloLive / ZyloChat controls arrive with it.
-function Tile({ person }: { person: Person }) {
-  return (
-    <div className="relative grid aspect-video place-items-center rounded-2xl border border-border bg-card">
-      <span className="grid size-20 place-items-center rounded-full bg-muted text-2xl font-bold text-muted-foreground">
-        {initials(person.name)}
-      </span>
-      <span className="absolute inset-x-3 bottom-3 flex items-center gap-2">
-        <span className="truncate rounded-md bg-background/80 px-2 py-1 text-sm font-medium">{person.name}</span>
-        {person.isHost && <Badge variant="secondary">Host</Badge>}
-      </span>
-    </div>
-  );
-}
 
 export function RoomShell({
   title,
@@ -40,12 +21,14 @@ export function RoomShell({
   lobby,
   admission,
   isHost,
+  selfUserId,
+  media,
   onAdmit,
   onDeny,
   onSetAdmission,
   onLeave,
   messages,
-  sendChat,
+  onSendChat,
 }: {
   title: string;
   maxParticipants: number;
@@ -53,18 +36,27 @@ export function RoomShell({
   lobby: LobbyEntry[];
   admission: Admission;
   isHost: boolean;
+  selfUserId: string;
+  media: ReturnType<typeof useLiveKitRoom>;
   onAdmit: (userId: string) => void;
   onDeny: (userId: string) => void;
   onSetAdmission: (mode: Admission) => void;
   onLeave: () => void;
   messages: ChatMessage[];
-  sendChat: (text: string) => void;
+  onSendChat: (text: string) => void;
 }) {
-  const { user } = useUser();
   const [tab, setTab] = useState<PanelTab>('people'); // People is the default: the host's
   // lobby (admit/deny) and the admission setting live there, and hiding those behind a
   // tab would regress Phase 2 behaviour.
   const [sheetOpen, setSheetOpen] = useState(false);
+
+  const openPanel = (next: PanelTab) => {
+    setTab(next);
+    // The panel is docked at >=1024px; below that the same button opens the Sheet.
+    // Reading the media query in the click handler (not during render) keeps this
+    // out of hydration and out of react-hooks' way.
+    if (!window.matchMedia('(min-width: 1024px)').matches) setSheetOpen(true);
+  };
 
   const peoplePanel = (
     <PeoplePanel
@@ -89,7 +81,7 @@ export function RoomShell({
         <TabsTrigger value="people">People ({people.length})</TabsTrigger>
       </TabsList>
       <TabsContent value="chat" className="min-h-0 flex-1">
-        <ChatPanel messages={messages} selfUserId={user?.id ?? ''} onSend={sendChat} />
+        <ChatPanel messages={messages} selfUserId={selfUserId} onSend={onSendChat} />
       </TabsContent>
       <TabsContent value="people" className="min-h-0 flex-1">
         {peoplePanel}
@@ -109,56 +101,51 @@ export function RoomShell({
         {isHost && <Badge variant="outline">{admission === 'manual' ? 'Host admits' : 'Join instantly'}</Badge>}
       </header>
 
+      {media.status === 'error' && (
+        // Non-blocking, above the stage: losing video must not eject anyone from a
+        // meeting whose chat, presence and lobby run over an independent transport.
+        <p role="alert" className="mx-4 mt-3 rounded-lg border border-warning bg-card px-4 py-3 text-sm">
+          {media.error} <Button variant="ghost" size="sm" onClick={media.retry}>Try again</Button>
+        </p>
+      )}
+
       <div className="flex min-h-0 flex-1 gap-4 p-4">
-        <main
-          aria-label={`${brand.room} stage`}
-          className="grid min-h-0 flex-1 auto-rows-max content-center grid-cols-1 gap-4 overflow-y-auto sm:grid-cols-2 lg:grid-cols-3"
-        >
-          {people.map((person) => (
-            <Tile key={person.userId} person={person} />
-          ))}
-        </main>
+        <VideoStage
+          people={people}
+          selfUserId={selfUserId}
+          videoTracks={media.videoTracks}
+          audioTracks={media.audioTracks}
+          speaking={media.speaking}
+          micMuted={media.micMuted}
+          status={media.status}
+        />
         <aside aria-label="Chat and people" className="hidden w-80 shrink-0 lg:block">
           {panel}
         </aside>
       </div>
 
-      <footer className="flex items-center justify-center gap-3 border-t border-border px-4 py-3">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              size="icon"
-              variant="secondary"
-              className="relative size-12 rounded-full lg:hidden"
-              aria-label={`People (${people.length})`}
-              onClick={() => setSheetOpen(true)}
-            >
-              <Users className="size-5" />
-              {waitingCount > 0 && (
-                <span className="absolute -right-0.5 -top-0.5 grid size-5 place-items-center rounded-full bg-primary text-xs font-bold tabular-nums text-primary-foreground">
-                  {waitingCount}
-                </span>
-              )}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>People</TooltipContent>
-        </Tooltip>
-        {/* Controlled, no SheetTrigger: Task 10's control bar opens this too, so the
-            footer button above just flips the same `sheetOpen` state. */}
-        <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
-          <SheetContent side="right" className="dark w-full max-w-sm p-4">
-            <SheetHeader className="p-0 pb-4">
-              <SheetTitle>Chat and people</SheetTitle>
-            </SheetHeader>
-            {panel}
-          </SheetContent>
-        </Sheet>
+      {/* Controlled, no SheetTrigger: ControlBar's Chat/People buttons open this too
+          (via openPanel), so they just flip the same `sheetOpen` state. */}
+      <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
+        <SheetContent side="right" className="dark w-full max-w-sm p-4">
+          <SheetHeader className="p-0 pb-4">
+            <SheetTitle>Chat and people</SheetTitle>
+          </SheetHeader>
+          {panel}
+        </SheetContent>
+      </Sheet>
 
-        <Button variant="destructive" className="h-12 rounded-full px-6" onClick={onLeave}>
-          Leave
-        </Button>
-      </footer>
+      <ControlBar
+        micOn={media.micOn}
+        camOn={media.camOn}
+        onToggleMic={media.toggleMic}
+        onToggleCam={media.toggleCam}
+        mediaReady={media.status === 'connected'}
+        peopleCount={people.length}
+        waitingCount={waitingCount}
+        onOpenPanel={openPanel}
+        onLeave={onLeave}
+      />
     </div>
   );
 }

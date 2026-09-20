@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { MediaToggle } from '@/components/media-toggle';
 import { ZyloLogo } from '@/components/zylo-logo';
 import { ApiError, useApi } from '@/lib/api';
 import { brand } from '@/lib/brand';
@@ -41,43 +41,6 @@ export function Notice({ title, text }: { title: string; text: string }) {
         <Link href="/dashboard">Back to dashboard</Link>
       </Button>
     </main>
-  );
-}
-
-function ToggleButton({
-  on,
-  label,
-  onIcon: OnIcon,
-  offIcon: OffIcon,
-  disabled,
-  onClick,
-}: {
-  on: boolean;
-  label: string;
-  onIcon: typeof Mic;
-  offIcon: typeof Mic;
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  const text = `${on ? 'Turn off' : 'Turn on'} ${label}`;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          type="button"
-          size="icon"
-          variant={on ? 'secondary' : 'destructive'}
-          className="size-12 rounded-full"
-          aria-label={text}
-          aria-pressed={on}
-          disabled={disabled}
-          onClick={onClick}
-        >
-          {on ? <OnIcon className="size-5" /> : <OffIcon className="size-5" />}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{text}</TooltipContent>
-    </Tooltip>
   );
 }
 
@@ -187,8 +150,8 @@ export function PreJoin({ code, onJoin }: Props) {
               </div>
             )}
             <div className="absolute inset-x-0 bottom-4 flex justify-center gap-3">
-              <ToggleButton on={micOn} label="microphone" onIcon={Mic} offIcon={MicOff} disabled={!stream} onClick={() => toggle('audio')} />
-              <ToggleButton on={camOn} label="camera" onIcon={Video} offIcon={VideoOff} disabled={!stream} onClick={() => toggle('video')} />
+              <MediaToggle on={micOn} label="microphone" onIcon={Mic} offIcon={MicOff} disabled={!stream} onClick={() => toggle('audio')} />
+              <MediaToggle on={camOn} label="camera" onIcon={Video} offIcon={VideoOff} disabled={!stream} onClick={() => toggle('video')} />
             </div>
           </div>
           {mediaError && (

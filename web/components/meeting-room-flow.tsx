@@ -44,16 +44,26 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   const { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat } =
     useMeeting(joined ? code : null);
   // One expression decides both "which screen" and "is LiveKit connected", so they
-  // can never disagree. Seat lost for any reason -> this flips to null -> the connect
-  // effect's cleanup runs -> room.disconnect(). A transient socket blip is NOT one of
-  // these paths: use-meeting.ts only flips state away from 'admitted' on connect_error,
-  // not on a bare 'disconnect', so a reconnecting socket keeps video up.
-  const media = useLiveKitRoom(state.status === 'admitted' ? code : null, joined?.prefs ?? MEDIA_OFF);
+  // can never disagree. `joined` is deliberately part of this condition, not
+  // redundant with `state.status`: it is the only thing Leave changes
+  // synchronously. use-meeting.ts's join effect opens with `if (!meetingId) return;`
+  // *before* it would ever reset `state` — so when Leave fires, `state.status` is
+  // still 'admitted' on the very next render, and dropping `joined` from this
+  // expression would leave LiveKit connected (and still publishing) under a
+  // <PreJoin> that believes it's starting fresh. Seat lost any other way -> a real
+  // socket event flips `state.status` itself (denied/replaced/offline) -> this
+  // still goes to null -> the connect effect's cleanup runs -> room.disconnect().
+  // A transient socket blip is NOT one of these paths: use-meeting.ts only flips
+  // state away from 'admitted' on connect_error, not on a bare 'disconnect', so a
+  // reconnecting socket keeps video up.
+  const media = useLiveKitRoom(joined && state.status === 'admitted' ? code : null, joined?.prefs ?? MEDIA_OFF);
 
   // Tells the server first (releases the seat), then tears down locally right
   // away rather than waiting on a socket round-trip: setting joined to null
-  // unmounts useMeeting's effect (disconnects the socket) and flips the
-  // useLiveKitRoom meeting id to null (disconnects the room), both in cleanup.
+  // unmounts useMeeting's effect (disconnects the socket) and — because `joined`
+  // is part of the gate above — flips useLiveKitRoom's meeting id to null on this
+  // same render, so its connect effect's cleanup (room.disconnect()) is queued
+  // before <PreJoin> ever mounts and re-acquires the camera.
   function handleLeave() {
     leave();
     setJoined(null);

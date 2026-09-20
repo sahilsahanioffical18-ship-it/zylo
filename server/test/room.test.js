@@ -682,12 +682,17 @@ test("a message never reaches a different meeting's ZyloRoom", async (t) => {
   other.emit('meeting:join-request', { meetingId: OTHER_MEETING_ID });
   await otherAdmitted;
 
+  const hostChat = [];
   const otherChat = [];
+  host.on('chat:message', (m) => hostChat.push(m));
   other.on('chat:message', (m) => otherChat.push(m));
 
   host.emit('chat:message', { text: 'hello meeting A' });
   await new Promise((r) => setTimeout(r, 60));
 
+  // Prove isolation, not just silence: the message must actually land inside
+  // meeting A, or a handler that silently drops everything would pass this too.
+  assert.equal(hostChat.length, 1);
   assert.equal(otherChat.length, 0);
 });
 
@@ -732,6 +737,64 @@ test('a tab that was replaced cannot post to ZyloChat', async (t) => {
   await new Promise((r) => setTimeout(r, 60));
   assert.equal(hostChat.length, 1);
   assert.equal(hostChat[0].text, 'from the active tab');
+});
+
+// Pins the seat.socketId !== socket.id guard by itself, deterministically. In the
+// real join path, seats.tryTakeSeat() moves the seat to a new socket
+// synchronously, but admit() only nulls the OLD socket's socket.data.meetingId
+// after two `await`s (upsertParticipant, markStarted) — so there is a real
+// window where the old socket's meetingId is still set and the seat already
+// points elsewhere. The 'a tab that was replaced cannot post' test above can't
+// land inside that window (by the time the client sees 'meeting:replaced', the
+// server has already nulled meetingId, so that test actually proves the
+// !meetingId guard). Here we recreate the window directly: call tryTakeSeat
+// against the seats module, bypassing admit() entirely, so p1's original socket
+// keeps its meetingId. If seat.socketId !== socket.id were ever deleted from the
+// handler, this is the test that would catch it.
+test('a socket the seat no longer points at cannot post', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await scenario(db);
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  const host = connectClient(server.url, 'host');
+  clients.push(host);
+  const hostAdmitted = waitForEvent(host, 'meeting:admitted');
+  host.emit('meeting:join-request', { meetingId });
+  await hostAdmitted;
+
+  const p1 = connectClient(server.url, 'p1');
+  clients.push(p1);
+  const p1Admitted = waitForEvent(p1, 'meeting:admitted');
+  p1.emit('meeting:join-request', { meetingId });
+  await p1Admitted;
+
+  // Repoint the seat to a synthetic socket without going through admit(), so
+  // p1's real socket keeps socket.data.meetingId set even though the seat no
+  // longer points at it.
+  const seat = seats.seatFor(meetingId, 'p1');
+  seats.tryTakeSeat(meetingId, {
+    userId: 'p1',
+    socketId: 'synthetic-other-tab',
+    name: seat.name,
+    imageUrl: seat.imageUrl,
+    isHost: false,
+    max: 3,
+  });
+  assert.equal(seats.seatFor(meetingId, 'p1').socketId, 'synthetic-other-tab');
+
+  const hostChat = [];
+  host.on('chat:message', (m) => hostChat.push(m));
+
+  p1.emit('chat:message', { text: 'stale socket, meetingId still set' });
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal(hostChat.length, 0);
 });
 
 test('a socket that never joined a meeting cannot post', async (t) => {

@@ -6,11 +6,17 @@ import { io, type Socket } from 'socket.io-client';
 import { toast } from 'sonner';
 import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
+import { validateChatText } from '@/lib/chat-rules';
 import type { Admission } from '@/lib/types';
 
 export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean };
 export type LobbyEntry = { userId: string; name: string; imageUrl: string | null };
 export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied';
+export type ChatMessage = { userId: string; name: string; text: string; ts: number };
+
+// ponytail: keep the last 200 in memory; nothing is stored anyway, so scrollback has a
+// floor. Raise it or virtualise if a long meeting ever loses history people wanted.
+const MAX_MESSAGES = 200;
 
 export type MeetingState =
   | { status: 'connecting' }
@@ -32,6 +38,7 @@ export function useMeeting(meetingId: string | null) {
   const [state, setState] = useState<MeetingState>({ status: 'connecting' });
   const [lobby, setLobby] = useState<LobbyEntry[]>([]);
   const [admission, setAdmission] = useState<Admission | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   useEffect(() => {
     if (!meetingId) return;
@@ -40,6 +47,7 @@ export function useMeeting(meetingId: string | null) {
     Promise.resolve().then(() => {
       setState({ status: 'connecting' });
       setLobby([]);
+      setMessages([]);
     });
 
     const socket = io(SERVER_URL, {
@@ -65,6 +73,7 @@ export function useMeeting(meetingId: string | null) {
     socket.on('meeting:replaced', () => setState({ status: 'replaced' }));
     socket.on('lobby:update', ({ waiting }: { waiting: LobbyEntry[] }) => setLobby(waiting));
     socket.on('meeting:settings', (settings: { admission: Admission }) => setAdmission(settings.admission));
+    socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));
 
     return () => {
       socket.disconnect();
@@ -91,5 +100,13 @@ export function useMeeting(meetingId: string | null) {
     socketRef.current?.emit('host:set-admission', { mode });
   }, []);
 
-  return { state, lobby, admission, leave, admitFromLobby, denyFromLobby, setAdmissionMode };
+  // Validate client-side so a message the server would silently drop never leaves
+  // the browser (the server takes the sender's name from the seat, so there is
+  // nothing else for this call to pass).
+  const sendChat = useCallback((text: string) => {
+    if (validateChatText(text) === null) return;
+    socketRef.current?.emit('chat:message', { text });
+  }, []);
+
+  return { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat };
 }

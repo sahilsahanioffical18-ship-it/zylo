@@ -61,7 +61,7 @@ export function PeoplePanel({
   onSetAdmission: (mode: Admission) => void;
 }) {
   return (
-    <div className="flex h-full flex-col gap-4 rounded-2xl border border-border bg-card p-4">
+    <div className="flex h-full flex-col gap-4">
       {isHost && (
         <ChoiceGroup
           legend="Admission"

@@ -1,7 +1,10 @@
-const { test } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { TokenVerifier } = require('livekit-server-sdk');
 const { createLivekit } = require('../lib/livekit');
+const { createApp } = require('../app');
+const seats = require('../lib/seats');
+const { listen, fakeAuth, setupTestDb, insertUser, insertMeeting } = require('./helpers');
 
 const API_KEY = 'devkey';
 const API_SECRET = 'secret';
@@ -50,6 +53,15 @@ test('mintToken grants exactly what the spec allows, and nothing more', async ()
   assert.deepEqual(claims.video.canPublishSources, ['camera', 'microphone']);
   assert.equal(claims.video.roomAdmin, undefined);
   assert.equal(claims.video.roomCreate, undefined);
+  // The field-by-field asserts above don't catch a stray extra grant
+  // (canPublishData, hidden, roomList, ...) slipping in — this does.
+  assert.deepEqual(claims.video, {
+    roomJoin: true,
+    room: 'meeting-1',
+    canSubscribe: true,
+    canPublish: true,
+    canPublishSources: ['camera', 'microphone'],
+  });
 });
 
 test('mintToken issues a 10-minute token', async () => {
@@ -110,4 +122,162 @@ test('ping rejects when LiveKit does not answer', async () => {
     rooms: { listRooms: async () => [] },
   });
   await assert.doesNotReject(() => up.ping());
+});
+
+// --- GET /api/meetings/:id/livekit-token -----------------------------------
+//
+// mintToken below is always the real one from createLivekit (so the JWT is
+// genuinely signed and verifiable); only ensureRoom/ping are recording stubs,
+// so a test can watch what the room-creation call looked like without a real
+// LiveKit server.
+const MEETING_ID = 'tok-enme-eet';
+const MISSING_MEETING_ID = 'zzz-zzzz-zzz';
+const FAKE_LIVEKIT_URL = 'ws://fake-livekit.test';
+
+function fakeLivekit() {
+  const livekit = createLivekit({ url: FAKE_LIVEKIT_URL, apiKey: API_KEY, apiSecret: API_SECRET, rooms: {} });
+  const ensureRoomCalls = [];
+  livekit.ensureRoom = async (meetingId, maxParticipants) => {
+    ensureRoomCalls.push([meetingId, maxParticipants]);
+  };
+  livekit.ping = async () => {};
+  return { livekit, ensureRoomCalls };
+}
+
+async function tokenApi(server, userId, id) {
+  const res = await fetch(`${server.base}/api/meetings/${id}/livekit-token`, {
+    headers: userId ? { 'x-test-user': userId } : {},
+  });
+  const text = await res.text();
+  return { status: res.status, body: text ? JSON.parse(text) : null };
+}
+
+let tokenDb;
+let good; // working livekit: real mintToken, recording ensureRoom/ping stubs
+let noLivekit; // app built with livekit: null
+let broken; // livekit whose ensureRoom rejects the way the real server does when unreachable
+
+before(async () => {
+  tokenDb = await setupTestDb();
+  await insertUser(tokenDb, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
+  await insertUser(tokenDb, { id: 'p1', email: 'p1@zylo.test', name: 'Priya One' });
+  await insertUser(tokenDb, { id: 'p2', email: 'p2@zylo.test', name: 'Pablo Two' });
+  await insertMeeting(tokenDb, { id: MEETING_ID, hostId: 'host', maxParticipants: 20 });
+
+  const { livekit, ensureRoomCalls } = fakeLivekit();
+  good = { livekit, ensureRoomCalls, server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit })) };
+  noLivekit = { server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit: null })) };
+
+  const brokenLivekit = fakeLivekit().livekit;
+  // The real observed failure: LiveKit's ServerError carries `.status = 401` —
+  // a bare Error would produce a 500 from app.js's error middleware and would
+  // not reproduce the actual bug this route guards against.
+  brokenLivekit.ensureRoom = async () => {
+    throw Object.assign(
+      new Error('invalid authorization token: token signature is invalid: signature is invalid'),
+      { name: 'Unauthorized', status: 401 },
+    );
+  };
+  broken = { server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit: brokenLivekit })) };
+});
+
+after(async () => {
+  await good.server.close();
+  await noLivekit.server.close();
+  await broken.server.close();
+  await tokenDb.close();
+});
+
+test('a malformed meeting code is rejected before anything else', async () => {
+  const { status, body } = await tokenApi(good.server, 'p1', 'not-a-code');
+  assert.equal(status, 400);
+  assert.match(body.error, /meeting code/);
+});
+
+test('a token request with no session is refused', async () => {
+  const { status } = await tokenApi(good.server, null, MEETING_ID);
+  assert.equal(status, 401);
+});
+
+test('a token request is refused when LiveKit is not configured', async () => {
+  const { status, body } = await tokenApi(noLivekit.server, 'p1', MEETING_ID);
+  assert.equal(status, 503);
+  assert.match(body.error, /LIVEKIT/);
+});
+
+test('a token request without a seat is refused', async () => {
+  const { status, body } = await tokenApi(good.server, 'p1', MEETING_ID);
+  assert.equal(status, 403);
+  assert.match(body.error, /seat/i);
+});
+
+test('a seat holder gets a token scoped to their meeting and identity', async (t) => {
+  seats.tryTakeSeat(MEETING_ID, {
+    userId: 'p1', socketId: 's1', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
+  });
+  t.after(() => seats.clearMeeting(MEETING_ID));
+
+  const { status, body } = await tokenApi(good.server, 'p1', MEETING_ID);
+  assert.equal(status, 200);
+  assert.equal(body.url, FAKE_LIVEKIT_URL);
+
+  const claims = await new TokenVerifier(API_KEY, API_SECRET).verify(body.token);
+  assert.equal(claims.sub, 'p1');
+  assert.equal(claims.name, 'Priya One'); // from the seat record, never from the request
+  assert.equal(claims.video.room, MEETING_ID);
+  assert.equal(claims.video.roomAdmin, undefined);
+});
+
+test("the LiveKit room is created with the meeting's cap before the token is minted", async (t) => {
+  seats.tryTakeSeat(MEETING_ID, {
+    userId: 'p1', socketId: 's1', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
+  });
+  t.after(() => seats.clearMeeting(MEETING_ID));
+  good.ensureRoomCalls.length = 0;
+
+  const { status } = await tokenApi(good.server, 'p1', MEETING_ID);
+  assert.equal(status, 200);
+  assert.deepEqual(good.ensureRoomCalls, [[MEETING_ID, 20]]);
+});
+
+test('a seat for a meeting that no longer exists gets 404, not 500', async (t) => {
+  seats.tryTakeSeat(MISSING_MEETING_ID, {
+    userId: 'p1', socketId: 's2', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
+  });
+  t.after(() => seats.clearMeeting(MISSING_MEETING_ID));
+
+  const { status } = await tokenApi(good.server, 'p1', MISSING_MEETING_ID);
+  assert.equal(status, 404);
+});
+
+test('a removed user is refused even though they still hold a seat', async (t) => {
+  seats.tryTakeSeat(MEETING_ID, {
+    userId: 'p2', socketId: 's3', name: 'Pablo Two', imageUrl: null, isHost: false, max: 20,
+  });
+  t.after(() => seats.clearMeeting(MEETING_ID));
+  await tokenDb.query(
+    `INSERT INTO meeting_participants (meeting_id, user_id, role, removed_at) VALUES ($1, 'p2', 'participant', now())`,
+    [MEETING_ID],
+  );
+
+  const { status, body } = await tokenApi(good.server, 'p2', MEETING_ID);
+  assert.equal(status, 403);
+  assert.match(body.error, /removed/i);
+});
+
+test('an unreachable LiveKit is a 503, not a 500', async (t) => {
+  seats.tryTakeSeat(MEETING_ID, {
+    userId: 'p1', socketId: 's4', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
+  });
+  t.after(() => seats.clearMeeting(MEETING_ID));
+
+  const { status, body } = await tokenApi(broken.server, 'p1', MEETING_ID);
+  assert.equal(status, 503);
+  // The two wrong answers a naive implementation could give: 401 is what the
+  // real LiveKit ServerError's .status actually produces without the route's
+  // try/catch (see app.js's error middleware); 500 is what the brief warned
+  // about but isn't the real failure mode.
+  assert.notEqual(status, 401);
+  assert.notEqual(status, 500);
+  assert.match(body.error, /video server/i);
 });

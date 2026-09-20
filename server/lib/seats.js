@@ -51,6 +51,13 @@ function hasSeat(meetingId, userId) {
   return meetings.get(meetingId)?.seats.has(userId) ?? false;
 }
 
+// Authorize and read the name in one lookup — the token route and the chat
+// handler both need this, and identity must come from the seat, not the request.
+function seatFor(meetingId, userId) {
+  const seat = meetings.get(meetingId)?.seats.get(userId);
+  return seat ? { userId, ...seat } : null;
+}
+
 function seatSocketId(meetingId, userId) {
   return meetings.get(meetingId)?.seats.get(userId)?.socketId ?? null;
 }
@@ -142,6 +149,7 @@ module.exports = {
   GRACE_MS,
   tryTakeSeat,
   hasSeat,
+  seatFor,
   seatSocketId,
   listSeats,
   releaseSeat,

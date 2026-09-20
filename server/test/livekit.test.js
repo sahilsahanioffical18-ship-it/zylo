@@ -137,11 +137,21 @@ const FAKE_LIVEKIT_URL = 'ws://fake-livekit.test';
 function fakeLivekit() {
   const livekit = createLivekit({ url: FAKE_LIVEKIT_URL, apiKey: API_KEY, apiSecret: API_SECRET, rooms: {} });
   const ensureRoomCalls = [];
+  // One shared log for both calls, not two separate flags, so a test can assert
+  // the actual sequence (ensureRoom before mintToken) rather than just that both
+  // happened — a reordering bug must be able to fail this.
+  const callOrder = [];
+  const realMintToken = livekit.mintToken;
   livekit.ensureRoom = async (meetingId, maxParticipants) => {
     ensureRoomCalls.push([meetingId, maxParticipants]);
+    callOrder.push('ensureRoom');
+  };
+  livekit.mintToken = async (...args) => {
+    callOrder.push('mintToken');
+    return realMintToken(...args); // still the real signer — JWT stays genuine
   };
   livekit.ping = async () => {};
-  return { livekit, ensureRoomCalls };
+  return { livekit, ensureRoomCalls, callOrder };
 }
 
 async function tokenApi(server, userId, id) {
@@ -160,12 +170,19 @@ let broken; // livekit whose ensureRoom rejects the way the real server does whe
 before(async () => {
   tokenDb = await setupTestDb();
   await insertUser(tokenDb, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
-  await insertUser(tokenDb, { id: 'p1', email: 'p1@zylo.test', name: 'Priya One' });
+  // Deliberately NOT 'Priya One' — the seat is given that name below, and the
+  // whole point of test 5 is that the token's name can only come from the seat,
+  // never from a users-table lookup. If a future refactor joined users instead
+  // of reading seat.name, this mismatch is what would make that test fail.
+  await insertUser(tokenDb, { id: 'p1', email: 'p1@zylo.test', name: 'Priya DB' });
   await insertUser(tokenDb, { id: 'p2', email: 'p2@zylo.test', name: 'Pablo Two' });
   await insertMeeting(tokenDb, { id: MEETING_ID, hostId: 'host', maxParticipants: 20 });
 
-  const { livekit, ensureRoomCalls } = fakeLivekit();
-  good = { livekit, ensureRoomCalls, server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit })) };
+  const { livekit, ensureRoomCalls, callOrder } = fakeLivekit();
+  good = {
+    livekit, ensureRoomCalls, callOrder,
+    server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit })),
+  };
   noLivekit = { server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit: null })) };
 
   const brokenLivekit = fakeLivekit().livekit;
@@ -223,7 +240,7 @@ test('a seat holder gets a token scoped to their meeting and identity', async (t
 
   const claims = await new TokenVerifier(API_KEY, API_SECRET).verify(body.token);
   assert.equal(claims.sub, 'p1');
-  assert.equal(claims.name, 'Priya One'); // from the seat record, never from the request
+  assert.equal(claims.name, 'Priya One'); // the seat's name, not the DB user's ('Priya DB') or the request's
   assert.equal(claims.video.room, MEETING_ID);
   assert.equal(claims.video.roomAdmin, undefined);
 });
@@ -234,10 +251,14 @@ test("the LiveKit room is created with the meeting's cap before the token is min
   });
   t.after(() => seats.clearMeeting(MEETING_ID));
   good.ensureRoomCalls.length = 0;
+  good.callOrder.length = 0;
 
   const { status } = await tokenApi(good.server, 'p1', MEETING_ID);
   assert.equal(status, 200);
   assert.deepEqual(good.ensureRoomCalls, [[MEETING_ID, 20]]);
+  // The name promises an order, not just that both were called — this is what
+  // would fail if a reorder ever called mintToken first.
+  assert.deepEqual(good.callOrder, ['ensureRoom', 'mintToken']);
 });
 
 test('a seat for a meeting that no longer exists gets 404, not 500', async (t) => {

@@ -9,7 +9,12 @@ import { RoomShell } from '@/components/room-shell';
 import { WaitingCard } from '@/components/waiting-card';
 import { brand } from '@/lib/brand';
 import type { MeetingCard } from '@/lib/types';
+import { useLiveKitRoom, type MediaPrefs } from '@/lib/use-livekit-room';
 import { useMeeting, type DeniedReason } from '@/lib/use-meeting';
+
+// Module-level so it's a stable reference — allocating a fresh object per render
+// would needlessly re-run any effect that has it in a dependency array.
+const MEDIA_OFF: MediaPrefs = Object.freeze({ micOn: false, camOn: false });
 
 const DENIED_COPY: Record<DeniedReason, { title: string; text: string }> = {
   not_found: {
@@ -33,23 +38,51 @@ const DENIED_COPY: Record<DeniedReason, { title: string; text: string }> = {
 export function MeetingRoomFlow({ code }: { code: string }) {
   const router = useRouter();
   const { user } = useUser();
-  const [meeting, setMeeting] = useState<MeetingCard | null>(null);
+  const [joined, setJoined] = useState<{ meeting: MeetingCard; prefs: MediaPrefs } | null>(null);
+  // Set by handleLeave, checked only in the `!joined` branch below: it exists
+  // purely to stop <PreJoin> mounting (and calling getUserMedia) during the
+  // window between setJoined(null) and router.push('/dashboard') landing.
+  const [leaving, setLeaving] = useState(false);
   // The socket only opens once Join is pressed, so nobody takes a seat while
   // they are still setting up their camera.
-  const { state, lobby, admission, leave, admitFromLobby, denyFromLobby, setAdmissionMode } = useMeeting(
-    meeting ? code : null,
-  );
+  const { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat } =
+    useMeeting(joined ? code : null);
+  // One expression decides both "which screen" and "is LiveKit connected", so they
+  // can never disagree. `joined` is deliberately part of this condition, not
+  // redundant with `state.status`: it is the only thing Leave changes
+  // synchronously. use-meeting.ts's join effect opens with `if (!meetingId) return;`
+  // *before* it would ever reset `state` — so when Leave fires, `state.status` is
+  // still 'admitted' on the very next render, and dropping `joined` from this
+  // expression would leave LiveKit connected (and still publishing) under a
+  // <PreJoin> that believes it's starting fresh. Seat lost any other way -> a real
+  // socket event flips `state.status` itself (denied/replaced/offline) -> this
+  // still goes to null -> the connect effect's cleanup runs -> room.disconnect().
+  // A transient socket blip is NOT one of these paths: use-meeting.ts only flips
+  // state away from 'admitted' on connect_error, not on a bare 'disconnect', so a
+  // reconnecting socket keeps video up.
+  const media = useLiveKitRoom(joined && state.status === 'admitted' ? code : null, joined?.prefs ?? MEDIA_OFF);
 
   // Tells the server first (releases the seat), then tears down locally right
-  // away rather than waiting on a socket round-trip: setting meeting to null
-  // unmounts useMeeting's effect, which disconnects the socket in cleanup.
+  // away rather than waiting on a socket round-trip: setting joined to null
+  // unmounts useMeeting's effect (disconnects the socket) and — because `joined`
+  // is part of the gate above — flips useLiveKitRoom's meeting id to null on this
+  // same render, so its connect effect's cleanup (room.disconnect()) is queued
+  // before <PreJoin> ever mounts and re-acquires the camera.
   function handleLeave() {
+    setLeaving(true);
     leave();
-    setMeeting(null);
+    setJoined(null);
     router.push('/dashboard');
   }
 
-  if (!meeting) return <PreJoin code={code} onJoin={(loaded) => setMeeting(loaded)} />;
+  if (!joined) {
+    // leaving: render nothing rather than <PreJoin> — otherwise the brief window
+    // before router.push('/dashboard') lands would mount PreJoin, which fetches
+    // the meeting and calls getUserMedia, blinking the camera light back on (and
+    // flashing "This meeting has ended" if this was the last participant out).
+    if (leaving) return null;
+    return <PreJoin code={code} onJoin={(meeting, prefs) => setJoined({ meeting, prefs })} />;
+  }
 
   if (state.status === 'denied') {
     const { title, text } = DENIED_COPY[state.reason];
@@ -85,16 +118,20 @@ export function MeetingRoomFlow({ code }: { code: string }) {
 
   return (
     <RoomShell
-      title={meeting.title}
-      maxParticipants={meeting.maxParticipants}
+      title={joined.meeting.title}
+      maxParticipants={joined.meeting.maxParticipants}
       people={state.people}
       lobby={lobby}
-      admission={admission ?? meeting.admission}
+      admission={admission ?? joined.meeting.admission}
       isHost={state.people.find((p) => p.userId === user?.id)?.isHost ?? false}
+      selfUserId={user?.id ?? ''}
+      media={media}
       onAdmit={admitFromLobby}
       onDeny={denyFromLobby}
       onSetAdmission={setAdmissionMode}
       onLeave={handleLeave}
+      messages={messages}
+      onSendChat={sendChat}
     />
   );
 }

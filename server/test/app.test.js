@@ -23,11 +23,56 @@ function withEnv(vars, fn) {
   });
 }
 
-test('GET /health reports db:false when no database is configured', async () => {
+test('GET /health reports db:false and livekit:false when neither is configured', async () => {
   const { base, close } = await listen(createApp({ db: null, auth: (_req, _res, next) => next() }));
   const res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, db: false });
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false });
+  await close();
+});
+
+test('GET /health reports livekit:true when LiveKit answers', async () => {
+  const { base, close } = await listen(
+    createApp({ db: null, auth: (_req, _res, next) => next(), livekit: { ping: async () => {} } }),
+  );
+  const res = await fetch(`${base}/health`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: true });
+  await close();
+});
+
+test('GET /health reports livekit:false when LiveKit is configured but unreachable', async () => {
+  const { base, close } = await listen(
+    createApp({
+      db: null,
+      auth: (_req, _res, next) => next(),
+      livekit: {
+        ping: async () => {
+          throw new Error('ECONNREFUSED 127.0.0.1:7880');
+        },
+      },
+    }),
+  );
+  const res = await fetch(`${base}/health`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false });
+  await close();
+});
+
+test('GET /health reports db:false when the database is configured but failing', async () => {
+  const { base, close } = await listen(
+    createApp({
+      db: {
+        query: async () => {
+          throw new Error('connection terminated');
+        },
+      },
+      auth: (_req, _res, next) => next(),
+    }),
+  );
+  const res = await fetch(`${base}/health`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false });
   await close();
 });
 

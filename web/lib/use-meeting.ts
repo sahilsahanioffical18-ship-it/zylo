@@ -6,11 +6,17 @@ import { io, type Socket } from 'socket.io-client';
 import { toast } from 'sonner';
 import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
+import { validateChatText } from '@/lib/chat-rules';
 import type { Admission } from '@/lib/types';
 
 export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean };
 export type LobbyEntry = { userId: string; name: string; imageUrl: string | null };
 export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied';
+export type ChatMessage = { userId: string; name: string; text: string; ts: number };
+
+// ponytail: keep the last 200 in memory; nothing is stored anyway, so scrollback has a
+// floor. Raise it or virtualise if a long meeting ever loses history people wanted.
+const MAX_MESSAGES = 200;
 
 export type MeetingState =
   | { status: 'connecting' }
@@ -32,6 +38,7 @@ export function useMeeting(meetingId: string | null) {
   const [state, setState] = useState<MeetingState>({ status: 'connecting' });
   const [lobby, setLobby] = useState<LobbyEntry[]>([]);
   const [admission, setAdmission] = useState<Admission | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   useEffect(() => {
     if (!meetingId) return;
@@ -40,6 +47,7 @@ export function useMeeting(meetingId: string | null) {
     Promise.resolve().then(() => {
       setState({ status: 'connecting' });
       setLobby([]);
+      setMessages([]);
     });
 
     const socket = io(SERVER_URL, {
@@ -61,10 +69,30 @@ export function useMeeting(meetingId: string | null) {
     // room:presence always follows meeting:admitted and carries the roster, so it
     // is what flips us into the room — admitted on its own would render empty.
     socket.on('room:presence', ({ people }: { people: Person[] }) => setState({ status: 'admitted', people }));
-    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => setState({ status: 'denied', reason }));
-    socket.on('meeting:replaced', () => setState({ status: 'replaced' }));
+    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => {
+      setState({ status: 'denied', reason });
+      // Terminal screen: nothing to reconnect to. Calling disconnect() here is a
+      // CLIENT-initiated disconnect, which is what turns off socket.io's automatic
+      // reconnection (this is not a 'disconnect' event LISTENER — we still never
+      // react to the server's own disconnect event, which the 30s seat grace
+      // period depends on). Without this call, a later network blip would
+      // reconnect this socket, re-emit meeting:join-request, and silently
+      // re-queue someone the host just denied.
+      socket.disconnect();
+    });
+    socket.on('meeting:replaced', () => {
+      setState({ status: 'replaced' });
+      // Same fix as meeting:denied above. Without disconnecting here, a hidden
+      // tab's socket that blips (laptop sleep, background-tab throttling) would
+      // reconnect, re-send join-request, skip the lobby (the server lets a seat
+      // holder back in without queueing), retake the seat from the tab the user
+      // is actually watching, and flip back to 'admitted' — republishing camera
+      // and mic from a tab nobody is looking at.
+      socket.disconnect();
+    });
     socket.on('lobby:update', ({ waiting }: { waiting: LobbyEntry[] }) => setLobby(waiting));
     socket.on('meeting:settings', (settings: { admission: Admission }) => setAdmission(settings.admission));
+    socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));
 
     return () => {
       socket.disconnect();
@@ -91,5 +119,13 @@ export function useMeeting(meetingId: string | null) {
     socketRef.current?.emit('host:set-admission', { mode });
   }, []);
 
-  return { state, lobby, admission, leave, admitFromLobby, denyFromLobby, setAdmissionMode };
+  // Validate client-side so a message the server would silently drop never leaves
+  // the browser (the server takes the sender's name from the seat, so there is
+  // nothing else for this call to pass).
+  const sendChat = useCallback((text: string) => {
+    if (validateChatText(text) === null) return;
+    socketRef.current?.emit('chat:message', { text });
+  }, []);
+
+  return { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat };
 }

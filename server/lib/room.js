@@ -1,4 +1,5 @@
 const seats = require('./seats');
+const { validateChatText } = require('./chatRules');
 
 const roomChannel = (meetingId) => `meeting:${meetingId}`;
 
@@ -204,6 +205,21 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       socket.data.meetingId = null;
       await onSeatFreed(meetingId);
       socket.disconnect(true);
+    });
+
+    // ZyloChat. roomChannel holds exactly the seated members — a socket joins it only
+    // inside admit() — so joining it is both the authorization scope and the delivery
+    // scope. But socket.data.meetingId is also set for people still in the lobby, so
+    // it proves nothing on its own: the seat lookup is the real check. The name comes
+    // from the seat, never the payload, so nobody can speak as someone else.
+    on(socket, 'chat:message', ({ text } = {}) => {
+      const { meetingId, userId } = socket.data;
+      if (!meetingId) return;
+      const seat = seats.seatFor(meetingId, userId);
+      if (!seat || seat.socketId !== socket.id) return;
+      const clean = validateChatText(text);
+      if (!clean) return; // a client bug or a probe; see host:set-admission below
+      io.to(roomChannel(meetingId)).emit('chat:message', { userId, name: seat.name, text: clean, ts: Date.now() });
     });
 
     on(socket, 'lobby:admit', async ({ userId } = {}, ack) => {

@@ -1,5 +1,6 @@
 const express = require('express');
 const { generateCode, isValidCode, validateCreateMeeting } = require('./meetingRules');
+const seats = require('./seats');
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -38,7 +39,7 @@ async function getCard(db, id, userId) {
   return rows[0] ? toCard(rows[0], userId) : null;
 }
 
-function meetingsRouter(db) {
+function meetingsRouter(db, livekit) {
   const router = express.Router();
 
   router.get('/dashboard', async (req, res) => {
@@ -101,6 +102,43 @@ function meetingsRouter(db) {
     const meeting = await getCard(db, req.params.id, req.userId);
     if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
     res.json({ meeting, isHost: meeting.isHost });
+  });
+
+  router.get('/meetings/:id/livekit-token', async (req, res) => {
+    const { id } = req.params;
+    if (!isValidCode(id)) return res.status(400).json({ error: 'That is not a valid meeting code.' });
+    if (!livekit) return res.status(503).json({ error: 'LIVEKIT is not configured on the server.' });
+
+    const seat = seats.seatFor(id, req.userId);
+    if (!seat) return res.status(403).json({ error: 'You do not hold a seat in this meeting.' });
+
+    const { rows } = await db.query(
+      `SELECT m.max_participants, p.removed_at
+       FROM meetings m
+       LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $2
+       WHERE m.id = $1`,
+      [id, req.userId],
+    );
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: 'Meeting not found.' });
+    if (row.removed_at) return res.status(403).json({ error: 'You have been removed from this meeting.' });
+
+    let token;
+    try {
+      // LiveKit is the only out-of-process dependency reached from this path with
+      // a documented failure status: its ServerError carries .status = 401, which
+      // the error middleware would otherwise forward as a 401 "not signed in" to a
+      // caller who is genuinely signed in. Narrow on purpose — wraps exactly the
+      // two upstream calls, nothing else in the handler. console.errors like
+      // room.js's socket wrapper does.
+      await livekit.ensureRoom(id, row.max_participants);
+      token = await livekit.mintToken({ meetingId: id, userId: req.userId, name: seat.name });
+    } catch (err) {
+      console.error('livekit token mint failed:', err.message);
+      return res.status(503).json({ error: 'The video server is unavailable right now.' });
+    }
+
+    res.json({ token, url: livekit.url });
   });
 
   router.delete('/meetings/:id', async (req, res) => {

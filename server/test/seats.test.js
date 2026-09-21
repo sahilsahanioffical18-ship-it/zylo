@@ -136,6 +136,15 @@ test('a second tab takes the seat over and reports the old socket', () => {
   seats.clearMeeting(id);
 });
 
+test('seatFor returns the seat record, or null for a stranger or an unknown meeting', () => {
+  const id = 'm-seat-for';
+  seats.tryTakeSeat(id, { ...person(1), isHost: true, max: 3 });
+  assert.deepEqual(seats.seatFor(id, 'u1'), { userId: 'u1', socketId: 's1', name: 'User 1', imageUrl: null, isHost: true });
+  assert.equal(seats.seatFor(id, 'u2'), null); // seated meeting, unseated user
+  assert.equal(seats.seatFor('m-does-not-exist', 'u1'), null); // unknown meeting
+  seats.clearMeeting(id);
+});
+
 test('clearMeeting drops all state and cancels a pending grace timer', async () => {
   const id = 'm-clear';
   let expired = false;

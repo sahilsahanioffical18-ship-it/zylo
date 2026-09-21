@@ -35,4 +35,4 @@ function createLivekit({ url, apiKey, apiSecret, rooms } = {}) {
   };
 }
 
-module.exports = { createLivekit, TOKEN_TTL, EMPTY_TIMEOUT };
+module.exports = { createLivekit };

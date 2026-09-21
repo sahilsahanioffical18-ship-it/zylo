@@ -218,7 +218,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       const seat = seats.seatFor(meetingId, userId);
       if (!seat || seat.socketId !== socket.id) return;
       const clean = validateChatText(text);
-      if (!clean) return; // a client bug or a probe; see host:set-admission above
+      if (!clean) return; // a client bug or a probe; see host:set-admission below
       io.to(roomChannel(meetingId)).emit('chat:message', { userId, name: seat.name, text: clean, ts: Date.now() });
     });
 

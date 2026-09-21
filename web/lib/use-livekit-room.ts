@@ -12,8 +12,8 @@ export type MediaPrefs = { micOn: boolean; camOn: boolean };
 export type LiveKitStatus = 'idle' | 'connecting' | 'connected' | 'error';
 
 // room.connect() rejections that aren't an ApiError (bad token, LiveKit host down,
-// room full) don't expose a discriminator we can trust across server versions —
-// see the VERIFY note in the task brief. One generic, retry-able message covers all of them.
+// room full) don't expose a discriminator we can trust across server versions, so
+// one generic, retry-able message covers all of them.
 const CONNECT_ERROR = `Couldn't connect to the video for this ${brand.room}. Check your connection, then try again.`;
 
 function connectErrorMessage(err: unknown): string {

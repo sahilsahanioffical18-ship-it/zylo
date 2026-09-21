@@ -171,7 +171,14 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     room.on(RoomEvent.TrackUnmuted, () => snapshot());
     room.on(RoomEvent.LocalTrackPublished, () => snapshot());
     room.on(RoomEvent.LocalTrackUnpublished, () => snapshot());
-    room.on(RoomEvent.ParticipantDisconnected, () => snapshot());
+    // apply() (not just snapshot()) so the slot the leaving participant held is
+    // handed to the next person in `order` right away, matching
+    // ParticipantConnected — otherwise a room past the 5-live-video limit leaves
+    // that slot empty until somebody speaks or publishes.
+    room.on(RoomEvent.ParticipantDisconnected, () => {
+      apply();
+      snapshot();
+    });
 
     room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
       if (!room.canPlaybackAudio) {
@@ -239,6 +246,11 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
       setAudioTracks([]);
       setSpeaking(new Set());
       setMicMuted(new Set());
+      // The AudioPlaybackStatusChanged listener above is gone (removeAllListeners
+      // just ran), but its toast isn't: without this it survives past Leave onto
+      // the dashboard, and its "Turn on sound" button would call startAudio() on
+      // this now-disconnected Room.
+      toast.dismiss('lk-audio');
     };
   }, [meetingId, attempt, api]);
 

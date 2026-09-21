@@ -265,7 +265,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     let cancelled = false;
     room.localParticipant.setMicrophoneEnabled(micOn).catch((err) => {
       if (cancelled) return;
-      toast.error(mediaErrorMessage(err, brand.product));
+      toast.error(mediaErrorMessage(err, brand.product, 'room'));
       setMicOn(false);
     });
     return () => {
@@ -280,7 +280,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     let cancelled = false;
     room.localParticipant.setCameraEnabled(camOn).catch((err) => {
       if (cancelled) return;
-      toast.error(mediaErrorMessage(err, brand.product));
+      toast.error(mediaErrorMessage(err, brand.product, 'room'));
       setCamOn(false);
     });
     return () => {

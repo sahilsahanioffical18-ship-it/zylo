@@ -24,3 +24,14 @@ test('anything else falls back to the HTTPS hint, naming the product', () => {
     assert.match(msg, /Zylo/);
   }
 });
+
+test('room context: a missing device does not say you can still join', () => {
+  const msg = mediaErrorMessage(new DOMException('x', 'NotFoundError'), 'Zylo', 'room');
+  assert.doesNotMatch(msg, /still join/);
+});
+
+test('room context: an unrecognised error does not mention HTTPS or localhost', () => {
+  const msg = mediaErrorMessage(new Error('boom'), 'Zylo', 'room');
+  assert.doesNotMatch(msg, /HTTPS|localhost/);
+  assert.match(msg, /camera|microphone/i);
+});

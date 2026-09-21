@@ -94,12 +94,17 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     let order: string[] = [];
 
     function snapshot() {
+      // LiveKit mutes a camera publication rather than unpublishing it when the
+      // camera is turned off, so the track object (and its last frame) survives —
+      // isMuted has to be checked here too, same as the mic path below, or a
+      // stopped camera renders as a frozen/black tile instead of falling back to
+      // the avatar.
       const video = new Map<string, VideoTrack>();
-      const localVideo = room.localParticipant.getTrackPublication(Track.Source.Camera)?.videoTrack;
-      if (localVideo) video.set(room.localParticipant.identity, localVideo);
+      const localCam = room.localParticipant.getTrackPublication(Track.Source.Camera);
+      if (localCam && !localCam.isMuted && localCam.videoTrack) video.set(room.localParticipant.identity, localCam.videoTrack);
       for (const participant of room.remoteParticipants.values()) {
-        const videoTrack = participant.getTrackPublication(Track.Source.Camera)?.videoTrack;
-        if (videoTrack) video.set(participant.identity, videoTrack);
+        const pub = participant.getTrackPublication(Track.Source.Camera);
+        if (pub && !pub.isMuted && pub.videoTrack) video.set(participant.identity, pub.videoTrack);
       }
 
       const audio: { sid: string; track: RemoteAudioTrack }[] = [];

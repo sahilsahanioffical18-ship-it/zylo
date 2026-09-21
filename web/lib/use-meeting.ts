@@ -69,8 +69,27 @@ export function useMeeting(meetingId: string | null) {
     // room:presence always follows meeting:admitted and carries the roster, so it
     // is what flips us into the room — admitted on its own would render empty.
     socket.on('room:presence', ({ people }: { people: Person[] }) => setState({ status: 'admitted', people }));
-    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => setState({ status: 'denied', reason }));
-    socket.on('meeting:replaced', () => setState({ status: 'replaced' }));
+    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => {
+      setState({ status: 'denied', reason });
+      // Terminal screen: nothing to reconnect to. Calling disconnect() here is a
+      // CLIENT-initiated disconnect, which is what turns off socket.io's automatic
+      // reconnection (this is not a 'disconnect' event LISTENER — we still never
+      // react to the server's own disconnect event, which the 30s seat grace
+      // period depends on). Without this call, a later network blip would
+      // reconnect this socket, re-emit meeting:join-request, and silently
+      // re-queue someone the host just denied.
+      socket.disconnect();
+    });
+    socket.on('meeting:replaced', () => {
+      setState({ status: 'replaced' });
+      // Same fix as meeting:denied above. Without disconnecting here, a hidden
+      // tab's socket that blips (laptop sleep, background-tab throttling) would
+      // reconnect, re-send join-request, skip the lobby (the server lets a seat
+      // holder back in without queueing), retake the seat from the tab the user
+      // is actually watching, and flip back to 'admitted' — republishing camera
+      // and mic from a tab nobody is looking at.
+      socket.disconnect();
+    });
     socket.on('lobby:update', ({ waiting }: { waiting: LobbyEntry[] }) => setLobby(waiting));
     socket.on('meeting:settings', (settings: { admission: Admission }) => setAdmission(settings.admission));
     socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));

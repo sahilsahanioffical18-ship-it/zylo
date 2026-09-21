@@ -39,6 +39,10 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   const router = useRouter();
   const { user } = useUser();
   const [joined, setJoined] = useState<{ meeting: MeetingCard; prefs: MediaPrefs } | null>(null);
+  // Set by handleLeave, checked only in the `!joined` branch below: it exists
+  // purely to stop <PreJoin> mounting (and calling getUserMedia) during the
+  // window between setJoined(null) and router.push('/dashboard') landing.
+  const [leaving, setLeaving] = useState(false);
   // The socket only opens once Join is pressed, so nobody takes a seat while
   // they are still setting up their camera.
   const { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat } =
@@ -65,12 +69,20 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   // same render, so its connect effect's cleanup (room.disconnect()) is queued
   // before <PreJoin> ever mounts and re-acquires the camera.
   function handleLeave() {
+    setLeaving(true);
     leave();
     setJoined(null);
     router.push('/dashboard');
   }
 
-  if (!joined) return <PreJoin code={code} onJoin={(meeting, prefs) => setJoined({ meeting, prefs })} />;
+  if (!joined) {
+    // leaving: render nothing rather than <PreJoin> — otherwise the brief window
+    // before router.push('/dashboard') lands would mount PreJoin, which fetches
+    // the meeting and calls getUserMedia, blinking the camera light back on (and
+    // flashing "This meeting has ended" if this was the last participant out).
+    if (leaving) return null;
+    return <PreJoin code={code} onJoin={(meeting, prefs) => setJoined({ meeting, prefs })} />;
+  }
 
   if (state.status === 'denied') {
     const { title, text } = DENIED_COPY[state.reason];

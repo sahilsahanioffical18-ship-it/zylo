@@ -127,6 +127,8 @@ function recordingLivekit() {
     evict: record('evict'),
     grantScreenShare: record('grantScreenShare'),
     revokeScreenShare: record('revokeScreenShare'),
+    muteMic: record('muteMic'),
+    endRoom: record('endRoom'),
   };
 }
 

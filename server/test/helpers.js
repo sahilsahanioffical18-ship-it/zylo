@@ -148,11 +148,14 @@ async function roomHarness(t, options = {}) {
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
+    // Cancel any grace timers a disconnect just started before they can fire against
+    // a pool that's about to close — clearMeeting cancels them outright instead of
+    // racing settle()'s fixed delay against the timer's own graceMs.
+    seats.clearMeeting(meetingId);
     // Give the server's own disconnect handling (onSeatFreed's DB query, among
     // others) a chance to finish before the pool it needs goes away.
     await settle();
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
   const connect = (userId) => { const c = connectClient(server.url, userId); clients.push(c); return c; };

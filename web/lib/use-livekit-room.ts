@@ -409,7 +409,12 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
       try {
         await Promise.all(tracks.map((track) => room.localParticipant.publishTrack(track, { source: track.source })));
       } catch (err) {
-        tracks.forEach((track) => track.stop());
+        // Video and screen-share audio negotiate independently, so one can publish
+        // while the other rejects. Unpublish (not just stop) every track: unpublishTrack
+        // stops the track as part of tearing it down and resolves harmlessly for a
+        // track that never published, so whichever one *did* land on the server gets
+        // removed too instead of being left as a live, frozen ScreenShare publication.
+        await Promise.allSettled(tracks.map((track) => room.localParticipant.unpublishTrack(track)));
         toast.error(screenStartErrorMessage(err, brand.live));
         shareRef.current.onEnded();
       }

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -72,13 +72,14 @@ export function RoomShell({
   // Session-only, local to this viewer: never persisted, never sent to the server.
   const [mutedForMe, setMutedForMe] = useState<Set<string>>(() => new Set());
 
-  const openPanel = (next: PanelTab) => {
+  // Stable (setters only), so the ZyloChat toast effect below doesn't re-run every render.
+  const openPanel = useCallback((next: PanelTab) => {
     setTab(next);
     // The panel is docked at >=1024px; below that the same button opens the Sheet.
     // Reading the media query in the click handler (not during render) keeps this
     // out of hydration and out of react-hooks' way.
     if (!window.matchMedia('(min-width: 1024px)').matches) setSheetOpen(true);
-  };
+  }, []);
 
   const toggleMuteForMe = (userId: string) => {
     setMutedForMe((prev) => {
@@ -96,7 +97,7 @@ export function RoomShell({
   useEffect(() => {
     const last = messages.at(-1);
     if (!last || last === seenRef.current) return;
-    seenRef.current = last; // set once per new message; a remount seeds from mount, never re-toasting old history
+    seenRef.current = last; // seeded at mount, so a remount never re-toasts history
     const chatVisible = tab === 'chat' && (sheetOpen || window.matchMedia('(min-width: 1024px)').matches);
     if (shouldToast(last, selfUserId, chatVisible)) {
       toast(last.name, {

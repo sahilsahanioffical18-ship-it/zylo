@@ -43,13 +43,11 @@ function ScreenVideo({ track }: { track: VideoTrack }) {
 // re-runs the attach effect, while an unrelated snapshot update does not.
 function AudioSink({ track, muted }: { track: RemoteAudioTrack; muted: boolean }) {
   const ref = useAttach<HTMLAudioElement>(track);
-  // A second effect, declared after useAttach's. livekit-client's attachToElement
-  // sets element.muted = false unconditionally, so every re-attach (a new track
-  // object under the same sid) would silently undo "Mute for me" if this ran first.
-  // Effects run in declaration order, so this one always runs after the attach.
+  // After useAttach's effect (declaration order): livekit's attach resets
+  // element.muted to false, so every re-attach must re-apply "Mute for me".
   useEffect(() => {
     if (ref.current) ref.current.muted = muted;
-  }, [track, muted]);
+  }, [ref, track, muted]);
   return <audio ref={ref} autoPlay playsInline />;
 }
 

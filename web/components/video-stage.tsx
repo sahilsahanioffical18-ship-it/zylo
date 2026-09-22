@@ -98,7 +98,7 @@ function Tile({
         </span>
       )}
       <span className={`absolute flex items-center gap-2 ${small ? 'inset-x-2 bottom-2 text-xs' : 'inset-x-3 bottom-3'}`}>
-        <span className="truncate rounded-md bg-background/80 px-2 py-1 text-sm font-medium">{person.name}</span>
+        <span className="min-w-0 truncate rounded-md bg-background/80 px-2 py-1 text-sm font-medium">{person.name}</span>
         {person.isHost && <Badge variant="secondary">Host</Badge>}
         {isMicMuted && <MicOff className="size-4 shrink-0 text-muted-foreground" aria-label="Muted" />}
       </span>
@@ -110,6 +110,8 @@ function GridStage({ people, status, tileProps }: { people: Person[]; status: Li
   const ref = useRef<HTMLElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
+  // p-1 on <main> leaves room for the 2px speaking ring: a tile that fills the stage
+  // would otherwise have it clipped by overflow-hidden (contentRect excludes padding).
   // Grid-only measurement: mounts and unmounts with grid mode. ResizeObserver's first
   // notification arrives before paint, so there's no first-frame flash, and the
   // setSize call lives in its callback (not the effect body), so this stays clear of
@@ -131,7 +133,7 @@ function GridStage({ people, status, tileProps }: { people: Person[]; status: Li
     <main
       ref={ref}
       aria-label={`${brand.room} stage`}
-      className={`relative min-h-0 min-w-0 flex-1 ${fit.scroll ? 'overflow-y-auto' : 'overflow-hidden'}`}
+      className={`relative min-h-0 min-w-0 flex-1 p-1 ${fit.scroll ? 'overflow-y-auto' : 'overflow-hidden'}`}
     >
       {status === 'connecting' && (
         <p

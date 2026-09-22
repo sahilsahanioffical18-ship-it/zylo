@@ -1,6 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -10,6 +11,7 @@ import { ControlBar, type PanelTab } from '@/components/control-bar';
 import { PeoplePanel } from '@/components/people-panel';
 import { VideoStage } from '@/components/video-stage';
 import { brand } from '@/lib/brand';
+import { shouldToast, toastPreview } from '@/lib/chat-toast';
 import { stageView } from '@/lib/screen-share';
 import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { useLiveKitRoom } from '@/lib/use-livekit-room';
@@ -86,6 +88,26 @@ export function RoomShell({
       return next;
     });
   };
+
+  // Toasts a new ZyloChat message while chat isn't on screen. Keyed on the last
+  // message, not messages.length: use-meeting slices the array to MAX_MESSAGES, so
+  // the length stops changing once a room hits that cap.
+  const seenRef = useRef<ChatMessage | undefined>(messages.at(-1));
+  useEffect(() => {
+    const last = messages.at(-1);
+    if (!last || last === seenRef.current) return;
+    seenRef.current = last; // set once per new message; a remount seeds from mount, never re-toasting old history
+    const chatVisible = tab === 'chat' && (sheetOpen || window.matchMedia('(min-width: 1024px)').matches);
+    if (shouldToast(last, selfUserId, chatVisible)) {
+      toast(last.name, {
+        id: 'zylochat', // a burst of messages replaces one toast instead of stacking
+        description: toastPreview(last.text),
+        duration: 4000,
+        position: 'top-right', // off the room title and the control bar
+        action: { label: 'Open', onClick: () => openPanel('chat') },
+      });
+    }
+  }, [messages, selfUserId, tab, sheetOpen, openPanel]);
 
   const peoplePanel = (
     <PeoplePanel

@@ -67,6 +67,8 @@ export function RoomShell({
   // lobby (admit/deny) and the admission setting live there, and hiding those behind a
   // tab would regress Phase 2 behaviour.
   const [sheetOpen, setSheetOpen] = useState(false);
+  // Session-only, local to this viewer: never persisted, never sent to the server.
+  const [mutedForMe, setMutedForMe] = useState<Set<string>>(() => new Set());
 
   const openPanel = (next: PanelTab) => {
     setTab(next);
@@ -74,6 +76,15 @@ export function RoomShell({
     // Reading the media query in the click handler (not during render) keeps this
     // out of hydration and out of react-hooks' way.
     if (!window.matchMedia('(min-width: 1024px)').matches) setSheetOpen(true);
+  };
+
+  const toggleMuteForMe = (userId: string) => {
+    setMutedForMe((prev) => {
+      const next = new Set(prev);
+      if (next.has(userId)) next.delete(userId);
+      else next.add(userId);
+      return next;
+    });
   };
 
   const peoplePanel = (
@@ -85,6 +96,8 @@ export function RoomShell({
       selfUserId={selfUserId}
       sharerUserId={sharerUserId}
       micMuted={media.micMuted}
+      mutedForMe={mutedForMe}
+      onToggleMuteForMe={toggleMuteForMe}
       screenPolicy={screenPolicy}
       onSetScreenPolicy={onSetScreenPolicy}
       onAdmit={onAdmit}
@@ -148,6 +161,7 @@ export function RoomShell({
           audioTracks={media.audioTracks}
           speaking={media.speaking}
           micMuted={media.micMuted}
+          mutedForMe={mutedForMe}
           status={media.status}
           view={view}
           screenTracks={media.screenTracks}

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Check, MicOff, MoreHorizontal, ScreenShareOff, UserX, X } from 'lucide-react';
+import { Check, MicOff, MoreHorizontal, ScreenShareOff, UserX, Volume2, VolumeX, X } from 'lucide-react';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -58,6 +58,30 @@ function LobbyAction({
         </Button>
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+// Local-only, session-only: never touches the server, so it's offered for every row
+// (host or not) except the viewer's own, unlike the host-only PersonMenu below.
+function MuteForMeAction({ name, muted, onClick }: { name: string; muted: boolean; onClick: () => void }) {
+  const Icon = muted ? VolumeX : Volume2;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="size-11"
+          aria-pressed={muted}
+          aria-label={muted ? `Unmute ${name} for me` : `Mute ${name} for me`}
+          onClick={onClick}
+        >
+          <Icon className="size-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{muted ? 'Unmute for me' : 'Only you won’t hear them'}</TooltipContent>
     </Tooltip>
   );
 }
@@ -143,6 +167,8 @@ export function PeoplePanel({
   selfUserId,
   sharerUserId,
   micMuted,
+  mutedForMe,
+  onToggleMuteForMe,
   screenPolicy,
   onSetScreenPolicy,
   onAdmit,
@@ -159,6 +185,8 @@ export function PeoplePanel({
   selfUserId: string;
   sharerUserId: string | null;
   micMuted: Set<string>;
+  mutedForMe: Set<string>;
+  onToggleMuteForMe: (userId: string) => void;
   screenPolicy: ScreenSharePolicy;
   onSetScreenPolicy: (policy: ScreenSharePolicy) => void;
   onAdmit: (userId: string) => void;
@@ -230,11 +258,18 @@ export function PeoplePanel({
               return (
                 <li key={person.userId} className="flex items-center gap-3 rounded-lg px-1 py-1.5">
                   <PersonAvatar name={person.name} imageUrl={person.imageUrl} />
-                  <span className="flex-1 truncate text-sm">{person.name}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm">{person.name}</span>
                   {sharerUserId === person.userId && (
                     <Badge className="bg-success text-success-foreground">{brand.live}</Badge>
                   )}
                   {person.isHost && <Badge variant="secondary">Host</Badge>}
+                  {person.userId !== selfUserId && (
+                    <MuteForMeAction
+                      name={person.name}
+                      muted={mutedForMe.has(person.userId)}
+                      onClick={() => onToggleMuteForMe(person.userId)}
+                    />
+                  )}
                   {actions.length > 0 && (
                     <PersonMenu person={person} actions={actions} onMute={onMute} onStopShare={onStopShare} onKick={onKick} />
                   )}

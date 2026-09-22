@@ -67,7 +67,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
   const [attempt, setAttempt] = useState(0);
 
   const [videoTracks, setVideoTracks] = useState<Map<string, VideoTrack>>(new Map());
-  const [audioTracks, setAudioTracks] = useState<{ sid: string; track: RemoteAudioTrack }[]>([]);
+  const [audioTracks, setAudioTracks] = useState<{ sid: string; identity: string; track: RemoteAudioTrack }[]>([]);
   const [speaking, setSpeaking] = useState<Set<string>>(new Set());
   const [micMuted, setMicMuted] = useState<Set<string>>(new Set());
   const [screenTracks, setScreenTracks] = useState<Map<string, VideoTrack>>(new Map());
@@ -132,10 +132,12 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
         if (pub && !pub.isMuted && pub.videoTrack) video.set(participant.identity, pub.videoTrack);
       }
 
-      const audio: { sid: string; track: RemoteAudioTrack }[] = [];
+      const audio: { sid: string; identity: string; track: RemoteAudioTrack }[] = [];
       for (const participant of room.remoteParticipants.values()) {
         for (const pub of participant.audioTrackPublications.values()) {
-          if (pub.track) audio.push({ sid: pub.trackSid, track: pub.track as RemoteAudioTrack });
+          // identity is the userId, the same key videoTracks uses — VideoStage keys
+          // "Mute for me" off it.
+          if (pub.track) audio.push({ sid: pub.trackSid, identity: participant.identity, track: pub.track as RemoteAudioTrack });
         }
       }
 

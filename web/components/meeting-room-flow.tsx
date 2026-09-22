@@ -45,8 +45,23 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   const [leaving, setLeaving] = useState(false);
   // The socket only opens once Join is pressed, so nobody takes a seat while
   // they are still setting up their camera.
-  const { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat } =
-    useMeeting(joined ? code : null);
+  const {
+    state,
+    lobby,
+    admission,
+    messages,
+    leave,
+    admitFromLobby,
+    denyFromLobby,
+    setAdmissionMode,
+    sendChat,
+    sharerUserId,
+    shareGrant,
+    requestScreen,
+    stopScreen,
+  } = useMeeting(joined ? code : null);
+  const selfUserId = user?.id ?? '';
+  const presenting = sharerUserId !== null && sharerUserId === selfUserId;
   // One expression decides both "which screen" and "is LiveKit connected", so they
   // can never disagree. `joined` is deliberately part of this condition, not
   // redundant with `state.status`: it is the only thing Leave changes
@@ -60,7 +75,11 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   // A transient socket blip is NOT one of these paths: use-meeting.ts only flips
   // state away from 'admitted' on connect_error, not on a bare 'disconnect', so a
   // reconnecting socket keeps video up.
-  const media = useLiveKitRoom(joined && state.status === 'admitted' ? code : null, joined?.prefs ?? MEDIA_OFF);
+  const media = useLiveKitRoom(joined && state.status === 'admitted' ? code : null, joined?.prefs ?? MEDIA_OFF, {
+    grant: shareGrant,
+    allowed: presenting,
+    onEnded: stopScreen,
+  });
 
   // Tells the server first (releases the seat), then tears down locally right
   // away rather than waiting on a socket round-trip: setting joined to null
@@ -124,8 +143,10 @@ export function MeetingRoomFlow({ code }: { code: string }) {
       lobby={lobby}
       admission={admission ?? joined.meeting.admission}
       isHost={state.people.find((p) => p.userId === user?.id)?.isHost ?? false}
-      selfUserId={user?.id ?? ''}
+      selfUserId={selfUserId}
       media={media}
+      sharerUserId={sharerUserId}
+      onToggleLive={presenting ? media.stopScreenShare : requestScreen}
       onAdmit={admitFromLobby}
       onDeny={denyFromLobby}
       onSetAdmission={setAdmissionMode}

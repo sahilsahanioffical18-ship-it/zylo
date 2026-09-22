@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { validateChatText } from '@/lib/chat-rules';
+import { screenDeniedMessage, type ScreenDenial } from '@/lib/screen-share';
 import type { Admission } from '@/lib/types';
 
 export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean };
@@ -39,6 +40,10 @@ export function useMeeting(meetingId: string | null) {
   const [lobby, setLobby] = useState<LobbyEntry[]>([]);
   const [admission, setAdmission] = useState<Admission | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sharerUserId, setSharerUserId] = useState<string | null>(null);
+  // Bumped once per screen:granted. A counter, not a flag — see use-livekit-room.ts's
+  // capture effect for why.
+  const [shareGrant, setShareGrant] = useState(0);
 
   useEffect(() => {
     if (!meetingId) return;
@@ -48,6 +53,8 @@ export function useMeeting(meetingId: string | null) {
       setState({ status: 'connecting' });
       setLobby([]);
       setMessages([]);
+      setSharerUserId(null);
+      setShareGrant(0);
     });
 
     const socket = io(SERVER_URL, {
@@ -93,6 +100,9 @@ export function useMeeting(meetingId: string | null) {
     socket.on('lobby:update', ({ waiting }: { waiting: LobbyEntry[] }) => setLobby(waiting));
     socket.on('meeting:settings', (settings: { admission: Admission }) => setAdmission(settings.admission));
     socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));
+    socket.on('screen:granted', () => setShareGrant((n) => n + 1));
+    socket.on('screen:denied', (denial: ScreenDenial) => toast.error(screenDeniedMessage(denial, brand.live)));
+    socket.on('screen:state', ({ sharerUserId: id }: { sharerUserId: string | null }) => setSharerUserId(id));
 
     return () => {
       socket.disconnect();
@@ -127,5 +137,27 @@ export function useMeeting(meetingId: string | null) {
     socketRef.current?.emit('chat:message', { text });
   }, []);
 
-  return { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat };
+  const requestScreen = useCallback(() => {
+    socketRef.current?.emit('screen:request');
+  }, []);
+
+  const stopScreen = useCallback(() => {
+    socketRef.current?.emit('screen:stop');
+  }, []);
+
+  return {
+    state,
+    lobby,
+    admission,
+    messages,
+    leave,
+    admitFromLobby,
+    denyFromLobby,
+    setAdmissionMode,
+    sendChat,
+    sharerUserId,
+    shareGrant,
+    requestScreen,
+    stopScreen,
+  };
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { MessageSquare, Mic, MicOff, Users, Video, VideoOff } from 'lucide-react';
+import { MessageSquare, Mic, MicOff, ScreenShare, ScreenShareOff, Users, Video, VideoOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { MediaToggle } from '@/components/media-toggle';
@@ -8,14 +8,16 @@ import { brand } from '@/lib/brand';
 
 export type PanelTab = 'chat' | 'people';
 
-// No ZyloLive button and no End-for-all button here — those are Phase 4. This is
-// exactly Mic, Camera, ZyloChat, People, Leave and nothing else.
+// No End-for-all button here — that's Phase 4's host controls (Task 10). This is
+// Mic, Camera, ZyloLive, ZyloChat, People, Leave and nothing else.
 export function ControlBar({
   micOn,
   camOn,
   onToggleMic,
   onToggleCam,
   mediaReady,
+  sharing,
+  onToggleLive,
   peopleCount,
   waitingCount,
   onOpenPanel,
@@ -26,13 +28,15 @@ export function ControlBar({
   onToggleMic: () => void;
   onToggleCam: () => void;
   mediaReady: boolean;
+  sharing: boolean;
+  onToggleLive: () => void;
   peopleCount: number;
   waitingCount: number;
   onOpenPanel: (tab: PanelTab) => void;
   onLeave: () => void;
 }) {
   return (
-    <footer className="flex items-center justify-center gap-3 border-t border-border px-4 py-3">
+    <footer className="flex flex-wrap items-center justify-center gap-3 border-t border-border px-4 py-3">
       <MediaToggle
         on={micOn}
         label="microphone"
@@ -49,6 +53,26 @@ export function ControlBar({
         disabled={!mediaReady}
         onClick={onToggleCam}
       />
+
+      {/* Enabled whoever is presenting and whatever the policy: the server answers
+          with the spec's toasts (busy / host_only / unavailable). */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            size="icon"
+            variant={sharing ? 'default' : 'secondary'}
+            className="size-12 rounded-full"
+            aria-label={sharing ? `Stop ${brand.live}` : brand.live}
+            aria-pressed={sharing}
+            disabled={!mediaReady}
+            onClick={onToggleLive}
+          >
+            {sharing ? <ScreenShareOff className="size-5" /> : <ScreenShare className="size-5" />}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{sharing ? `Stop ${brand.live}` : `${brand.live} · share your screen`}</TooltipContent>
+      </Tooltip>
 
       <Tooltip>
         <TooltipTrigger asChild>

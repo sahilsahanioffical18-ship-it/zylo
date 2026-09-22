@@ -10,6 +10,7 @@ import { ControlBar, type PanelTab } from '@/components/control-bar';
 import { PeoplePanel } from '@/components/people-panel';
 import { VideoStage } from '@/components/video-stage';
 import { brand } from '@/lib/brand';
+import { stageView } from '@/lib/screen-share';
 import type { Admission } from '@/lib/types';
 import type { useLiveKitRoom } from '@/lib/use-livekit-room';
 import type { ChatMessage, LobbyEntry, Person } from '@/lib/use-meeting';
@@ -23,6 +24,8 @@ export function RoomShell({
   isHost,
   selfUserId,
   media,
+  sharerUserId,
+  onToggleLive,
   onAdmit,
   onDeny,
   onSetAdmission,
@@ -38,6 +41,8 @@ export function RoomShell({
   isHost: boolean;
   selfUserId: string;
   media: ReturnType<typeof useLiveKitRoom>;
+  sharerUserId: string | null;
+  onToggleLive: () => void;
   onAdmit: (userId: string) => void;
   onDeny: (userId: string) => void;
   onSetAdmission: (mode: Admission) => void;
@@ -45,6 +50,7 @@ export function RoomShell({
   messages: ChatMessage[];
   onSendChat: (text: string) => void;
 }) {
+  const view = stageView(sharerUserId, selfUserId, people);
   const [tab, setTab] = useState<PanelTab>('people'); // People is the default: the host's
   // lobby (admit/deny) and the admission setting live there, and hiding those behind a
   // tab would regress Phase 2 behaviour.
@@ -118,6 +124,8 @@ export function RoomShell({
           speaking={media.speaking}
           micMuted={media.micMuted}
           status={media.status}
+          view={view}
+          screenTracks={media.screenTracks}
         />
         <aside aria-label="Chat and people" className="hidden w-80 shrink-0 lg:block">
           {panel}
@@ -141,6 +149,8 @@ export function RoomShell({
         onToggleMic={media.toggleMic}
         onToggleCam={media.toggleCam}
         mediaReady={media.status === 'connected'}
+        sharing={sharerUserId !== null && sharerUserId === selfUserId}
+        onToggleLive={onToggleLive}
         peopleCount={people.length}
         waitingCount={waitingCount}
         onOpenPanel={openPanel}

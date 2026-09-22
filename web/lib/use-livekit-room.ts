@@ -1,15 +1,25 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { DisconnectReason, Room, RoomEvent, Track, type RemoteAudioTrack, type VideoTrack } from 'livekit-client';
+import {
+  ConnectionState,
+  DisconnectReason,
+  Room,
+  RoomEvent,
+  Track,
+  type RemoteAudioTrack,
+  type VideoTrack,
+} from 'livekit-client';
 import { toast } from 'sonner';
 import { ApiError, useApi } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { mediaErrorMessage } from '@/lib/media-error';
+import { screenStartErrorMessage } from '@/lib/screen-share';
 import { promote, seen, videoIdentities } from '@/lib/speaker-order';
 
 export type MediaPrefs = { micOn: boolean; camOn: boolean };
 export type LiveKitStatus = 'idle' | 'connecting' | 'connected' | 'error';
+export type ShareInput = { grant: number; allowed: boolean; onEnded: () => void };
 
 // room.connect() rejections that aren't an ApiError (bad token, LiveKit host down,
 // room full) don't expose a discriminator we can trust across server versions, so
@@ -31,9 +41,10 @@ function connectErrorMessage(err: unknown): string {
  *
  * Pass `meetingId: null` while there's nothing to join yet — no Room is created.
  */
-export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
+export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, share: ShareInput) {
   const api = useApi();
   const roomRef = useRef<Room | null>(null);
+  const { grant, allowed } = share;
 
   // Tracks whether the current connection has already used its one automatic
   // reconnect. Lives outside the effect (a ref, not state) because it must
@@ -55,6 +66,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
   const [audioTracks, setAudioTracks] = useState<{ sid: string; track: RemoteAudioTrack }[]>([]);
   const [speaking, setSpeaking] = useState<Set<string>>(new Set());
   const [micMuted, setMicMuted] = useState<Set<string>>(new Set());
+  const [screenTracks, setScreenTracks] = useState<Map<string, VideoTrack>>(new Map());
 
   // micOn/camOn start false and are only set once the room actually connects
   // (seeded from prefsRef.current there) — never from `prefs` directly, so
@@ -66,8 +78,10 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
   // keeps `prefs` out of the connect effect's deps, which would otherwise tear
   // down and rebuild the whole LiveKit room on every parent re-render.
   const prefsRef = useRef(prefs);
+  const shareRef = useRef(share);
   useEffect(() => {
     prefsRef.current = prefs;
+    shareRef.current = share;
   });
 
   useEffect(() => {
@@ -87,6 +101,10 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     // silently do nothing and we'd subscribe to every participant's video.
     const room = new Room({ adaptiveStream: true, dynacast: true });
     roomRef.current = room;
+
+    // Reads shareRef (never share directly) so listeners and cleanup below don't
+    // capture a stale closure over a prop from the render that started this effect.
+    const endShare = () => shareRef.current.onEnded();
 
     // Speaker order driving the subscription policy. A plain local, not React
     // state, so it stays cheap; still built only through the pure promote/seen
@@ -126,10 +144,19 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
       // room.activeSpeakers includes the local participant.
       const speakers = new Set(room.activeSpeakers.map((p) => p.identity));
 
+      // The local share is never included here (it's never rendered to the
+      // presenter — VideoStage's presenting branch shows a status line instead).
+      const screens = new Map<string, VideoTrack>();
+      for (const participant of room.remoteParticipants.values()) {
+        const pub = participant.getTrackPublication(Track.Source.ScreenShare);
+        if (pub && !pub.isMuted && pub.videoTrack) screens.set(participant.identity, pub.videoTrack);
+      }
+
       setVideoTracks(video);
       setAudioTracks(audio);
       setMicMuted(muted);
       setSpeaking(speakers);
+      setScreenTracks(screens);
     }
 
     // Every remote audio publication gets subscribed regardless of video — we
@@ -139,7 +166,10 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
       const live = videoIdentities(order, room.remoteParticipants.keys());
       for (const [identity, participant] of room.remoteParticipants) {
         for (const pub of participant.audioTrackPublications.values()) pub.setSubscribed(true);
-        for (const pub of participant.videoTrackPublications.values()) pub.setSubscribed(live.has(identity));
+        // A ZyloLive share is always on — the spec's "five most-recent speakers
+        // plus any ZyloLive share"; cameras follow the speaker slots.
+        for (const pub of participant.videoTrackPublications.values())
+          pub.setSubscribed(pub.source === Track.Source.ScreenShare || live.has(identity));
       }
     }
 
@@ -170,7 +200,25 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     room.on(RoomEvent.TrackMuted, () => snapshot());
     room.on(RoomEvent.TrackUnmuted, () => snapshot());
     room.on(RoomEvent.LocalTrackPublished, () => snapshot());
-    room.on(RoomEvent.LocalTrackUnpublished, () => snapshot());
+    room.on(RoomEvent.LocalTrackUnpublished, (publication) => {
+      // Every way our own share ends lands here: our Stop, the browser's own "Stop
+      // sharing" (livekit-client unpublishes on the track's ended event), and LiveKit
+      // unpublishing it after the server revoked the permission. Unpublish already
+      // stopped the capture, so the browser's indicator is off; tell the server,
+      // which ignores a repeat.
+      if (publication.source === Track.Source.ScreenShare) endShare();
+      snapshot();
+    });
+    room.on(RoomEvent.TrackUnpublished, () => snapshot());
+    // A full reconnect rebuilds our session from the camera/microphone token, so a
+    // share cannot survive it: end it now instead of letting livekit-client try to
+    // republish it. A resume (SignalReconnecting) keeps the session, its permission
+    // and the share, so it is deliberately not handled.
+    room.on(RoomEvent.Reconnecting, () => {
+      if (!room.localParticipant.getTrackPublication(Track.Source.ScreenShare)) return;
+      endShare();
+      room.localParticipant.setScreenShareEnabled(false).catch(() => {});
+    });
     // apply() (not just snapshot()) so the slot the leaving participant held is
     // handed to the next person in `order` right away, matching
     // ParticipantConnected — otherwise a room past the 5-live-video limit leaves
@@ -239,6 +287,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
 
     return () => {
       cancelled = true;
+      if (room.localParticipant.getTrackPublication(Track.Source.ScreenShare)) endShare(); // listeners are about to go; disconnect() below stops the capture
       room.removeAllListeners();
       room.disconnect().catch(() => {});
       roomRef.current = null;
@@ -246,6 +295,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
       setAudioTracks([]);
       setSpeaking(new Set());
       setMicMuted(new Set());
+      setScreenTracks(new Map());
       // The AudioPlaybackStatusChanged listener above is gone (removeAllListeners
       // just ran), but its toast isn't: without this it survives past Leave onto
       // the dashboard, and its "Turn on sound" button would call startAudio() on
@@ -288,12 +338,54 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     };
   }, [status, camOn]);
 
+  // Screen capture starts HERE AND NOWHERE ELSE: when a NEW grant arrives, i.e. when
+  // `grant` changes. A counter, not a boolean, is the whole point — a reconnect, a
+  // retry or any re-render keeps the same number, so nothing but a fresh
+  // screen:granted can ever open the screen picker again. (Phase 3 shipped the
+  // camera/mic version of this bug: a reconnect re-applied the pre-join prefs.)
+  useEffect(() => {
+    if (grant === 0) return;
+    const room = roomRef.current;
+    if (!room || room.state !== ConnectionState.Connected) {
+      shareRef.current.onEnded(); // granted, but there is no connected room to share into
+      return;
+    }
+    room.localParticipant
+      .setScreenShareEnabled(true, { audio: true })
+      .then(() => {
+        // The lock went away while the picker was open (host stop, policy switch):
+        // the publish still won the race, so take it straight down.
+        if (!shareRef.current.allowed) room.localParticipant.setScreenShareEnabled(false).catch(() => {});
+      })
+      .catch((err) => {
+        // Cancelled picker, OS refusal, unsupported browser, refused publish.
+        // livekit-client has already stopped anything it captured.
+        toast.error(screenStartErrorMessage(err, brand.live));
+        shareRef.current.onEnded();
+      });
+  }, [grant]);
+
+  // This effect only ever turns sharing OFF: the server says someone else, or nobody,
+  // holds the lock (host stop, policy switch, a new tab took the seat).
+  useEffect(() => {
+    if (allowed) return;
+    roomRef.current?.localParticipant.setScreenShareEnabled(false).catch(() => {});
+  }, [allowed]);
+
   const retry = useCallback(() => {
     retriedRef.current = false;
     setAttempt((n) => n + 1);
   }, []);
   const toggleMic = useCallback(() => setMicOn((v) => !v), []);
   const toggleCam = useCallback(() => setCamOn((v) => !v), []);
+
+  // The ZyloLive button while presenting: tell the server first, so even a share
+  // whose picker is still open cannot go live afterwards, then stop locally without
+  // waiting on the round trip — a dead socket must never keep the capture running.
+  const stopScreenShare = useCallback(() => {
+    shareRef.current.onEnded();
+    roomRef.current?.localParticipant.setScreenShareEnabled(false).catch(() => {});
+  }, []);
 
   return {
     status,
@@ -307,5 +399,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs) {
     camOn,
     toggleMic,
     toggleCam,
+    screenTracks,
+    stopScreenShare,
   };
 }

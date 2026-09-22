@@ -55,6 +55,7 @@ test('a waiting user cannot take ZyloLive', async (t) => {
 
   const granted = collect(p2, 'screen:granted');
   const denied = collect(p2, 'screen:denied');
+  t.mock.method(console, 'error');
   p2.emit('screen:request');
   await settle();
 
@@ -62,6 +63,7 @@ test('a waiting user cannot take ZyloLive', async (t) => {
   assert.deepEqual(denied, []);
   assert.equal(seats.screenSharer(meetingId), null);
   assert.equal(livekit.callsTo('grantScreenShare').length, 0);
+  assert.equal(console.error.mock.callCount(), 0);
 });
 
 test('a socket the seat no longer points at cannot take ZyloLive', async (t) => {

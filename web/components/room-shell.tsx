@@ -132,11 +132,12 @@ export function RoomShell({
     />
   );
 
+  // Card chrome only when docked (lg): inside the phone Sheet it would double the padding.
   const panel = (
     <Tabs
       value={tab}
       onValueChange={(v) => setTab(v as PanelTab)}
-      className="flex h-full min-h-0 flex-col rounded-2xl border border-border bg-card p-4"
+      className="flex h-full min-h-0 flex-col lg:rounded-2xl lg:border lg:border-border lg:bg-card lg:p-4"
     >
       <TabsList className="w-full">
         <TabsTrigger value="chat">{brand.chat}</TabsTrigger>
@@ -197,7 +198,7 @@ export function RoomShell({
       {/* Controlled, no SheetTrigger: ControlBar's Chat/People buttons open this too
           (via openPanel), so they just flip the same `sheetOpen` state. */}
       <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
-        <SheetContent side="right" className="dark w-full max-w-sm p-4">
+        <SheetContent side="right" className="dark p-4 data-[side=right]:w-full data-[side=right]:max-w-sm">
           <SheetHeader className="p-0 pb-4">
             <SheetTitle>Chat and people</SheetTitle>
           </SheetHeader>

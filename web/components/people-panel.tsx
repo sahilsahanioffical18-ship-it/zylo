@@ -30,6 +30,10 @@ import { brand } from '@/lib/brand';
 import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { LobbyEntry, Person } from '@/lib/use-meeting';
 
+// Side by side without hints below lg (the phone Sheet), so the host's two settings
+// don't push "In the meeting" off screen; stacked with hints in the docked panel.
+const ROOM_SETTING_GRID = 'grid grid-cols-2 gap-2 lg:grid-cols-1 max-lg:[&_[data-hint]]:hidden';
+
 function PersonAvatar({ name, imageUrl }: { name: string; imageUrl: string | null }) {
   return (
     <Avatar className="size-8">
@@ -205,7 +209,7 @@ export function PeoplePanel({
           value={admission}
           onChange={onSetAdmission}
           options={ADMISSION_OPTIONS}
-          className="grid gap-2"
+          className={ROOM_SETTING_GRID}
         />
       )}
 
@@ -216,7 +220,7 @@ export function PeoplePanel({
           value={screenPolicy}
           onChange={onSetScreenPolicy}
           options={SCREEN_POLICY_OPTIONS}
-          className="grid gap-2"
+          className={ROOM_SETTING_GRID}
         />
       )}
 

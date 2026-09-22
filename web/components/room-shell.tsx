@@ -1,6 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -10,10 +11,14 @@ import { ControlBar, type PanelTab } from '@/components/control-bar';
 import { PeoplePanel } from '@/components/people-panel';
 import { VideoStage } from '@/components/video-stage';
 import { brand } from '@/lib/brand';
+import { shouldToast, toastPreview } from '@/lib/chat-toast';
 import { stageView } from '@/lib/screen-share';
 import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { useLiveKitRoom } from '@/lib/use-livekit-room';
 import type { ChatMessage, LobbyEntry, Person } from '@/lib/use-meeting';
+
+// Tailwind's lg: where the Chat/People panel docks beside the stage instead of opening as a Sheet.
+const DOCKED_QUERY = '(min-width: 1024px)';
 
 export function RoomShell({
   title,
@@ -67,14 +72,46 @@ export function RoomShell({
   // lobby (admit/deny) and the admission setting live there, and hiding those behind a
   // tab would regress Phase 2 behaviour.
   const [sheetOpen, setSheetOpen] = useState(false);
+  // Session-only, local to this viewer: never persisted, never sent to the server.
+  const [mutedForMe, setMutedForMe] = useState<Set<string>>(() => new Set());
 
-  const openPanel = (next: PanelTab) => {
+  // Stable (setters only), so the ZyloChat toast effect below doesn't re-run every render.
+  const openPanel = useCallback((next: PanelTab) => {
     setTab(next);
     // The panel is docked at >=1024px; below that the same button opens the Sheet.
     // Reading the media query in the click handler (not during render) keeps this
     // out of hydration and out of react-hooks' way.
-    if (!window.matchMedia('(min-width: 1024px)').matches) setSheetOpen(true);
+    if (!window.matchMedia(DOCKED_QUERY).matches) setSheetOpen(true);
+  }, []);
+
+  const toggleMuteForMe = (userId: string) => {
+    setMutedForMe((prev) => {
+      const next = new Set(prev);
+      if (next.has(userId)) next.delete(userId);
+      else next.add(userId);
+      return next;
+    });
   };
+
+  // Toasts a new ZyloChat message while chat isn't on screen. Keyed on the last
+  // message, not messages.length: use-meeting slices the array to MAX_MESSAGES, so
+  // the length stops changing once a room hits that cap.
+  const seenRef = useRef<ChatMessage | undefined>(messages.at(-1));
+  useEffect(() => {
+    const last = messages.at(-1);
+    if (!last || last === seenRef.current) return;
+    seenRef.current = last; // seeded at mount, so a remount never re-toasts history
+    const chatVisible = tab === 'chat' && (sheetOpen || window.matchMedia(DOCKED_QUERY).matches);
+    if (shouldToast(last, selfUserId, chatVisible)) {
+      toast(last.name, {
+        id: 'zylochat', // a burst of messages replaces one toast instead of stacking
+        description: toastPreview(last.text),
+        duration: 4000,
+        position: 'top-right', // off the room title and the control bar
+        action: { label: 'Open', onClick: () => openPanel('chat') },
+      });
+    }
+  }, [messages, selfUserId, tab, sheetOpen, openPanel]);
 
   const peoplePanel = (
     <PeoplePanel
@@ -85,6 +122,8 @@ export function RoomShell({
       selfUserId={selfUserId}
       sharerUserId={sharerUserId}
       micMuted={media.micMuted}
+      mutedForMe={mutedForMe}
+      onToggleMuteForMe={toggleMuteForMe}
       screenPolicy={screenPolicy}
       onSetScreenPolicy={onSetScreenPolicy}
       onAdmit={onAdmit}
@@ -96,11 +135,12 @@ export function RoomShell({
     />
   );
 
+  // Card chrome only when docked (lg): inside the phone Sheet it would double the padding.
   const panel = (
     <Tabs
       value={tab}
       onValueChange={(v) => setTab(v as PanelTab)}
-      className="flex h-full min-h-0 flex-col rounded-2xl border border-border bg-card p-4"
+      className="flex h-full min-h-0 flex-col lg:rounded-2xl lg:border lg:border-border lg:bg-card lg:p-4"
     >
       <TabsList className="w-full">
         <TabsTrigger value="chat">{brand.chat}</TabsTrigger>
@@ -118,13 +158,18 @@ export function RoomShell({
 
   // ZyloRoom is always dark, whatever the dashboard's theme is set to.
   return (
-    <div className="dark flex min-h-dvh flex-col bg-background text-foreground">
+    <div className="dark flex h-dvh flex-col overflow-hidden bg-background text-foreground">
       <header className="flex items-center gap-3 border-b border-border px-4 py-3">
         <h1 className="min-w-0 flex-1 truncate font-semibold">{title}</h1>
         <Badge variant="outline" className="tabular-nums">
           {people.length}/{maxParticipants}
         </Badge>
-        {isHost && <Badge variant="outline">{admission === 'manual' ? 'Host admits' : 'Join instantly'}</Badge>}
+        {isHost && (
+          // cn() drops the badge's base inline-flex in favour of `hidden` (checked).
+          <Badge variant="outline" className="hidden sm:inline-flex">
+            {admission === 'manual' ? 'Host admits' : 'Join instantly'}
+          </Badge>
+        )}
       </header>
 
       {media.status === 'error' && (
@@ -143,6 +188,7 @@ export function RoomShell({
           audioTracks={media.audioTracks}
           speaking={media.speaking}
           micMuted={media.micMuted}
+          mutedForMe={mutedForMe}
           status={media.status}
           view={view}
           screenTracks={media.screenTracks}
@@ -155,7 +201,7 @@ export function RoomShell({
       {/* Controlled, no SheetTrigger: ControlBar's Chat/People buttons open this too
           (via openPanel), so they just flip the same `sheetOpen` state. */}
       <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
-        <SheetContent side="right" className="dark w-full max-w-sm p-4">
+        <SheetContent side="right" className="dark p-4 data-[side=right]:w-full data-[side=right]:max-w-sm">
           <SheetHeader className="p-0 pb-4">
             <SheetTitle>Chat and people</SheetTitle>
           </SheetHeader>

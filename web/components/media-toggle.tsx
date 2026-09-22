@@ -29,7 +29,7 @@ export function MediaToggle({
           type="button"
           size="icon"
           variant={on ? 'secondary' : 'destructive'}
-          className="size-12 rounded-full"
+          className="size-11 rounded-full sm:size-12"
           aria-label={text}
           aria-pressed={on}
           disabled={disabled}

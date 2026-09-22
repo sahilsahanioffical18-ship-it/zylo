@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Check, MicOff, MoreHorizontal, ScreenShareOff, UserX, X } from 'lucide-react';
+import { Check, MicOff, MoreHorizontal, ScreenShareOff, UserX, Volume2, VolumeX, X } from 'lucide-react';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -29,6 +29,10 @@ import { hostActionsFor, type HostAction } from '@/lib/host-actions';
 import { brand } from '@/lib/brand';
 import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { LobbyEntry, Person } from '@/lib/use-meeting';
+
+// Side by side without hints below lg (the phone Sheet), so the host's two settings
+// don't push "In the meeting" off screen; stacked with hints in the docked panel.
+const ROOM_SETTING_GRID = 'grid grid-cols-2 gap-2 lg:grid-cols-1 max-lg:[&_[data-hint]]:hidden';
 
 function PersonAvatar({ name, imageUrl }: { name: string; imageUrl: string | null }) {
   return (
@@ -58,6 +62,30 @@ function LobbyAction({
         </Button>
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+// Local-only, session-only: never touches the server, so it's offered for every row
+// (host or not) except the viewer's own, unlike the host-only PersonMenu below.
+function MuteForMeAction({ name, muted, onClick }: { name: string; muted: boolean; onClick: () => void }) {
+  const Icon = muted ? VolumeX : Volume2;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="size-11"
+          aria-pressed={muted}
+          aria-label={`Mute ${name} for me`} // constant: aria-pressed carries the state
+          onClick={onClick}
+        >
+          <Icon className="size-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{muted ? 'Unmute for me' : 'Only you won’t hear them'}</TooltipContent>
     </Tooltip>
   );
 }
@@ -143,6 +171,8 @@ export function PeoplePanel({
   selfUserId,
   sharerUserId,
   micMuted,
+  mutedForMe,
+  onToggleMuteForMe,
   screenPolicy,
   onSetScreenPolicy,
   onAdmit,
@@ -159,6 +189,8 @@ export function PeoplePanel({
   selfUserId: string;
   sharerUserId: string | null;
   micMuted: Set<string>;
+  mutedForMe: Set<string>;
+  onToggleMuteForMe: (userId: string) => void;
   screenPolicy: ScreenSharePolicy;
   onSetScreenPolicy: (policy: ScreenSharePolicy) => void;
   onAdmit: (userId: string) => void;
@@ -168,8 +200,11 @@ export function PeoplePanel({
   onStopShare: (userId: string) => void;
   onKick: (userId: string) => void;
 }) {
+  // The room is exactly one screen tall, so nothing here can rely on the page
+  // scrolling: the panel scrolls itself once settings + lobby outgrow it, and the
+  // people list keeps min-h-40 so it never collapses to nothing.
   return (
-    <div className="flex h-full flex-col gap-4">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto">
       {isHost && (
         <ChoiceGroup
           legend="Admission"
@@ -177,7 +212,7 @@ export function PeoplePanel({
           value={admission}
           onChange={onSetAdmission}
           options={ADMISSION_OPTIONS}
-          className="grid gap-2"
+          className={ROOM_SETTING_GRID}
         />
       )}
 
@@ -188,7 +223,7 @@ export function PeoplePanel({
           value={screenPolicy}
           onChange={onSetScreenPolicy}
           options={SCREEN_POLICY_OPTIONS}
-          className="grid gap-2"
+          className={ROOM_SETTING_GRID}
         />
       )}
 
@@ -218,7 +253,7 @@ export function PeoplePanel({
         </section>
       )}
 
-      <section aria-label="People in the meeting" className="flex min-h-0 flex-1 flex-col space-y-2">
+      <section aria-label="People in the meeting" className="flex min-h-40 flex-1 flex-col space-y-2">
         <h2 className="text-sm font-semibold tabular-nums">In the meeting ({people.length})</h2>
         <ScrollArea className="min-h-0 flex-1">
           <ul className="space-y-1 pr-3">
@@ -230,11 +265,18 @@ export function PeoplePanel({
               return (
                 <li key={person.userId} className="flex items-center gap-3 rounded-lg px-1 py-1.5">
                   <PersonAvatar name={person.name} imageUrl={person.imageUrl} />
-                  <span className="flex-1 truncate text-sm">{person.name}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm">{person.name}</span>
                   {sharerUserId === person.userId && (
                     <Badge className="bg-success text-success-foreground">{brand.live}</Badge>
                   )}
                   {person.isHost && <Badge variant="secondary">Host</Badge>}
+                  {person.userId !== selfUserId && (
+                    <MuteForMeAction
+                      name={person.name}
+                      muted={mutedForMe.has(person.userId)}
+                      onClick={() => onToggleMuteForMe(person.userId)}
+                    />
+                  )}
                   {actions.length > 0 && (
                     <PersonMenu person={person} actions={actions} onMute={onMute} onStopShare={onStopShare} onKick={onKick} />
                   )}

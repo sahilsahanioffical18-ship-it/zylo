@@ -45,7 +45,7 @@ export function ChoiceGroup<T extends string>({
             <RadioGroupItem id={`${name}-${option.value}`} value={option.value} className="mt-0.5" />
             <span className="space-y-0.5">
               <span className="block font-semibold">{option.label}</span>
-              <span className="block text-xs font-normal text-muted-foreground">{option.hint}</span>
+              <span data-hint className="block text-xs font-normal text-muted-foreground">{option.hint}</span>
             </span>
           </Label>
         ))}

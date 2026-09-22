@@ -27,6 +27,11 @@ export function screenDeniedMessage(denial: ScreenDenial, live: string): string 
   return `${live} couldn’t start. Try again in a moment.`;
 }
 
+// Phones have no getDisplayMedia, so a button that can only fail is worse than no button.
+export function canShareScreen(): boolean {
+  return typeof navigator !== 'undefined' && typeof navigator.mediaDevices?.getDisplayMedia === 'function';
+}
+
 export function screenStartErrorMessage(err: unknown, live: string): string {
   const name = typeof err === 'object' && err !== null && 'name' in err ? err.name : undefined;
   // Chrome raises NotAllowedError both for "closed the picker" and for the OS

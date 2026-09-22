@@ -11,7 +11,7 @@ import { PeoplePanel } from '@/components/people-panel';
 import { VideoStage } from '@/components/video-stage';
 import { brand } from '@/lib/brand';
 import { stageView } from '@/lib/screen-share';
-import type { Admission } from '@/lib/types';
+import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { useLiveKitRoom } from '@/lib/use-livekit-room';
 import type { ChatMessage, LobbyEntry, Person } from '@/lib/use-meeting';
 
@@ -25,11 +25,17 @@ export function RoomShell({
   selfUserId,
   media,
   sharerUserId,
+  screenPolicy,
+  onSetScreenPolicy,
   onToggleLive,
   onAdmit,
   onDeny,
   onSetAdmission,
+  onMute,
+  onStopShare,
+  onKick,
   onLeave,
+  onEndForAll,
   messages,
   onSendChat,
 }: {
@@ -42,11 +48,17 @@ export function RoomShell({
   selfUserId: string;
   media: ReturnType<typeof useLiveKitRoom>;
   sharerUserId: string | null;
+  screenPolicy: ScreenSharePolicy;
+  onSetScreenPolicy: (policy: ScreenSharePolicy) => void;
   onToggleLive: () => void;
   onAdmit: (userId: string) => void;
   onDeny: (userId: string) => void;
   onSetAdmission: (mode: Admission) => void;
+  onMute: (userId: string) => void;
+  onStopShare: (userId: string) => void;
+  onKick: (userId: string) => void;
   onLeave: () => void;
+  onEndForAll: () => void;
   messages: ChatMessage[];
   onSendChat: (text: string) => void;
 }) {
@@ -70,9 +82,17 @@ export function RoomShell({
       lobby={lobby}
       admission={admission}
       isHost={isHost}
+      selfUserId={selfUserId}
+      sharerUserId={sharerUserId}
+      micMuted={media.micMuted}
+      screenPolicy={screenPolicy}
+      onSetScreenPolicy={onSetScreenPolicy}
       onAdmit={onAdmit}
       onDeny={onDeny}
       onSetAdmission={onSetAdmission}
+      onMute={onMute}
+      onStopShare={onStopShare}
+      onKick={onKick}
     />
   );
 
@@ -155,6 +175,8 @@ export function RoomShell({
         waitingCount={waitingCount}
         onOpenPanel={openPanel}
         onLeave={onLeave}
+        isHost={isHost}
+        onEndForAll={onEndForAll}
       />
     </div>
   );

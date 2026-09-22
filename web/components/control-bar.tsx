@@ -1,6 +1,17 @@
 'use client';
 
 import { MessageSquare, Mic, MicOff, ScreenShare, ScreenShareOff, Users, Video, VideoOff } from 'lucide-react';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { MediaToggle } from '@/components/media-toggle';
@@ -8,8 +19,6 @@ import { brand } from '@/lib/brand';
 
 export type PanelTab = 'chat' | 'people';
 
-// No End-for-all button here — that's Phase 4's host controls (Task 10). This is
-// Mic, Camera, ZyloLive, ZyloChat, People, Leave and nothing else.
 export function ControlBar({
   micOn,
   camOn,
@@ -22,6 +31,8 @@ export function ControlBar({
   waitingCount,
   onOpenPanel,
   onLeave,
+  isHost,
+  onEndForAll,
 }: {
   micOn: boolean;
   camOn: boolean;
@@ -34,6 +45,8 @@ export function ControlBar({
   waitingCount: number;
   onOpenPanel: (tab: PanelTab) => void;
   onLeave: () => void;
+  isHost: boolean;
+  onEndForAll: () => void;
 }) {
   return (
     <footer className="flex flex-wrap items-center justify-center gap-3 border-t border-border px-4 py-3">
@@ -114,6 +127,30 @@ export function ControlBar({
       <Button variant="destructive" className="h-12 rounded-full px-6" onClick={onLeave}>
         Leave
       </Button>
+
+      {isHost && (
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button variant="destructive" className="h-12 rounded-full px-6">
+              End for all
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent className="dark">
+            <AlertDialogHeader>
+              <AlertDialogTitle>End this meeting for everyone?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Everyone is disconnected, including you. It moves to {brand.meet} → Previous.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep meeting</AlertDialogCancel>
+              <AlertDialogAction variant="destructive" onClick={onEndForAll}>
+                End for all
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
     </footer>
   );
 }

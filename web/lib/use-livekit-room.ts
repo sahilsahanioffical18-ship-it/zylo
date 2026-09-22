@@ -25,6 +25,10 @@ export type ShareInput = { grant: number; allowed: boolean; onEnded: () => void 
 // room full) don't expose a discriminator we can trust across server versions, so
 // one generic, retry-able message covers all of them.
 const CONNECT_ERROR = `Couldn't connect to the video for this ${brand.room}. Check your connection, then try again.`;
+// The server took us out (kick, End for all, a released seat, or the webhook
+// evicting a seatless join): see the Disconnected listener below for why this
+// never auto-retries.
+const REMOVED_ERROR = `You’re no longer connected to the video for this ${brand.room}.`;
 
 function connectErrorMessage(err: unknown): string {
   // api.ts already turns every status the token endpoint can return (0 network,
@@ -197,7 +201,13 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
     });
     room.on(RoomEvent.TrackSubscribed, () => snapshot());
     room.on(RoomEvent.TrackUnsubscribed, () => snapshot());
-    room.on(RoomEvent.TrackMuted, () => snapshot());
+    room.on(RoomEvent.TrackMuted, (publication, participant) => {
+      // host:mute arrives as LiveKit muting our own mic. Mirror it in the toggle, or it
+      // would show "on" over a muted track. Unmuting stays the person's own choice
+      // (spec default 3): their next toggle goes through setMicrophoneEnabled as usual.
+      if (participant === room.localParticipant && publication.source === Track.Source.Microphone) setMicOn(false);
+      snapshot();
+    });
     room.on(RoomEvent.TrackUnmuted, () => snapshot());
     room.on(RoomEvent.LocalTrackPublished, () => snapshot());
     room.on(RoomEvent.LocalTrackUnpublished, (publication) => {
@@ -246,6 +256,17 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
       // meeting:replaced screen already owns the tab (retrying here would just
       // fight the new tab for the identity).
       if (reason === DisconnectReason.CLIENT_INITIATED || reason === DisconnectReason.DUPLICATE_IDENTITY) return;
+      // Our server took us out: host:kick (removeParticipant), End for all (deleteRoom),
+      // a released seat, or the webhook evicting a seatless join. Retrying would fetch a
+      // token, get a 403 and flash an error at someone who was just removed — and the
+      // server sends the socket's removed/ended screen BEFORE calling LiveKit, so on
+      // those paths this listener is normally gone already. Reaching here means the seat
+      // went some other way: say so and offer Retry, never auto-retry.
+      if (reason === DisconnectReason.PARTICIPANT_REMOVED || reason === DisconnectReason.ROOM_DELETED) {
+        setStatus('error');
+        setError(REMOVED_ERROR);
+        return;
+      }
       if (!retriedRef.current) {
         retriedRef.current = true;
         setAttempt((n) => n + 1);

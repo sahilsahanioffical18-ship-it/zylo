@@ -59,6 +59,12 @@ export function MeetingRoomFlow({ code }: { code: string }) {
     shareGrant,
     requestScreen,
     stopScreen,
+    screenPolicy,
+    kick,
+    mute,
+    stopShareOf,
+    setScreenPolicyMode,
+    endMeeting,
   } = useMeeting(joined ? code : null);
   const selfUserId = user?.id ?? '';
   const presenting = sharerUserId !== null && sharerUserId === selfUserId;
@@ -95,11 +101,9 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   }
 
   if (!joined) {
-    // leaving: render nothing rather than <PreJoin> — otherwise the brief window
-    // before router.push('/dashboard') lands would mount PreJoin, which fetches
-    // the meeting and calls getUserMedia, blinking the camera light back on (and
-    // flashing "This meeting has ended" if this was the last participant out).
-    if (leaving) return null;
+    // Never PreJoin (it would re-acquire the camera), never blank: if router.push never
+    // lands, this still offers the way back.
+    if (leaving) return <Notice title={`You left the ${brand.room}`} text="Taking you back to your dashboard…" />;
     return <PreJoin code={code} onJoin={(meeting, prefs) => setJoined({ meeting, prefs })} />;
   }
 
@@ -146,11 +150,17 @@ export function MeetingRoomFlow({ code }: { code: string }) {
       selfUserId={selfUserId}
       media={media}
       sharerUserId={sharerUserId}
+      screenPolicy={screenPolicy ?? joined.meeting.screenSharePolicy}
+      onSetScreenPolicy={setScreenPolicyMode}
       onToggleLive={presenting ? media.stopScreenShare : requestScreen}
       onAdmit={admitFromLobby}
       onDeny={denyFromLobby}
       onSetAdmission={setAdmissionMode}
+      onMute={mute}
+      onStopShare={stopShareOf}
+      onKick={kick}
       onLeave={handleLeave}
+      onEndForAll={endMeeting}
       messages={messages}
       onSendChat={sendChat}
     />

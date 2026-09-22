@@ -1,14 +1,33 @@
 'use client';
 
-import { Check, X } from 'lucide-react';
+import { useState } from 'react';
+import { Check, MicOff, MoreHorizontal, ScreenShareOff, UserX, X } from 'lucide-react';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { ADMISSION_OPTIONS, ChoiceGroup } from '@/components/choice-group';
+import { ADMISSION_OPTIONS, ChoiceGroup, SCREEN_POLICY_OPTIONS } from '@/components/choice-group';
 import { initials } from '@/lib/format';
-import type { Admission } from '@/lib/types';
+import { hostActionsFor, type HostAction } from '@/lib/host-actions';
+import { brand } from '@/lib/brand';
+import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { LobbyEntry, Person } from '@/lib/use-meeting';
 
 function PersonAvatar({ name, imageUrl }: { name: string; imageUrl: string | null }) {
@@ -43,22 +62,111 @@ function LobbyAction({
   );
 }
 
+// Kick confirms first; Mute and Stop are reversible (they can unmute, share again).
+function PersonMenu({
+  person,
+  actions,
+  onMute,
+  onStopShare,
+  onKick,
+}: {
+  person: Person;
+  actions: HostAction[];
+  onMute: (userId: string) => void;
+  onStopShare: (userId: string) => void;
+  onKick: (userId: string) => void;
+}) {
+  const [confirmKick, setConfirmKick] = useState(false);
+  return (
+    <>
+      <DropdownMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-11"
+                aria-label={`Actions for ${person.name}`}
+              >
+                <MoreHorizontal className="size-5" />
+              </Button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>Actions</TooltipContent>
+        </Tooltip>
+        {/* Portals out of ZyloRoom's dark subtree, so it re-declares dark. */}
+        <DropdownMenuContent align="end" className="dark min-w-44">
+          {actions.includes('mute') && (
+            <DropdownMenuItem onSelect={() => onMute(person.userId)}>
+              <MicOff className="size-4" /> Mute
+            </DropdownMenuItem>
+          )}
+          {actions.includes('stop-share') && (
+            <DropdownMenuItem onSelect={() => onStopShare(person.userId)}>
+              <ScreenShareOff className="size-4" /> Stop {brand.live}
+            </DropdownMenuItem>
+          )}
+          {actions.includes('kick') && (
+            <DropdownMenuItem variant="destructive" onSelect={() => setConfirmKick(true)}>
+              <UserX className="size-4" /> Kick
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <AlertDialog open={confirmKick} onOpenChange={setConfirmKick}>
+        <AlertDialogContent className="dark">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Kick {person.name}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              They leave this {brand.room} now and can’t rejoin this meeting.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep them</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => onKick(person.userId)}>
+              Kick
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
 export function PeoplePanel({
   people,
   lobby,
   admission,
   isHost,
+  selfUserId,
+  sharerUserId,
+  micMuted,
+  screenPolicy,
+  onSetScreenPolicy,
   onAdmit,
   onDeny,
   onSetAdmission,
+  onMute,
+  onStopShare,
+  onKick,
 }: {
   people: Person[];
   lobby: LobbyEntry[];
   admission: Admission;
   isHost: boolean;
+  selfUserId: string;
+  sharerUserId: string | null;
+  micMuted: Set<string>;
+  screenPolicy: ScreenSharePolicy;
+  onSetScreenPolicy: (policy: ScreenSharePolicy) => void;
   onAdmit: (userId: string) => void;
   onDeny: (userId: string) => void;
   onSetAdmission: (mode: Admission) => void;
+  onMute: (userId: string) => void;
+  onStopShare: (userId: string) => void;
+  onKick: (userId: string) => void;
 }) {
   return (
     <div className="flex h-full flex-col gap-4">
@@ -69,6 +177,17 @@ export function PeoplePanel({
           value={admission}
           onChange={onSetAdmission}
           options={ADMISSION_OPTIONS}
+          className="grid gap-2"
+        />
+      )}
+
+      {isHost && (
+        <ChoiceGroup
+          legend={`${brand.live} (screen share)`}
+          name="room-screen-policy"
+          value={screenPolicy}
+          onChange={onSetScreenPolicy}
+          options={SCREEN_POLICY_OPTIONS}
           className="grid gap-2"
         />
       )}
@@ -103,13 +222,25 @@ export function PeoplePanel({
         <h2 className="text-sm font-semibold tabular-nums">In the meeting ({people.length})</h2>
         <ScrollArea className="min-h-0 flex-1">
           <ul className="space-y-1 pr-3">
-            {people.map((person) => (
-              <li key={person.userId} className="flex items-center gap-3 rounded-lg px-1 py-1.5">
-                <PersonAvatar name={person.name} imageUrl={person.imageUrl} />
-                <span className="flex-1 truncate text-sm">{person.name}</span>
-                {person.isHost && <Badge variant="secondary">Host</Badge>}
-              </li>
-            ))}
+            {people.map((person) => {
+              const actions = hostActionsFor(
+                { userId: person.userId, micMuted: micMuted.has(person.userId) },
+                { isHost, selfUserId, sharerUserId },
+              );
+              return (
+                <li key={person.userId} className="flex items-center gap-3 rounded-lg px-1 py-1.5">
+                  <PersonAvatar name={person.name} imageUrl={person.imageUrl} />
+                  <span className="flex-1 truncate text-sm">{person.name}</span>
+                  {sharerUserId === person.userId && (
+                    <Badge className="bg-success text-success-foreground">{brand.live}</Badge>
+                  )}
+                  {person.isHost && <Badge variant="secondary">Host</Badge>}
+                  {actions.length > 0 && (
+                    <PersonMenu person={person} actions={actions} onMute={onMute} onStopShare={onStopShare} onKick={onKick} />
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </ScrollArea>
       </section>

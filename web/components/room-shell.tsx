@@ -124,7 +124,14 @@ export function RoomShell({
         <Badge variant="outline" className="tabular-nums">
           {people.length}/{maxParticipants}
         </Badge>
-        {isHost && <Badge variant="outline">{admission === 'manual' ? 'Host admits' : 'Join instantly'}</Badge>}
+        {isHost && (
+          // Hidden below sm: badge.tsx's base `inline-flex` and this `hidden` are the
+          // same cn() conflict group, so `hidden` here wins at the default breakpoint
+          // and `sm:inline-flex` brings it back — no wrapper span needed.
+          <Badge variant="outline" className="hidden sm:inline-flex">
+            {admission === 'manual' ? 'Host admits' : 'Join instantly'}
+          </Badge>
+        )}
       </header>
 
       {media.status === 'error' && (

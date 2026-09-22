@@ -22,7 +22,8 @@ function livekitWebhook(livekit) {
     try {
       const body = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
       event = await livekit.receiveWebhook(body, req.get('authorization'));
-    } catch {
+    } catch (err) {
+      console.error('livekit webhook rejected:', err.message);
       return res.status(401).json({ error: 'Invalid webhook signature.' });
     }
     if (event.event === 'participant_joined') {

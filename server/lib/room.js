@@ -208,10 +208,10 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
 
       const isHostUser = meta.hostId === userId;
       const { name, imageUrl } = await userInfo(userId);
-      // host:end-meeting (or the last seat emptying) can land during the awaits above.
-      // Both drop the cache entry, so a join that read it before the end must not seat
-      // anyone in a meeting that is over.
+      // host:end-meeting (or the last seat emptying) can land during the awaits above,
+      // and so can host:kick — the DB check above ran before either.
       if (!liveMeetings.has(meetingId)) return socket.emit('meeting:denied', { reason: 'ended' });
+      if (meta.removed?.has(userId)) return socket.emit('meeting:denied', { reason: 'removed' });
       const entry = { userId, socketId: socket.id, name, imageUrl };
 
       // Every DB read is done. From here down nothing awaits until the seat is
@@ -288,6 +288,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       } catch (err) {
         console.error('screen share grant failed:', err.message);
         seats.releaseScreenLock(meetingId, socket.id);
+        livekit.revokeScreenShare(meetingId, userId); // never rejects; the grant may have applied before it failed
         return socket.emit('screen:denied', { reason: 'unavailable' });
       }
       // The lock can be released while the grant is in flight (host stop, policy
@@ -404,6 +405,10 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       if (!guard) return;
       const { meetingId, meta } = guard;
       if (typeof userId !== 'string' || userId === meta.hostId) return;
+      // Mark the target on the cached meta before the DB await below: a join already
+      // past its own isRemoved check can still be awaiting userInfo when this commits,
+      // and liveMeetings.has alone only catches the meeting ending, not this.
+      (meta.removed ??= new Set()).add(userId);
       // The DB first: once this commits, a rejoin (isRemoved) and a token request
       // are refused, and it survives a restart. Anyone ever admitted has a row, so
       // someone who left a second before the click is still blocked.
@@ -412,7 +417,9 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
          WHERE meeting_id = $1 AND user_id = $2 AND removed_at IS NULL`,
         [meetingId, userId],
       );
-      if (rowCount === 0) return; // never admitted, or already removed
+      // Never admitted, or already removed — unless a seat or queue entry still
+      // needs freeing (the in-flight-join race this guards against).
+      if (rowCount === 0 && !seats.hasSeat(meetingId, userId) && !seats.queueSocketId(meetingId, userId)) return;
       const seatSocketId = seats.seatSocketId(meetingId, userId);
       const queuedSocketId = seats.queueSocketId(meetingId, userId);
       seats.removeFromQueue(meetingId, userId);

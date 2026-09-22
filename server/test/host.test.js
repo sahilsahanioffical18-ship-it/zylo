@@ -1,7 +1,43 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const seats = require('../lib/seats');
-const { roomHarness, collect, settle, shareScreen, waitForEvent } = require('./helpers');
+const {
+  roomHarness,
+  collect,
+  settle,
+  shareScreen,
+  waitForEvent,
+  setupTestDb,
+  recordingLivekit,
+  startRoom,
+  connectClient,
+  seat,
+} = require('./helpers');
+
+// Pauses one specific db.query call (matched by exact text and first param) until
+// release() is called, so a race between two in-flight handlers is deterministic,
+// not timing-based. Inactive until arm(): a setup join for the same user must pass
+// straight through, or the gate would fire on the wrong call and never resolve.
+function gateQuery(db, text, param) {
+  let active = false;
+  let started = false;
+  let notifyStarted;
+  const startedPromise = new Promise((resolve) => { notifyStarted = resolve; });
+  let releaseGate;
+  const gatePromise = new Promise((resolve) => { releaseGate = resolve; });
+  const gated = {
+    query: async (queryText, params) => {
+      if (active && !started && queryText === text && params?.[0] === param) {
+        started = true;
+        notifyStarted();
+        await gatePromise;
+      }
+      return db.query(queryText, params);
+    },
+    close: db.close,
+  };
+  return { db: gated, arm: () => { active = true; }, paused: startedPromise, release: () => releaseGate() };
+}
 
 test('a participant sending any host:* event is forbidden and changes nothing', async (t) => {
   const { db, meetingId, livekit, connect, join } = await roomHarness(t);
@@ -172,6 +208,121 @@ test('kicking someone who left a moment ago still keeps them out', async (t) => 
   const denied = waitForEvent(p1b, 'meeting:denied');
   p1b.emit('meeting:join-request', { meetingId });
   assert.deepEqual(await denied, { reason: 'removed' });
+});
+
+test('a join that lands mid-kick is refused, and the kick still works', async (t) => {
+  const raw = await setupTestDb();
+  const livekit = recordingLivekit();
+  const { db, arm, paused, release } = gateQuery(raw, 'SELECT name, image_url FROM users WHERE id = $1', 'p1');
+  const { meetingId, server } = await startRoom(db, { livekit });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await settle();
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await raw.close();
+  });
+
+  const host = await seat(server.url, 'host', meetingId);
+  clients.push(host);
+  // p1 joins and leaves once first, so they hold a meeting_participants row
+  // (removed_at IS NULL) before the gate goes live — otherwise host:kick's UPDATE
+  // would match nothing and the race below wouldn't be the one the fix guards.
+  const firstJoin = await seat(server.url, 'p1', meetingId);
+  clients.push(firstJoin);
+  firstJoin.emit('meeting:leave');
+  await settle();
+
+  arm();
+  const rejoin = connectClient(server.url, 'p1');
+  clients.push(rejoin);
+  const denied = collect(rejoin, 'meeting:denied');
+  const admitted = collect(rejoin, 'meeting:admitted');
+  rejoin.emit('meeting:join-request', { meetingId });
+  await paused; // rejoin is stuck awaiting userInfo, past its own isRemoved check
+
+  host.emit('host:kick', { userId: 'p1' });
+  await settle(); // host:kick's in-memory mark and its DB commit both land while paused
+
+  release();
+  await settle();
+
+  assert.deepEqual(denied, [{ reason: 'removed' }]);
+  assert.deepEqual(admitted, []);
+  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+
+  const { rows } = await raw.query(
+    'SELECT removed_at FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2',
+    [meetingId, 'p1'],
+  );
+  assert.notEqual(rows[0].removed_at, null); // the kick's own DB write landed
+});
+
+test('a join that lands mid-end-for-all is refused', async (t) => {
+  const raw = await setupTestDb();
+  const livekit = recordingLivekit();
+  const { db, arm, paused, release } = gateQuery(raw, 'SELECT name, image_url FROM users WHERE id = $1', 'p1');
+  const { meetingId, server } = await startRoom(db, { livekit });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await settle();
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await raw.close();
+  });
+
+  const host = await seat(server.url, 'host', meetingId);
+  clients.push(host);
+
+  arm();
+  const p1 = connectClient(server.url, 'p1');
+  clients.push(p1);
+  const denied = collect(p1, 'meeting:denied');
+  const admitted = collect(p1, 'meeting:admitted');
+  p1.emit('meeting:join-request', { meetingId });
+  await paused; // p1 is stuck awaiting userInfo, past its own isRemoved check
+
+  host.emit('host:end-meeting');
+  await settle(); // markEnded commits, sockets are told, liveMeetings.delete runs
+
+  release();
+  await settle();
+
+  assert.deepEqual(denied, [{ reason: 'ended' }]);
+  assert.deepEqual(admitted, []);
+  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+});
+
+test('without LiveKit configured the host can still kick', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await startRoom(db); // livekit defaults to null
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await settle();
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  const host = await seat(server.url, 'host', meetingId);
+  clients.push(host);
+  const p1 = await seat(server.url, 'p1', meetingId);
+  clients.push(p1);
+
+  const removed = waitForEvent(p1, 'meeting:removed');
+  host.emit('host:kick', { userId: 'p1' });
+  await removed;
+  await settle();
+
+  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+  const { rows } = await db.query(
+    'SELECT removed_at FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2',
+    [meetingId, 'p1'],
+  );
+  assert.notEqual(rows[0].removed_at, null);
 });
 
 test('the host cannot kick themselves', async (t) => {

@@ -1,7 +1,29 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const seats = require('../lib/seats');
-const { roomHarness, collect, settle, shareScreen, waitForEvent } = require('./helpers');
+const { roomHarness, collect, settle, shareScreen, waitForEvent, setupTestDb, startRoom, seat } = require('./helpers');
+
+test('without LiveKit configured a ZyloLive request is answered unavailable', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server } = await startRoom(db); // livekit defaults to null
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await settle();
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+
+  const p1 = await seat(server.url, 'p1', meetingId);
+  clients.push(p1);
+  const denied = collect(p1, 'screen:denied');
+  p1.emit('screen:request');
+  await settle();
+
+  assert.deepEqual(denied, [{ reason: 'unavailable' }]);
+  assert.equal(seats.screenSharer(meetingId), null);
+});
 
 test('two people press ZyloLive at the same instant: exactly one is granted', async (t) => {
   const { meetingId, livekit, join } = await roomHarness(t);
@@ -189,6 +211,9 @@ test('a grant LiveKit refuses is denied, and frees the lock for the next person'
   await settle();
   assert.deepEqual(denied, [{ reason: 'unavailable' }]);
   assert.equal(seats.screenSharer(meetingId), null);
+  // I3: the grant may have applied at LiveKit before it rejected (a timeout, a 5xx
+  // after application), so the catch revokes too, not just releases the lock.
+  assert.deepEqual(livekit.callsTo('revokeScreenShare'), [[meetingId, 'p1']]);
 
   livekit.grantScreenShare = recordingGrant;
   await shareScreen(p2);

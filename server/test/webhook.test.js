@@ -44,10 +44,15 @@ const event = (name, identity, room = MEETING_ID) =>
 
 test('an unsigned webhook is rejected and evicts nobody', async (t) => {
   const { server, removed } = await start(t);
+  t.mock.method(console, 'error');
   const body = event('participant_joined', 'intruder');
   const status = await post(server, body);
   assert.equal(status, 401);
   assert.deepEqual(removed, []);
+  // I4: a rejected webhook used to be silent — a key rotation or check bug would
+  // switch off this line of defence with no signal. Now it logs.
+  assert.equal(console.error.mock.callCount(), 1);
+  assert.match(console.error.mock.calls[0].arguments[0], /livekit webhook rejected/);
 });
 
 test('a webhook signed with the wrong secret is rejected', async (t) => {

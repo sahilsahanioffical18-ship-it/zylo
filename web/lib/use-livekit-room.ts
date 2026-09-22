@@ -83,6 +83,9 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
   // down and rebuild the whole LiveKit room on every parent re-render.
   const prefsRef = useRef(prefs);
   const shareRef = useRef(share);
+  // Guards the screen-capture effect below against a second grant starting a second
+  // capture while one is still in flight (the picker is modal and can sit open).
+  const captureInFlightRef = useRef(false);
   useEffect(() => {
     prefsRef.current = prefs;
     shareRef.current = share;
@@ -364,6 +367,14 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
   // retry or any re-render keeps the same number, so nothing but a fresh
   // screen:granted can ever open the screen picker again. (Phase 3 shipped the
   // camera/mic version of this bug: a reconnect re-applied the pre-join prefs.)
+  //
+  // We own the two steps (create, then publish) instead of calling
+  // setScreenShareEnabled(true) as one opaque promise: setScreenShareEnabled's
+  // "defer publication until signal is connected" branch waits up to 15s before
+  // stopping a capture the picker returned after we'd already been torn down (kick,
+  // End for all, a second tab) — the browser's capture indicator would stay on that
+  // whole time. Re-checking right before publish and stopping the tracks ourselves
+  // turns that off at once instead.
   useEffect(() => {
     if (grant === 0) return;
     const room = roomRef.current;
@@ -371,19 +382,40 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
       shareRef.current.onEnded(); // granted, but there is no connected room to share into
       return;
     }
-    room.localParticipant
-      .setScreenShareEnabled(true, { audio: true })
-      .then(() => {
-        // The lock went away while the picker was open (host stop, policy switch):
-        // the publish still won the race, so take it straight down.
-        if (!shareRef.current.allowed) room.localParticipant.setScreenShareEnabled(false).catch(() => {});
-      })
-      .catch((err) => {
-        // Cancelled picker, OS refusal, unsupported browser, refused publish.
+    // A double press can bump `grant` again before the first capture (the picker is
+    // modal and can sit open for a while) resolves. We lose livekit-client's own
+    // pendingPublishing dedupe by owning these steps, so guard it ourselves.
+    if (captureInFlightRef.current) return;
+    captureInFlightRef.current = true;
+    (async () => {
+      let tracks;
+      try {
+        tracks = await room.localParticipant.createScreenTracks({ audio: true });
+      } catch (err) {
+        // Cancelled picker, OS refusal, unsupported browser. Nothing was published;
         // livekit-client has already stopped anything it captured.
         toast.error(screenStartErrorMessage(err, brand.live));
         shareRef.current.onEnded();
-      });
+        return;
+      }
+      // The room was torn down or the lock was lost while the picker was open (kick,
+      // End for all, a second tab, host stop, policy switch): stop the capture
+      // ourselves right now instead of publishing into a session that's gone.
+      if (room.state !== ConnectionState.Connected || !shareRef.current.allowed) {
+        tracks.forEach((track) => track.stop());
+        shareRef.current.onEnded();
+        return;
+      }
+      try {
+        await Promise.all(tracks.map((track) => room.localParticipant.publishTrack(track, { source: track.source })));
+      } catch (err) {
+        tracks.forEach((track) => track.stop());
+        toast.error(screenStartErrorMessage(err, brand.live));
+        shareRef.current.onEnded();
+      }
+    })().finally(() => {
+      captureInFlightRef.current = false;
+    });
   }, [grant]);
 
   // This effect only ever turns sharing OFF: the server says someone else, or nobody,

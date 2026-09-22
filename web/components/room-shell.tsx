@@ -17,6 +17,9 @@ import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { useLiveKitRoom } from '@/lib/use-livekit-room';
 import type { ChatMessage, LobbyEntry, Person } from '@/lib/use-meeting';
 
+// Tailwind's lg: where the Chat/People panel docks beside the stage instead of opening as a Sheet.
+const DOCKED_QUERY = '(min-width: 1024px)';
+
 export function RoomShell({
   title,
   maxParticipants,
@@ -78,7 +81,7 @@ export function RoomShell({
     // The panel is docked at >=1024px; below that the same button opens the Sheet.
     // Reading the media query in the click handler (not during render) keeps this
     // out of hydration and out of react-hooks' way.
-    if (!window.matchMedia('(min-width: 1024px)').matches) setSheetOpen(true);
+    if (!window.matchMedia(DOCKED_QUERY).matches) setSheetOpen(true);
   }, []);
 
   const toggleMuteForMe = (userId: string) => {
@@ -98,7 +101,7 @@ export function RoomShell({
     const last = messages.at(-1);
     if (!last || last === seenRef.current) return;
     seenRef.current = last; // seeded at mount, so a remount never re-toasts history
-    const chatVisible = tab === 'chat' && (sheetOpen || window.matchMedia('(min-width: 1024px)').matches);
+    const chatVisible = tab === 'chat' && (sheetOpen || window.matchMedia(DOCKED_QUERY).matches);
     if (shouldToast(last, selfUserId, chatVisible)) {
       toast(last.name, {
         id: 'zylochat', // a burst of messages replaces one toast instead of stacking

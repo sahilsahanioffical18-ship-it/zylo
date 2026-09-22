@@ -36,3 +36,8 @@ test('the output length never exceeds max + 1', () => {
   const preview = toastPreview('word '.repeat(200), 80);
   assert.ok(preview.length <= 81, `expected length <= 81, got ${preview.length}`);
 });
+
+test('the cut never splits an emoji surrogate pair', () => {
+  const preview = toastPreview(`${'x'.repeat(79)}😀tail`, 80);
+  assert.equal(preview, `${'x'.repeat(79)}…`);
+});

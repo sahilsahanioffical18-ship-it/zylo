@@ -16,7 +16,9 @@ export function shouldToast(message: { userId: string }, selfUserId: string, cha
 export function toastPreview(text: string, max = 80): string {
   const collapsed = text.replace(/\s+/g, ' ').trim();
   if (collapsed.length <= max) return collapsed;
-  const cut = collapsed.slice(0, max);
+  let cut = collapsed.slice(0, max);
+  // Don't leave half an emoji: a trailing high surrogate renders as U+FFFD.
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
   const lastSpace = cut.lastIndexOf(' ');
   const boundary = lastSpace > max / 2 ? cut.slice(0, lastSpace) : cut;
   return `${boundary.trimEnd()}…`;

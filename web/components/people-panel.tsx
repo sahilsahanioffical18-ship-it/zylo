@@ -79,7 +79,7 @@ function MuteForMeAction({ name, muted, onClick }: { name: string; muted: boolea
           variant="ghost"
           className="size-11"
           aria-pressed={muted}
-          aria-label={muted ? `Unmute ${name} for me` : `Mute ${name} for me`}
+          aria-label={`Mute ${name} for me`} // constant: aria-pressed carries the state
           onClick={onClick}
         >
           <Icon className="size-4" />
@@ -200,8 +200,11 @@ export function PeoplePanel({
   onStopShare: (userId: string) => void;
   onKick: (userId: string) => void;
 }) {
+  // The room is exactly one screen tall, so nothing here can rely on the page
+  // scrolling: the panel scrolls itself once settings + lobby outgrow it, and the
+  // people list keeps min-h-40 so it never collapses to nothing.
   return (
-    <div className="flex h-full flex-col gap-4">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto">
       {isHost && (
         <ChoiceGroup
           legend="Admission"
@@ -250,7 +253,7 @@ export function PeoplePanel({
         </section>
       )}
 
-      <section aria-label="People in the meeting" className="flex min-h-0 flex-1 flex-col space-y-2">
+      <section aria-label="People in the meeting" className="flex min-h-40 flex-1 flex-col space-y-2">
         <h2 className="text-sm font-semibold tabular-nums">In the meeting ({people.length})</h2>
         <ScrollArea className="min-h-0 flex-1">
           <ul className="space-y-1 pr-3">

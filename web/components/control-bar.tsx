@@ -53,6 +53,8 @@ export function ControlBar({
   isHost: boolean;
   onEndForAll: () => void;
 }) {
+  // 320px budget: 6 controls × 44 + 5 gaps × 8 = 304 = 320 − px-2 × 2, zero slack.
+  // A 7th control below sm needs a "More" menu, or the bar wraps to two rows.
   return (
     <footer className="flex flex-wrap items-center justify-center gap-2 border-t border-border px-2 py-3 sm:gap-3 sm:px-4">
       <MediaToggle

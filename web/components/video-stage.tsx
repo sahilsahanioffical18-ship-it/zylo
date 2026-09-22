@@ -43,10 +43,17 @@ function ScreenVideo({ track }: { track: VideoTrack }) {
 // re-runs the attach effect, while an unrelated snapshot update does not.
 function AudioSink({ track, muted }: { track: RemoteAudioTrack; muted: boolean }) {
   const ref = useAttach<HTMLAudioElement>(track);
-  // After useAttach's effect (declaration order): livekit's attach resets
-  // element.muted to false, so every re-attach must re-apply "Mute for me".
+  // livekit-client unmutes attached elements behind React's back (attach() and
+  // room.startAudio() both set muted = false), so re-assert on every volumechange.
   useEffect(() => {
-    if (ref.current) ref.current.muted = muted;
+    const el = ref.current;
+    if (!el) return;
+    const apply = () => {
+      if (el.muted !== muted) el.muted = muted;
+    };
+    apply();
+    el.addEventListener('volumechange', apply);
+    return () => el.removeEventListener('volumechange', apply);
   }, [ref, track, muted]);
   return <audio ref={ref} autoPlay playsInline />;
 }
@@ -106,7 +113,9 @@ function Tile({
         </span>
       )}
       <span className={`absolute flex items-center gap-2 ${small ? 'inset-x-2 bottom-2 text-xs' : 'inset-x-3 bottom-3'}`}>
-        <span className="min-w-0 truncate rounded-md bg-background/80 px-2 py-1 text-sm font-medium">{person.name}</span>
+        <span className={`min-w-0 truncate rounded-md bg-background/80 px-2 py-1 font-medium ${small ? 'text-xs' : 'text-sm'}`}>
+          {person.name}
+        </span>
         {person.isHost && <Badge variant="secondary">Host</Badge>}
         {isMicMuted && <MicOff className="size-4 shrink-0 text-muted-foreground" aria-label="Muted" />}
         {isMutedForMe && <VolumeX className="size-4 shrink-0 text-muted-foreground" aria-label="Muted for you" />}

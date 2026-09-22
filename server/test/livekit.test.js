@@ -1,6 +1,6 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const { TokenVerifier } = require('livekit-server-sdk');
+const { TokenVerifier, TrackSource } = require('livekit-server-sdk');
 const { createLivekit } = require('../lib/livekit');
 const { createApp } = require('../app');
 const seats = require('../lib/seats');
@@ -301,4 +301,119 @@ test('an unreachable LiveKit is a 503, not a 500', async (t) => {
   assert.notEqual(status, 401);
   assert.notEqual(status, 500);
   assert.match(body.error, /video server/i);
+});
+
+// --- Phase 4 enforcement calls -----------------------------------------------
+// recordingRooms() stands in for RoomServiceClient and logs every call in order;
+// an override replaces one method (and is not logged).
+function recordingRooms(overrides = {}) {
+  const calls = [];
+  const rec = (name, result) => async (...args) => { calls.push([name, ...args]); return result; };
+  return {
+    calls,
+    rooms: {
+      updateParticipant: rec('updateParticipant', {}),
+      removeParticipant: rec('removeParticipant'),
+      deleteRoom: rec('deleteRoom'),
+      mutePublishedTrack: rec('mutePublishedTrack', {}),
+      getParticipant: rec('getParticipant', { tracks: [] }),
+      ...overrides,
+    },
+  };
+}
+const withRooms = (rooms) => createLivekit({ url: 'ws://127.0.0.1:7880', apiKey: API_KEY, apiSecret: API_SECRET, rooms });
+const upstreamDown = async () => { throw Object.assign(new Error('fetch failed'), { status: 503 }); };
+const notFound = async () => { throw Object.assign(new Error('participant not found'), { status: 404, code: 'not_found' }); };
+const cameraMic = [TrackSource.CAMERA, TrackSource.MICROPHONE];
+
+test('grantScreenShare adds the screen and its audio to camera and microphone', async () => {
+  const { calls, rooms } = recordingRooms();
+  const livekit = withRooms(rooms);
+
+  await livekit.grantScreenShare('meeting-1', 'user-1');
+
+  assert.deepEqual(calls, [
+    ['updateParticipant', 'meeting-1', 'user-1', {
+      permission: {
+        canSubscribe: true,
+        canPublish: true,
+        canPublishSources: [...cameraMic, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO],
+      },
+    }],
+  ]);
+});
+
+test('grantScreenShare lets an upstream failure reach its caller', async () => {
+  const { rooms } = recordingRooms({ updateParticipant: upstreamDown });
+  const livekit = withRooms(rooms);
+
+  await assert.rejects(() => livekit.grantScreenShare('meeting-1', 'user-1'), { status: 503 });
+});
+
+test('revokeScreenShare puts the permission back to camera and microphone, and never rejects', async () => {
+  const { calls, rooms } = recordingRooms();
+  const livekit = withRooms(rooms);
+
+  await livekit.revokeScreenShare('meeting-1', 'user-1');
+
+  assert.deepEqual(calls, [
+    ['updateParticipant', 'meeting-1', 'user-1', { permission: { canSubscribe: true, canPublish: true, canPublishSources: cameraMic } }],
+  ]);
+
+  const down = withRooms(recordingRooms({ updateParticipant: upstreamDown }).rooms);
+  await assert.doesNotReject(() => down.revokeScreenShare('meeting-1', 'user-1'));
+});
+
+test('evict removes the participant, and never rejects — a 404 is the normal case', async () => {
+  const { calls, rooms } = recordingRooms();
+  const livekit = withRooms(rooms);
+
+  await livekit.evict('meeting-1', 'user-1');
+
+  assert.deepEqual(calls, [['removeParticipant', 'meeting-1', 'user-1']]);
+
+  const gone = withRooms(recordingRooms({ removeParticipant: notFound }).rooms);
+  await assert.doesNotReject(() => gone.evict('meeting-1', 'user-1'));
+
+  const down = withRooms(recordingRooms({ removeParticipant: upstreamDown }).rooms);
+  await assert.doesNotReject(() => down.evict('meeting-1', 'user-1'));
+});
+
+test('muteMic mutes the live microphone track and nothing else', async () => {
+  const { calls, rooms } = recordingRooms({
+    getParticipant: async () => ({
+      tracks: [
+        { sid: 'TR_cam', source: TrackSource.CAMERA, muted: false },
+        { sid: 'TR_mic', source: TrackSource.MICROPHONE, muted: false },
+      ],
+    }),
+  });
+  const livekit = withRooms(rooms);
+
+  await livekit.muteMic('meeting-1', 'user-1');
+
+  // getParticipant is an override here (see recordingRooms), so it is not logged —
+  // only the mutePublishedTrack call this test cares about shows up.
+  assert.deepEqual(calls, [['mutePublishedTrack', 'meeting-1', 'user-1', 'TR_mic', true]]);
+
+  const alreadyMuted = recordingRooms({
+    getParticipant: async () => ({ tracks: [{ sid: 'TR_mic', source: TrackSource.MICROPHONE, muted: true }] }),
+  });
+  await withRooms(alreadyMuted.rooms).muteMic('meeting-1', 'user-1');
+  assert.deepEqual(alreadyMuted.calls, []);
+
+  const gone = withRooms(recordingRooms({ getParticipant: notFound }).rooms);
+  await assert.doesNotReject(() => gone.muteMic('meeting-1', 'user-1'));
+});
+
+test('endRoom deletes the room, and never rejects', async () => {
+  const { calls, rooms } = recordingRooms();
+  const livekit = withRooms(rooms);
+
+  await livekit.endRoom('meeting-1');
+
+  assert.deepEqual(calls, [['deleteRoom', 'meeting-1']]);
+
+  const down = withRooms(recordingRooms({ deleteRoom: upstreamDown }).rooms);
+  await assert.doesNotReject(() => down.endRoom('meeting-1'));
 });

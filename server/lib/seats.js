@@ -8,13 +8,13 @@
 
 const GRACE_MS = 30_000;
 
-/** @type {Map<string, { seats: Map<string, object>, queue: object[], graceTimers: Map<string, NodeJS.Timeout> }>} */
+/** @type {Map<string, { seats: Map<string, object>, queue: object[], graceTimers: Map<string, NodeJS.Timeout>, sharer: { userId: string, socketId: string } | null }>} */
 const meetings = new Map();
 
 function state(meetingId) {
   let s = meetings.get(meetingId);
   if (!s) {
-    s = { seats: new Map(), queue: [], graceTimers: new Map() };
+    s = { seats: new Map(), queue: [], graceTimers: new Map(), sharer: null };
     meetings.set(meetingId, s);
   }
   return s;
@@ -72,18 +72,47 @@ function releaseSeat(meetingId, userId, { immediate = false, graceMs = GRACE_MS,
   const s = meetings.get(meetingId);
   if (!s || !s.seats.has(userId)) return;
   cancelGrace(s, userId);
-  if (immediate) {
+  const drop = () => {
     s.seats.delete(userId);
+    // No seat, no share: the lock can never outlive the seat that earned it.
+    if (s.sharer?.userId === userId) s.sharer = null;
     onExpire?.();
-    return;
-  }
+  };
+  if (immediate) return drop();
   const timer = setTimeout(() => {
     s.graceTimers.delete(userId);
-    s.seats.delete(userId);
-    onExpire?.();
+    drop();
   }, graceMs);
   timer.unref(); // a held seat must never keep the process alive
   s.graceTimers.set(userId, timer);
+}
+
+// The ZyloLive lock: one presenter per meeting. It belongs to a socket, not just a
+// user — a share lives in the page that started it, so a second tab or a reconnect
+// (Socket.IO gives it a new socket id) never inherits one. Same rule as
+// tryTakeSeat: the check and the write are one synchronous block, so two people
+// pressing ZyloLive together can never both win.
+function tryTakeScreenLock(meetingId, { userId, socketId }) {
+  const s = state(meetingId);
+  if (s.sharer && s.sharer.socketId !== socketId) return { ok: false, sharerUserId: s.sharer.userId };
+  s.sharer = { userId, socketId };
+  return { ok: true, sharerUserId: userId };
+}
+
+function screenSharer(meetingId) {
+  const sharer = meetings.get(meetingId)?.sharer;
+  return sharer ? { ...sharer } : null;
+}
+
+// Releases the lock only if `socketId` holds it; returns who held it, or null if
+// nothing changed. Callers that act for someone else (the host) look up the
+// holder's socketId first, so the check is never skipped.
+function releaseScreenLock(meetingId, socketId) {
+  const s = meetings.get(meetingId);
+  if (!s?.sharer || s.sharer.socketId !== socketId) return null;
+  const released = s.sharer;
+  s.sharer = null;
+  return released;
 }
 
 function enqueue(meetingId, { userId, socketId, name, imageUrl }) {
@@ -153,6 +182,9 @@ module.exports = {
   seatSocketId,
   listSeats,
   releaseSeat,
+  tryTakeScreenLock,
+  screenSharer,
+  releaseScreenLock,
   enqueue,
   queueSocketId,
   removeFromQueue,

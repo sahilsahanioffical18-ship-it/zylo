@@ -125,9 +125,7 @@ export function RoomShell({
           {people.length}/{maxParticipants}
         </Badge>
         {isHost && (
-          // Hidden below sm: badge.tsx's base `inline-flex` and this `hidden` are the
-          // same cn() conflict group, so `hidden` here wins at the default breakpoint
-          // and `sm:inline-flex` brings it back — no wrapper span needed.
+          // cn() drops the badge's base inline-flex in favour of `hidden` (checked).
           <Badge variant="outline" className="hidden sm:inline-flex">
             {admission === 'manual' ? 'Host admits' : 'Join instantly'}
           </Badge>

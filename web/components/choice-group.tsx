@@ -3,13 +3,18 @@
 import { FieldLegend, FieldSet } from '@/components/ui/field';
 import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
-import type { Admission } from '@/lib/types';
+import type { Admission, ScreenSharePolicy } from '@/lib/types';
 
-// One copy of the admission wording for the schedule dialog and the in-room
-// people panel, so the two can never drift apart.
+// One copy of the admission and ZyloLive wording for the schedule dialog and the
+// in-room people panel, so the two can never drift apart.
 export const ADMISSION_OPTIONS: { value: Admission; label: string; hint: string }[] = [
   { value: 'auto', label: 'Join instantly', hint: 'People enter until the room is full.' },
   { value: 'manual', label: 'Host admits', hint: 'People wait in the lobby for you.' },
+];
+
+export const SCREEN_POLICY_OPTIONS: { value: ScreenSharePolicy; label: string; hint: string }[] = [
+  { value: 'anyone', label: 'Anyone', hint: 'One presenter at a time.' },
+  { value: 'host_only', label: 'Host only', hint: 'Only you can present.' },
 ];
 
 export function ChoiceGroup<T extends string>({

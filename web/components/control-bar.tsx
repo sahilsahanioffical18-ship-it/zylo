@@ -1,6 +1,17 @@
 'use client';
 
-import { MessageSquare, Mic, MicOff, Users, Video, VideoOff } from 'lucide-react';
+import { MessageSquare, Mic, MicOff, ScreenShare, ScreenShareOff, Users, Video, VideoOff } from 'lucide-react';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { MediaToggle } from '@/components/media-toggle';
@@ -8,31 +19,37 @@ import { brand } from '@/lib/brand';
 
 export type PanelTab = 'chat' | 'people';
 
-// No ZyloLive button and no End-for-all button here — those are Phase 4. This is
-// exactly Mic, Camera, ZyloChat, People, Leave and nothing else.
 export function ControlBar({
   micOn,
   camOn,
   onToggleMic,
   onToggleCam,
   mediaReady,
+  sharing,
+  onToggleLive,
   peopleCount,
   waitingCount,
   onOpenPanel,
   onLeave,
+  isHost,
+  onEndForAll,
 }: {
   micOn: boolean;
   camOn: boolean;
   onToggleMic: () => void;
   onToggleCam: () => void;
   mediaReady: boolean;
+  sharing: boolean;
+  onToggleLive: () => void;
   peopleCount: number;
   waitingCount: number;
   onOpenPanel: (tab: PanelTab) => void;
   onLeave: () => void;
+  isHost: boolean;
+  onEndForAll: () => void;
 }) {
   return (
-    <footer className="flex items-center justify-center gap-3 border-t border-border px-4 py-3">
+    <footer className="flex flex-wrap items-center justify-center gap-3 border-t border-border px-4 py-3">
       <MediaToggle
         on={micOn}
         label="microphone"
@@ -49,6 +66,26 @@ export function ControlBar({
         disabled={!mediaReady}
         onClick={onToggleCam}
       />
+
+      {/* Enabled whoever is presenting and whatever the policy: the server answers
+          with the spec's toasts (busy / host_only / unavailable). */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            size="icon"
+            variant={sharing ? 'default' : 'secondary'}
+            className="size-12 rounded-full"
+            aria-label={sharing ? `Stop ${brand.live}` : brand.live}
+            aria-pressed={sharing}
+            disabled={!mediaReady}
+            onClick={onToggleLive}
+          >
+            {sharing ? <ScreenShareOff className="size-5" /> : <ScreenShare className="size-5" />}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{sharing ? `Stop ${brand.live}` : `${brand.live} · share your screen`}</TooltipContent>
+      </Tooltip>
 
       <Tooltip>
         <TooltipTrigger asChild>
@@ -90,6 +127,30 @@ export function ControlBar({
       <Button variant="destructive" className="h-12 rounded-full px-6" onClick={onLeave}>
         Leave
       </Button>
+
+      {isHost && (
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button variant="destructive" className="h-12 rounded-full px-6">
+              End for all
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent className="dark">
+            <AlertDialogHeader>
+              <AlertDialogTitle>End this meeting for everyone?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Everyone is disconnected, including you. It moves to {brand.meet} → Previous.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep meeting</AlertDialogCancel>
+              <AlertDialogAction variant="destructive" onClick={onEndForAll}>
+                End for all
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
     </footer>
   );
 }

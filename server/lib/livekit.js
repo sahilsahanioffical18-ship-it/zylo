@@ -1,7 +1,24 @@
-const { AccessToken, RoomServiceClient, TrackSource } = require('livekit-server-sdk');
+const { AccessToken, RoomServiceClient, TrackSource, WebhookReceiver } = require('livekit-server-sdk');
 
 const TOKEN_TTL = '10m';
 const EMPTY_TIMEOUT = 300;
+
+// What a seat earns through its token, and what a ZyloLive grant adds on top.
+const CAMERA_MIC = [TrackSource.CAMERA, TrackSource.MICROPHONE];
+const WITH_SCREEN = [...CAMERA_MIC, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO];
+
+// updateParticipant replaces the whole permission atomically, so every call spells
+// all of it out. Side effect: canPublishData (left at LiveKit's default of true by
+// the token) becomes false after the first update. Zylo publishes no data.
+const permission = (sources) => ({ canSubscribe: true, canPublish: true, canPublishSources: sources });
+
+// For enforcement calls that must never stall or crash the socket handler that
+// made them. The target may never have connected (a 404 is the normal case — a
+// lobby user's seat, a tab that closed first), and a LiveKit failure must not undo
+// the seat bookkeeping around the call. Anything but not-found is still logged.
+const quiet = (what) => (err) => {
+  if (err?.status !== 404) console.error(`livekit ${what} failed:`, err?.message);
+};
 
 function createLivekit({ url, apiKey, apiSecret, rooms } = {}) {
   url = url ?? process.env.LIVEKIT_URL;
@@ -13,6 +30,7 @@ function createLivekit({ url, apiKey, apiSecret, rooms } = {}) {
   // RPC calls; `url` below stays ws:// as-is because the browser client needs
   // that scheme to connect.
   const roomService = rooms || new RoomServiceClient(url, apiKey, apiSecret);
+  const webhooks = new WebhookReceiver(apiKey, apiSecret);
 
   return {
     url,
@@ -28,10 +46,35 @@ function createLivekit({ url, apiKey, apiSecret, rooms } = {}) {
         room: meetingId,
         canSubscribe: true,
         canPublish: true,
-        canPublishSources: [TrackSource.CAMERA, TrackSource.MICROPHONE],
+        canPublishSources: CAMERA_MIC,
       });
       return token.toJwt();
     },
+    // A released seat must end the media session too: the seat is the only thing
+    // that authorizes media.
+    evict: (meetingId, userId) => roomService.removeParticipant(meetingId, userId).catch(quiet('evict')),
+    endRoom: (meetingId) => roomService.deleteRoom(meetingId).catch(quiet('end room')),
+    // The one call here that rejects: screen:request must be able to tell the
+    // person that ZyloLive did not start.
+    grantScreenShare: async (meetingId, userId) => {
+      await roomService.updateParticipant(meetingId, userId, { permission: permission(WITH_SCREEN) });
+    },
+    revokeScreenShare: (meetingId, userId) =>
+      roomService
+        .updateParticipant(meetingId, userId, { permission: permission(CAMERA_MIC) })
+        .then(() => {}, quiet('revoke screen share')),
+    // host:mute. Only a live, unmuted microphone; the person can unmute themselves.
+    muteMic: async (meetingId, userId) => {
+      try {
+        const { tracks } = await roomService.getParticipant(meetingId, userId);
+        const mic = tracks.find((t) => t.source === TrackSource.MICROPHONE);
+        if (mic && !mic.muted) await roomService.mutePublishedTrack(meetingId, userId, mic.sid, true);
+      } catch (err) {
+        quiet('mute')(err);
+      }
+    },
+    // The signature is lib/webhook.js's only authentication: never skipAuth.
+    receiveWebhook: (body, authorization) => webhooks.receive(body, authorization),
   };
 }
 

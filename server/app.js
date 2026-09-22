@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { meetingsRouter } = require('./lib/meetings');
+const { livekitWebhook } = require('./lib/webhook');
 
 // Both probes mean "can we actually reach it", not "is it configured" — a
 // health endpoint that calls a configured-but-dead dependency healthy is a lie
@@ -16,6 +17,10 @@ async function reachable(probe) {
 function createApp({ db, auth, livekit }) {
   const app = express();
   app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000' }));
+  // Before express.json(), deliberately: the webhook verifies a signature over the
+  // raw bytes. Outside /api, deliberately: Clerk cannot authenticate LiveKit.
+  // Not mounted without LiveKit: there is no secret to verify it with.
+  if (livekit) app.use(livekitWebhook(livekit));
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/health', async (_req, res) => {

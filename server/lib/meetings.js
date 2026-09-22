@@ -123,21 +123,24 @@ function meetingsRouter(db, livekit) {
     if (!row) return res.status(404).json({ error: 'Meeting not found.' });
     if (row.removed_at) return res.status(403).json({ error: 'You have been removed from this meeting.' });
 
-    let token;
     try {
-      // LiveKit is the only out-of-process dependency reached from this path with
-      // a documented failure status: its ServerError carries .status = 401, which
-      // the error middleware would otherwise forward as a 401 "not signed in" to a
-      // caller who is genuinely signed in. Narrow on purpose — wraps exactly the
-      // two upstream calls, nothing else in the handler. console.errors like
-      // room.js's socket wrapper does.
+      // LiveKit is the only out-of-process dependency on this path with a documented
+      // failure status: its ServerError carries .status = 401, which the error
+      // middleware would forward as "not signed in" to someone who is. Narrow on
+      // purpose — wraps exactly the upstream call.
       await livekit.ensureRoom(id, row.max_participants);
-      token = await livekit.mintToken({ meetingId: id, userId: req.userId, name: seat.name });
     } catch (err) {
-      console.error('livekit token mint failed:', err.message);
+      console.error('livekit room creation failed:', err.message);
       return res.status(503).json({ error: 'The video server is unavailable right now.' });
     }
 
+    // Re-check after the awaits above: a kick, a Leave or a grace expiry can release
+    // the seat while the DB query and ensureRoom are in flight, and a token minted
+    // now would outlive the seat by 10 minutes.
+    if (!seats.seatFor(id, req.userId)) return res.status(403).json({ error: 'You do not hold a seat in this meeting.' });
+
+    // Local signing, no network: nothing here for the 503 mapping to cover.
+    const token = await livekit.mintToken({ meetingId: id, userId: req.userId, name: seat.name });
     res.json({ token, url: livekit.url });
   });
 

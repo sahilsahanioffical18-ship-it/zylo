@@ -21,6 +21,7 @@
     "socket.io": "^4.8.3"
   },
   "devDependencies": {
+    "@livekit/rtc-node": "^1.1.0",
     "socket.io-client": "^4.8.3"
   }
 }

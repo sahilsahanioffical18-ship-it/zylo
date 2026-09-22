@@ -16,7 +16,7 @@ import {
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { ADMISSION_OPTIONS, ChoiceGroup } from '@/components/choice-group';
+import { ADMISSION_OPTIONS, ChoiceGroup, SCREEN_POLICY_OPTIONS } from '@/components/choice-group';
 import { useApi } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { parseInviteEmails, toDateTimeLocalValue } from '@/lib/format';
@@ -164,10 +164,7 @@ export function ScheduleDialog({ onScheduled }: { onScheduled: () => void }) {
               name="policy"
               value={policy}
               onChange={setPolicy}
-              options={[
-                { value: 'anyone', label: 'Anyone', hint: 'One presenter at a time.' },
-                { value: 'host_only', label: 'Host only', hint: 'Only you can present.' },
-              ]}
+              options={SCREEN_POLICY_OPTIONS}
             />
 
             <Field data-invalid={Boolean(errors.emails)}>

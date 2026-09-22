@@ -3,7 +3,7 @@ const { validateChatText } = require('./chatRules');
 
 const roomChannel = (meetingId) => `meeting:${meetingId}`;
 
-function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
+function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS } = {}) {
   // Settings for every meeting that is currently live, so the host check and the
   // seat cap never wait on the DB inside a seat-grab path.
   const liveMeetings = new Map();
@@ -59,6 +59,21 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       [meetingId, userId, isHostUser ? 'host' : 'participant'],
     );
 
+  // Every seat release in this file goes through here, so none of them can forget
+  // LiveKit: the seat is the only thing that authorizes media, so losing it ends the
+  // media session too. A token outlives its seat by up to 10 minutes; a reconnect
+  // with one is evicted by lib/webhook.js. The seats release below calls onExpire
+  // for an immediate release as well as at grace expiry, so wrapping it covers both.
+  function freeSeat(meetingId, userId, { onExpire, ...rest } = {}) {
+    seats.releaseSeat(meetingId, userId, {
+      ...rest,
+      onExpire: () => {
+        livekit?.evict(meetingId, userId); // never rejects
+        onExpire?.();
+      },
+    });
+  }
+
   function broadcastPresence(meetingId) {
     io.to(roomChannel(meetingId)).emit('room:presence', {
       people: seats
@@ -87,9 +102,29 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
     });
   }
 
+  // The one place the room hears who is presenting, so the lock and what every
+  // client believes cannot drift apart.
+  function broadcastScreen(meetingId) {
+    io.to(roomChannel(meetingId)).emit('screen:state', { sharerUserId: seats.screenSharer(meetingId)?.userId ?? null });
+  }
+
+  // Ends a share if `holderSocketId` holds the lock: release (synchronously, so a
+  // request racing this sees it gone), revoke at LiveKit (fire and forget; never
+  // rejects), tell the room.
+  function releaseScreen(meetingId, holderSocketId) {
+    const released = seats.releaseScreenLock(meetingId, holderSocketId);
+    if (!released) return;
+    livekit?.revokeScreenShare(meetingId, released.userId);
+    broadcastScreen(meetingId);
+  }
+
   // Presence and lobby are NOT broadcast here: callers admitting several people at
   // once broadcast one time at the end instead of once per person.
   async function admit(socket, meetingId, isHostUser, result) {
+    // A share belongs to the page that started it. When a newer page takes this seat,
+    // the old page's share ends now — before the awaits below, so it cannot keep
+    // presenting while the DB catches up — and the new page never inherits it.
+    if (result.replacedSocketId) releaseScreen(meetingId, result.replacedSocketId);
     await upsertParticipant(meetingId, socket.data.userId, isHostUser);
     await markStarted(meetingId);
     if (result.replacedSocketId) {
@@ -103,6 +138,8 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
     socket.data.meetingId = meetingId;
     socket.join(roomChannel(meetingId));
     socket.emit('meeting:admitted');
+    // Arriving mid-presentation: say who is presenting; later changes arrive by broadcastScreen.
+    socket.emit('screen:state', { sharerUserId: seats.screenSharer(meetingId)?.userId ?? null });
   }
 
   // drainQueue already took the seat; this only runs the admission side effects.
@@ -110,7 +147,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
     const socket = io.sockets.sockets.get(entry.socketId);
     if (!socket) {
       // Their tab is gone: hand the seat straight back rather than leak it.
-      seats.releaseSeat(meetingId, entry.userId, { immediate: true });
+      freeSeat(meetingId, entry.userId, { immediate: true });
       return;
     }
     await admit(socket, meetingId, false, { replacedSocketId: null });
@@ -125,6 +162,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       }
     }
     broadcastPresence(meetingId);
+    broadcastScreen(meetingId); // releaseSeat drops the lock with the seat
     broadcastLobby(meetingId);
     if (seats.listSeats(meetingId).length > 0) return;
     // Nobody is seated any more, so the meeting is over. Anyone still in the
@@ -170,6 +208,10 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
 
       const isHostUser = meta.hostId === userId;
       const { name, imageUrl } = await userInfo(userId);
+      // host:end-meeting (or the last seat emptying) can land during the awaits above,
+      // and so can host:kick — the DB check above ran before either.
+      if (!liveMeetings.has(meetingId)) return socket.emit('meeting:denied', { reason: 'ended' });
+      if (meta.removed?.has(userId)) return socket.emit('meeting:denied', { reason: 'removed' });
       const entry = { userId, socketId: socket.id, name, imageUrl };
 
       // Every DB read is done. From here down nothing awaits until the seat is
@@ -200,7 +242,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return socket.disconnect(true);
       seats.removeFromQueue(meetingId, userId);
-      seats.releaseSeat(meetingId, userId, { immediate: true });
+      freeSeat(meetingId, userId, { immediate: true });
       socket.leave(roomChannel(meetingId));
       socket.data.meetingId = null;
       await onSeatFreed(meetingId);
@@ -222,6 +264,49 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       io.to(roomChannel(meetingId)).emit('chat:message', { userId, name: seat.name, text: clean, ts: Date.now() });
     });
 
+    // ZyloLive. From the seat check to tryTakeScreenLock nothing awaits, so two
+    // people pressing ZyloLive together cannot both win: Node finishes one
+    // handler's synchronous run before starting the other's.
+    on(socket, 'screen:request', async () => {
+      const { meetingId, userId } = socket.data;
+      if (!meetingId) return;
+      const seat = seats.seatFor(meetingId, userId);
+      if (!seat || seat.socketId !== socket.id) return; // lobby or replaced tab: ignored, like chat
+      const meta = liveMeetings.get(meetingId);
+      if (!meta) return;
+      if (!livekit) return socket.emit('screen:denied', { reason: 'unavailable' });
+      if (meta.screenSharePolicy === 'host_only' && meta.hostId !== userId) {
+        return socket.emit('screen:denied', { reason: 'host_only' });
+      }
+      const lock = seats.tryTakeScreenLock(meetingId, { userId, socketId: socket.id });
+      if (!lock.ok) {
+        const sharerName = seats.seatFor(meetingId, lock.sharerUserId)?.name ?? 'someone';
+        return socket.emit('screen:denied', { reason: 'busy', sharerName });
+      }
+      try {
+        await livekit.grantScreenShare(meetingId, userId);
+      } catch (err) {
+        console.error('screen share grant failed:', err.message);
+        seats.releaseScreenLock(meetingId, socket.id);
+        livekit.revokeScreenShare(meetingId, userId); // never rejects; the grant may have applied before it failed
+        return socket.emit('screen:denied', { reason: 'unavailable' });
+      }
+      // The lock can be released while the grant is in flight (host stop, policy
+      // switch, this tab closing), and that path's revoke may have reached LiveKit
+      // before our grant did. Revoke again rather than leave a permission with no lock.
+      if (seats.screenSharer(meetingId)?.socketId !== socket.id) {
+        livekit.revokeScreenShare(meetingId, userId);
+        return;
+      }
+      socket.emit('screen:granted');
+      broadcastScreen(meetingId);
+    });
+
+    on(socket, 'screen:stop', () => {
+      const { meetingId } = socket.data;
+      if (meetingId) releaseScreen(meetingId, socket.id); // only the holder's socket releases
+    });
+
     on(socket, 'lobby:admit', async ({ userId } = {}, ack) => {
       const guard = hostGuard(socket);
       if (!guard) return;
@@ -237,7 +322,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       seats.removeFromQueue(meetingId, userId);
       const waiting = io.sockets.sockets.get(entry.socketId);
       if (!waiting) {
-        seats.releaseSeat(meetingId, userId, { immediate: true });
+        freeSeat(meetingId, userId, { immediate: true });
         broadcastLobby(meetingId);
         return ack?.({ ok: false, reason: 'gone' });
       }
@@ -285,9 +370,101 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       broadcastLobby(meetingId);
     });
 
+    on(socket, 'host:set-screen-policy', async ({ policy } = {}) => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      const { meetingId, meta } = guard;
+      if (policy !== 'anyone' && policy !== 'host_only') return; // client bug; see host:set-admission
+      // Before the first await: screen:request reads meta, so a request racing this
+      // already sees the new policy, and a participant's share ends now.
+      meta.screenSharePolicy = policy;
+      const sharer = seats.screenSharer(meetingId);
+      if (policy === 'host_only' && sharer && sharer.userId !== meta.hostId) releaseScreen(meetingId, sharer.socketId);
+      io.to(roomChannel(meetingId)).emit('meeting:settings', { admission: meta.admission, screenSharePolicy: policy });
+      await db.query('UPDATE meetings SET screen_share_policy = $1 WHERE id = $2', [policy, meetingId]);
+    });
+
+    on(socket, 'host:stop-share', ({ userId } = {}) => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      // Named, not "whoever is sharing": a click aimed at Priya's share must not end
+      // Raj's if the lock changed hands while the menu was open.
+      const sharer = seats.screenSharer(guard.meetingId);
+      if (sharer && sharer.userId === userId) releaseScreen(guard.meetingId, sharer.socketId);
+    });
+
+    on(socket, 'host:mute', ({ userId } = {}) => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      if (typeof userId !== 'string' || !seats.hasSeat(guard.meetingId, userId)) return;
+      livekit?.muteMic(guard.meetingId, userId); // never rejects; they can unmute themselves
+    });
+
+    on(socket, 'host:kick', async ({ userId } = {}) => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      const { meetingId, meta } = guard;
+      if (typeof userId !== 'string' || userId === meta.hostId) return;
+      // Mark the target on the cached meta before the DB await below: a join already
+      // past its own isRemoved check can still be awaiting userInfo when this commits,
+      // and liveMeetings.has alone only catches the meeting ending, not this.
+      (meta.removed ??= new Set()).add(userId);
+      // The DB first: once this commits, a rejoin (isRemoved) and a token request
+      // are refused, and it survives a restart. Anyone ever admitted has a row, so
+      // someone who left a second before the click is still blocked.
+      const { rowCount } = await db.query(
+        `UPDATE meeting_participants SET removed_at = now()
+         WHERE meeting_id = $1 AND user_id = $2 AND removed_at IS NULL`,
+        [meetingId, userId],
+      );
+      // Never admitted, or already removed — unless a seat or queue entry still
+      // needs freeing (the in-flight-join race this guards against).
+      if (rowCount === 0 && !seats.hasSeat(meetingId, userId) && !seats.queueSocketId(meetingId, userId)) return;
+      const seatSocketId = seats.seatSocketId(meetingId, userId);
+      const queuedSocketId = seats.queueSocketId(meetingId, userId);
+      seats.removeFromQueue(meetingId, userId);
+      for (const id of new Set([seatSocketId, queuedSocketId])) {
+        const target = id && io.sockets.sockets.get(id);
+        if (!target) continue;
+        target.data.meetingId = null;
+        target.leave(roomChannel(meetingId));
+        // Before LiveKit hears anything, so the client tears media down on its
+        // "removed" screen instead of first seeing a media error.
+        target.emit('meeting:removed');
+      }
+      if (seatSocketId) freeSeat(meetingId, userId, { immediate: true }); // evicts; drops the lock
+      await onSeatFreed(meetingId);
+    });
+
+    on(socket, 'host:end-meeting', async () => {
+      const guard = hostGuard(socket);
+      if (!guard) return;
+      const { meetingId } = guard;
+      // The DB first, so from the moment anyone is told, a rejoin reads ended_at and
+      // is refused — and the meeting is already in everyone's Previous list.
+      await markEnded(meetingId);
+      const socketIds = [
+        ...seats.listSeats(meetingId).map((s) => s.socketId),
+        ...seats.queuedEntries(meetingId).map((e) => e.socketId),
+      ];
+      seats.clearMeeting(meetingId); // seats, queue, grace timers and the ZyloLive lock
+      liveMeetings.delete(meetingId);
+      for (const id of socketIds) {
+        const target = io.sockets.sockets.get(id);
+        if (!target) continue;
+        target.data.meetingId = null;
+        target.leave(roomChannel(meetingId));
+        target.emit('meeting:ended');
+      }
+      livekit?.endRoom(meetingId); // after the sockets, as in host:kick; never rejects
+    });
+
     on(socket, 'disconnect', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
+      // A share never outlives the page that started it: closing the tab or losing the
+      // socket ends it now, not when the seat's 30 s grace runs out (Deviation 1).
+      releaseScreen(meetingId, socket.id);
       // A newer connection may already hold this queue entry (two tabs). Never
       // pull it out from under them.
       if (seats.queueSocketId(meetingId, userId) === socket.id && seats.removeFromQueue(meetingId, userId)) {
@@ -295,7 +472,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       }
       // Same guard for the seat itself.
       if (seats.seatSocketId(meetingId, userId) !== socket.id) return;
-      seats.releaseSeat(meetingId, userId, {
+      freeSeat(meetingId, userId, {
         graceMs,
         onExpire: () => {
           onSeatFreed(meetingId).catch((err) => console.error('seat release failed:', err.message));

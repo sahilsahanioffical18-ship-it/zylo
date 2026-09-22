@@ -159,3 +159,68 @@ test('clearMeeting drops all state and cancels a pending grace timer', async () 
   await new Promise((r) => setTimeout(r, 60));
   assert.equal(expired, false);
 });
+
+test('two screen requests at once: exactly one gets the lock', () => {
+  const id = 'm-screen-race';
+  // Back to back, no await in between — this is the race the spec describes.
+  const a = seats.tryTakeScreenLock(id, { userId: 'u1', socketId: 's1' });
+  assert.deepEqual(a, { ok: true, sharerUserId: 'u1' });
+  const b = seats.tryTakeScreenLock(id, { userId: 'u2', socketId: 's2' });
+  assert.deepEqual(b, { ok: false, sharerUserId: 'u1' });
+  assert.deepEqual(seats.screenSharer(id), { userId: 'u1', socketId: 's1' });
+  seats.clearMeeting(id);
+});
+
+test('the lock belongs to a socket: the same page may ask again, a second tab may not', () => {
+  const id = 'm-screen-socket';
+  assert.equal(seats.tryTakeScreenLock(id, { userId: 'u1', socketId: 's1' }).ok, true);
+  assert.equal(seats.tryTakeScreenLock(id, { userId: 'u1', socketId: 's1' }).ok, true);
+  const denied = seats.tryTakeScreenLock(id, { userId: 'u1', socketId: 's1b' });
+  assert.deepEqual(denied, { ok: false, sharerUserId: 'u1' });
+  seats.clearMeeting(id);
+});
+
+test('only the socket holding the lock can release it', () => {
+  const id = 'm-screen-release';
+  seats.tryTakeScreenLock(id, { userId: 'u1', socketId: 's1' });
+  assert.equal(seats.releaseScreenLock(id, 's2'), null);
+  assert.deepEqual(seats.screenSharer(id), { userId: 'u1', socketId: 's1' });
+  assert.deepEqual(seats.releaseScreenLock(id, 's1'), { userId: 'u1', socketId: 's1' });
+  assert.equal(seats.screenSharer(id), null);
+  assert.equal(seats.releaseScreenLock(id, 's1'), null);
+  assert.equal(seats.screenSharer('m-unknown'), null);
+  seats.clearMeeting(id);
+});
+
+test('the sharer losing their seat loses the lock, whether they leave or their grace runs out', async () => {
+  const idImmediate = 'm-screen-lock-immediate';
+  seats.tryTakeSeat(idImmediate, { ...person(1), isHost: true, max: 3 });
+  seats.tryTakeScreenLock(idImmediate, { userId: 'u1', socketId: 's1' });
+  seats.releaseSeat(idImmediate, 'u1', { immediate: true });
+  assert.equal(seats.screenSharer(idImmediate), null);
+  seats.clearMeeting(idImmediate);
+
+  const idGrace = 'm-screen-lock-grace';
+  seats.tryTakeSeat(idGrace, { ...person(2), isHost: true, max: 3 });
+  seats.tryTakeScreenLock(idGrace, { userId: 'u2', socketId: 's2' });
+  seats.releaseSeat(idGrace, 'u2', { graceMs: 20 });
+  assert.deepEqual(seats.screenSharer(idGrace), { userId: 'u2', socketId: 's2' }); // still held immediately
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(seats.screenSharer(idGrace), null);
+  seats.clearMeeting(idGrace);
+
+  const idClear = 'm-screen-lock-clear';
+  seats.tryTakeSeat(idClear, { ...person(3), isHost: true, max: 3 });
+  seats.tryTakeScreenLock(idClear, { userId: 'u3', socketId: 's3' });
+  seats.clearMeeting(idClear);
+  assert.equal(seats.screenSharer(idClear), null);
+
+  // A non-sharer's release leaves another person's lock alone.
+  const idOther = 'm-screen-lock-nonsharer';
+  seats.tryTakeSeat(idOther, { ...person(4), isHost: true, max: 3 });
+  seats.tryTakeSeat(idOther, { ...person(5), isHost: false, max: 3 });
+  seats.tryTakeScreenLock(idOther, { userId: 'u4', socketId: 's4' });
+  seats.releaseSeat(idOther, 'u5', { immediate: true });
+  assert.deepEqual(seats.screenSharer(idOther), { userId: 'u4', socketId: 's4' });
+  seats.clearMeeting(idOther);
+});

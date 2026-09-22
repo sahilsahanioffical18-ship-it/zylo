@@ -7,7 +7,8 @@ import { toast } from 'sonner';
 import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { validateChatText } from '@/lib/chat-rules';
-import type { Admission } from '@/lib/types';
+import { screenDeniedMessage, type ScreenDenial } from '@/lib/screen-share';
+import type { Admission, ScreenSharePolicy } from '@/lib/types';
 
 export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean };
 export type LobbyEntry = { userId: string; name: string; imageUrl: string | null };
@@ -39,6 +40,11 @@ export function useMeeting(meetingId: string | null) {
   const [lobby, setLobby] = useState<LobbyEntry[]>([]);
   const [admission, setAdmission] = useState<Admission | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sharerUserId, setSharerUserId] = useState<string | null>(null);
+  // Bumped once per screen:granted. A counter, not a flag — see use-livekit-room.ts's
+  // capture effect for why.
+  const [shareGrant, setShareGrant] = useState(0);
+  const [screenPolicy, setScreenPolicy] = useState<ScreenSharePolicy | null>(null);
 
   useEffect(() => {
     if (!meetingId) return;
@@ -48,6 +54,8 @@ export function useMeeting(meetingId: string | null) {
       setState({ status: 'connecting' });
       setLobby([]);
       setMessages([]);
+      setSharerUserId(null);
+      setShareGrant(0);
     });
 
     const socket = io(SERVER_URL, {
@@ -69,17 +77,22 @@ export function useMeeting(meetingId: string | null) {
     // room:presence always follows meeting:admitted and carries the roster, so it
     // is what flips us into the room — admitted on its own would render empty.
     socket.on('room:presence', ({ people }: { people: Person[] }) => setState({ status: 'admitted', people }));
-    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => {
+    // Every terminal screen goes through here, so none of them can forget the
+    // disconnect. Terminal screen: nothing to reconnect to. Calling disconnect() here is a
+    // CLIENT-initiated disconnect, which is what turns off socket.io's automatic
+    // reconnection (this is not a 'disconnect' event LISTENER — we still never
+    // react to the server's own disconnect event, which the 30s seat grace
+    // period depends on). Without this call, a later network blip would
+    // reconnect this socket, re-emit meeting:join-request, and silently
+    // re-queue someone the host just denied/removed/ended.
+    const end = (reason: DeniedReason) => {
       setState({ status: 'denied', reason });
-      // Terminal screen: nothing to reconnect to. Calling disconnect() here is a
-      // CLIENT-initiated disconnect, which is what turns off socket.io's automatic
-      // reconnection (this is not a 'disconnect' event LISTENER — we still never
-      // react to the server's own disconnect event, which the 30s seat grace
-      // period depends on). Without this call, a later network blip would
-      // reconnect this socket, re-emit meeting:join-request, and silently
-      // re-queue someone the host just denied.
       socket.disconnect();
-    });
+    };
+    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => end(reason));
+    // The spec's contract names: host:kick sends meeting:removed, End for all meeting:ended.
+    socket.on('meeting:removed', () => end('removed'));
+    socket.on('meeting:ended', () => end('ended'));
     socket.on('meeting:replaced', () => {
       setState({ status: 'replaced' });
       // Same fix as meeting:denied above. Without disconnecting here, a hidden
@@ -91,8 +104,14 @@ export function useMeeting(meetingId: string | null) {
       socket.disconnect();
     });
     socket.on('lobby:update', ({ waiting }: { waiting: LobbyEntry[] }) => setLobby(waiting));
-    socket.on('meeting:settings', (settings: { admission: Admission }) => setAdmission(settings.admission));
+    socket.on('meeting:settings', (s: { admission: Admission; screenSharePolicy: ScreenSharePolicy }) => {
+      setAdmission(s.admission);
+      setScreenPolicy(s.screenSharePolicy);
+    });
     socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));
+    socket.on('screen:granted', () => setShareGrant((n) => n + 1));
+    socket.on('screen:denied', (denial: ScreenDenial) => toast.error(screenDeniedMessage(denial, brand.live)));
+    socket.on('screen:state', ({ sharerUserId: id }: { sharerUserId: string | null }) => setSharerUserId(id));
 
     return () => {
       socket.disconnect();
@@ -121,11 +140,62 @@ export function useMeeting(meetingId: string | null) {
 
   // Validate client-side so a message the server would silently drop never leaves
   // the browser (the server takes the sender's name from the seat, so there is
-  // nothing else for this call to pass).
+  // nothing else for this call to pass). Sends what it validated, not the raw
+  // text, so a message that only differs by leading/trailing whitespace can't
+  // reach the server untrimmed.
   const sendChat = useCallback((text: string) => {
-    if (validateChatText(text) === null) return;
-    socketRef.current?.emit('chat:message', { text });
+    const clean = validateChatText(text);
+    if (clean === null) return;
+    socketRef.current?.emit('chat:message', { text: clean });
   }, []);
 
-  return { state, lobby, admission, messages, leave, admitFromLobby, denyFromLobby, setAdmissionMode, sendChat };
+  const requestScreen = useCallback(() => {
+    socketRef.current?.emit('screen:request');
+  }, []);
+
+  const stopScreen = useCallback(() => {
+    socketRef.current?.emit('screen:stop');
+  }, []);
+
+  const kick = useCallback((userId: string) => {
+    socketRef.current?.emit('host:kick', { userId });
+  }, []);
+
+  const mute = useCallback((userId: string) => {
+    socketRef.current?.emit('host:mute', { userId });
+  }, []);
+
+  const stopShareOf = useCallback((userId: string) => {
+    socketRef.current?.emit('host:stop-share', { userId });
+  }, []);
+
+  const setScreenPolicyMode = useCallback((policy: ScreenSharePolicy) => {
+    socketRef.current?.emit('host:set-screen-policy', { policy });
+  }, []);
+
+  const endMeeting = useCallback(() => {
+    socketRef.current?.emit('host:end-meeting', {});
+  }, []);
+
+  return {
+    state,
+    lobby,
+    admission,
+    messages,
+    leave,
+    admitFromLobby,
+    denyFromLobby,
+    setAdmissionMode,
+    sendChat,
+    sharerUserId,
+    shareGrant,
+    requestScreen,
+    stopScreen,
+    screenPolicy,
+    kick,
+    mute,
+    stopShareOf,
+    setScreenPolicyMode,
+    endMeeting,
+  };
 }

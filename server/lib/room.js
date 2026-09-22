@@ -3,7 +3,7 @@ const { validateChatText } = require('./chatRules');
 
 const roomChannel = (meetingId) => `meeting:${meetingId}`;
 
-function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
+function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS } = {}) {
   // Settings for every meeting that is currently live, so the host check and the
   // seat cap never wait on the DB inside a seat-grab path.
   const liveMeetings = new Map();
@@ -59,6 +59,21 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       [meetingId, userId, isHostUser ? 'host' : 'participant'],
     );
 
+  // Every seat release in this file goes through here, so none of them can forget
+  // LiveKit: the seat is the only thing that authorizes media, so losing it ends the
+  // media session too. A token outlives its seat by up to 10 minutes; a reconnect
+  // with one is evicted by lib/webhook.js. The seats release below calls onExpire
+  // for an immediate release as well as at grace expiry, so wrapping it covers both.
+  function freeSeat(meetingId, userId, { onExpire, ...rest } = {}) {
+    seats.releaseSeat(meetingId, userId, {
+      ...rest,
+      onExpire: () => {
+        livekit?.evict(meetingId, userId); // never rejects
+        onExpire?.();
+      },
+    });
+  }
+
   function broadcastPresence(meetingId) {
     io.to(roomChannel(meetingId)).emit('room:presence', {
       people: seats
@@ -110,7 +125,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
     const socket = io.sockets.sockets.get(entry.socketId);
     if (!socket) {
       // Their tab is gone: hand the seat straight back rather than leak it.
-      seats.releaseSeat(meetingId, entry.userId, { immediate: true });
+      freeSeat(meetingId, entry.userId, { immediate: true });
       return;
     }
     await admit(socket, meetingId, false, { replacedSocketId: null });
@@ -200,7 +215,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return socket.disconnect(true);
       seats.removeFromQueue(meetingId, userId);
-      seats.releaseSeat(meetingId, userId, { immediate: true });
+      freeSeat(meetingId, userId, { immediate: true });
       socket.leave(roomChannel(meetingId));
       socket.data.meetingId = null;
       await onSeatFreed(meetingId);
@@ -237,7 +252,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       seats.removeFromQueue(meetingId, userId);
       const waiting = io.sockets.sockets.get(entry.socketId);
       if (!waiting) {
-        seats.releaseSeat(meetingId, userId, { immediate: true });
+        freeSeat(meetingId, userId, { immediate: true });
         broadcastLobby(meetingId);
         return ack?.({ ok: false, reason: 'gone' });
       }
@@ -295,7 +310,7 @@ function registerRoomHandlers(io, { db, graceMs = seats.GRACE_MS } = {}) {
       }
       // Same guard for the seat itself.
       if (seats.seatSocketId(meetingId, userId) !== socket.id) return;
-      seats.releaseSeat(meetingId, userId, {
+      freeSeat(meetingId, userId, {
         graceMs,
         onExpire: () => {
           onSeatFreed(meetingId).catch((err) => console.error('seat release failed:', err.message));

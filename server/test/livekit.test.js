@@ -417,3 +417,22 @@ test('endRoom deletes the room, and never rejects', async () => {
   const down = withRooms(recordingRooms({ deleteRoom: upstreamDown }).rooms);
   await assert.doesNotReject(() => down.endRoom('meeting-1'));
 });
+
+test('a seat released while the room is being created gets 403, not a token', async (t) => {
+  const { livekit } = fakeLivekit();
+  // The race the re-check exists for: a kick, a Leave or a grace expiry lands
+  // during the ensureRoom await, after the route's first seat check passed.
+  livekit.ensureRoom = async () => {
+    seats.releaseSeat(MEETING_ID, 'p1', { immediate: true });
+  };
+  const server = await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit }));
+  t.after(async () => {
+    await server.close();
+    seats.clearMeeting(MEETING_ID);
+  });
+  seats.tryTakeSeat(MEETING_ID, { userId: 'p1', socketId: 's5', name: 'Priya One', imageUrl: null, isHost: false, max: 20 });
+
+  const { status, body } = await tokenApi(server, 'p1', MEETING_ID);
+  assert.equal(status, 403);
+  assert.equal(body.token, undefined);
+});

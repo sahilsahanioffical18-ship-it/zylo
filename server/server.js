@@ -40,7 +40,7 @@ async function main() {
   const httpServer = http.createServer(app);
   const io = new Server(httpServer, { cors: { origin: CLIENT_ORIGIN } });
   io.use(clerkSocketAuth({ db }));
-  if (db) registerRoomHandlers(io, { db });
+  if (db) registerRoomHandlers(io, { db, livekit });
   else console.warn('WARNING: DATABASE_URL is not set — ZyloRoom sockets will refuse every join request.');
 
   httpServer.listen(PORT, () => console.log(`Zylo API listening on :${PORT}`));

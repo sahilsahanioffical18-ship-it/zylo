@@ -4,6 +4,8 @@ const { createDb } = require('../lib/db');
 const http = require('node:http');
 const { Server } = require('socket.io');
 const { io: ioClient } = require('socket.io-client');
+const seats = require('../lib/seats');
+const { registerRoomHandlers } = require('../lib/room');
 
 async function listen(app) {
   const server = app.listen(0);
@@ -68,11 +70,79 @@ function insertUser(db, { id, email, name, imageUrl = null }) {
   );
 }
 
-function insertMeeting(db, { id, hostId, title = 'ZyloCall', admission = 'auto', maxParticipants = 20 }) {
+function insertMeeting(
+  db,
+  { id, hostId, title = 'ZyloCall', admission = 'auto', screenSharePolicy = 'anyone', maxParticipants = 20 },
+) {
   return db.query(
-    `INSERT INTO meetings (id, host_id, title, admission, max_participants) VALUES ($1, $2, $3, $4, $5)`,
-    [id, hostId, title, admission, maxParticipants],
+    `INSERT INTO meetings (id, host_id, title, admission, screen_share_policy, max_participants)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, hostId, title, admission, screenSharePolicy, maxParticipants],
   );
+}
+
+// The four users and one meeting most socket tests need, and a Socket.IO server
+// running the real room handlers. graceMs is short so grace expiry is testable.
+async function startRoom(
+  db,
+  { meetingId = 'abc-defg-hij', admission = 'auto', screenSharePolicy = 'anyone', maxParticipants = 3, graceMs = 60, livekit = null } = {},
+) {
+  await insertUser(db, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
+  await insertUser(db, { id: 'p1', email: 'p1@zylo.test', name: 'Priya One' });
+  await insertUser(db, { id: 'p2', email: 'p2@zylo.test', name: 'Pablo Two' });
+  await insertUser(db, { id: 'p3', email: 'p3@zylo.test', name: 'Pia Three' });
+  await insertMeeting(db, { id: meetingId, hostId: 'host', admission, screenSharePolicy, maxParticipants });
+  const server = await startSocketServer((io) => {
+    io.use(fakeSocketAuth);
+    registerRoomHandlers(io, { db, graceMs, livekit });
+  });
+  return { meetingId, server };
+}
+
+// Connects userId and resolves once they hold a seat.
+async function seat(url, userId, meetingId) {
+  const client = connectClient(url, userId);
+  const admitted = waitForEvent(client, 'meeting:admitted');
+  client.emit('meeting:join-request', { meetingId });
+  await admitted;
+  return client;
+}
+
+// Every `event` a socket receives. Register before the emit under test, and read
+// it after settle(): proving something did NOT arrive needs a window, not a race.
+function collect(socket, event) {
+  const got = [];
+  socket.on(event, (payload) => got.push(payload));
+  return got;
+}
+const settle = (ms = 60) => new Promise((r) => setTimeout(r, ms));
+
+// Stands in for lib/livekit.js: records each enforcement call, touches no network.
+function recordingLivekit() {
+  const calls = [];
+  const record = (name) => async (...args) => { calls.push([name, ...args]); };
+  return {
+    calls,
+    callsTo: (name) => calls.filter(([n]) => n === name).map(([, ...args]) => args),
+    evict: record('evict'),
+  };
+}
+
+// One test's whole world — fresh DB, real handlers, recording LiveKit — torn down in t.after.
+async function roomHarness(t, options = {}) {
+  const db = await setupTestDb();
+  const livekit = recordingLivekit();
+  const { meetingId, server } = await startRoom(db, { ...options, livekit });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    seats.clearMeeting(meetingId);
+    await db.close();
+  });
+  const connect = (userId) => { const c = connectClient(server.url, userId); clients.push(c); return c; };
+  const join = async (userId) => { const c = await seat(server.url, userId, meetingId); clients.push(c); return c; };
+  return { db, livekit, meetingId, server, connect, join };
 }
 
 module.exports = {
@@ -85,4 +155,10 @@ module.exports = {
   waitForEvent,
   insertUser,
   insertMeeting,
+  startRoom,
+  seat,
+  collect,
+  settle,
+  recordingLivekit,
+  roomHarness,
 };

@@ -1,14 +1,18 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { RemoteAudioTrack, VideoTrack } from 'livekit-client';
 import { MicOff } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { brand } from '@/lib/brand';
 import { initials } from '@/lib/format';
 import { presentingBanner, type StageView } from '@/lib/screen-share';
+import { fitGrid } from '@/lib/stage-layout';
 import type { LiveKitStatus } from '@/lib/use-livekit-room';
 import type { Person } from '@/lib/use-meeting';
+
+// One CSS gap for the grid stage, at every screen size — see stage-layout.ts.
+const GRID_GAP = 12;
 
 // attach()/detach() in an effect keyed on the track: one copy for every media element here.
 function useAttach<E extends HTMLMediaElement>(track: VideoTrack | RemoteAudioTrack | undefined) {
@@ -41,6 +45,14 @@ function AudioSink({ track }: { track: RemoteAudioTrack }) {
   return <audio ref={ref} autoPlay playsInline />;
 }
 
+type TileData = {
+  person: Person;
+  isSelf: boolean;
+  track: VideoTrack | undefined;
+  isSpeaking: boolean;
+  isMicMuted: boolean;
+};
+
 function Tile({
   person,
   isSelf,
@@ -48,21 +60,23 @@ function Tile({
   isSpeaking,
   isMicMuted,
   compact,
-}: {
-  person: Person;
-  isSelf: boolean;
-  track: VideoTrack | undefined;
-  isSpeaking: boolean;
-  isMicMuted: boolean;
+  size,
+}: TileData & {
   compact?: boolean;
+  // Grid tiles pass their fitGrid pixel size; the presenting filmstrip omits it and
+  // keeps aspect-video instead.
+  size?: { width: number; height: number };
 }) {
   const ref = useAttach<HTMLVideoElement>(track);
+  // Below 200px wide a size-20 avatar and full caption no longer fit.
+  const small = compact || (size !== undefined && size.width < 200);
 
   return (
     <div
-      className={`relative grid aspect-video place-items-center overflow-hidden rounded-2xl border border-border bg-card transition-[box-shadow] duration-200 ${
-        isSpeaking ? 'ring-2 ring-success' : ''
-      }`}
+      style={size && { width: size.width, height: size.height }}
+      className={`relative grid place-items-center overflow-hidden rounded-2xl border border-border bg-card transition-[box-shadow] duration-200 ${
+        size ? '' : 'aspect-video'
+      } ${isSpeaking ? 'ring-2 ring-success' : ''}`}
     >
       {/* Roster is the source of truth: the tile exists whether or not `track` has
           arrived yet, so a slow or failed media connection still shows the avatar
@@ -77,18 +91,65 @@ function Tile({
       {!track && (
         <span
           className={`grid place-items-center rounded-full bg-muted font-bold text-muted-foreground ${
-            compact ? 'size-10 text-base' : 'size-20 text-2xl'
+            small ? 'size-10 text-base' : 'size-20 text-2xl'
           }`}
         >
           {initials(person.name)}
         </span>
       )}
-      <span className={`absolute flex items-center gap-2 ${compact ? 'inset-x-2 bottom-2 text-xs' : 'inset-x-3 bottom-3'}`}>
+      <span className={`absolute flex items-center gap-2 ${small ? 'inset-x-2 bottom-2 text-xs' : 'inset-x-3 bottom-3'}`}>
         <span className="truncate rounded-md bg-background/80 px-2 py-1 text-sm font-medium">{person.name}</span>
         {person.isHost && <Badge variant="secondary">Host</Badge>}
         {isMicMuted && <MicOff className="size-4 shrink-0 text-muted-foreground" aria-label="Muted" />}
       </span>
     </div>
+  );
+}
+
+function GridStage({ people, status, tileProps }: { people: Person[]; status: LiveKitStatus; tileProps: (person: Person) => TileData }) {
+  const ref = useRef<HTMLElement>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  // Grid-only measurement: mounts and unmounts with grid mode. ResizeObserver's first
+  // notification arrives before paint, so there's no first-frame flash, and the
+  // setSize call lives in its callback (not the effect body), so this stays clear of
+  // react-hooks/set-state-in-effect.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setSize((prev) => (prev.width === width && prev.height === height ? prev : { width, height }));
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const fit = fitGrid(people.length, size.width, size.height, GRID_GAP);
+
+  return (
+    <main
+      ref={ref}
+      aria-label={`${brand.room} stage`}
+      className={`relative min-h-0 min-w-0 flex-1 ${fit.scroll ? 'overflow-y-auto' : 'overflow-hidden'}`}
+    >
+      {status === 'connecting' && (
+        <p
+          role="status"
+          className="absolute inset-x-0 top-2 mx-auto w-fit rounded-full bg-background/80 px-3 py-1 text-sm text-muted-foreground"
+        >
+          Connecting video…
+        </p>
+      )}
+      <div
+        className={`grid min-h-full justify-center ${fit.scroll ? 'content-start' : 'content-center'}`}
+        style={{ gridTemplateColumns: `repeat(${fit.cols}, ${fit.tileWidth}px)`, gridAutoRows: `${fit.tileHeight}px`, gap: GRID_GAP }}
+      >
+        {people.map((person) => (
+          <Tile key={person.userId} {...tileProps(person)} size={{ width: fit.tileWidth, height: fit.tileHeight }} />
+        ))}
+      </div>
+    </main>
   );
 }
 
@@ -168,19 +229,7 @@ export function VideoStage({
 
   return (
     <>
-      <main
-        aria-label={`${brand.room} stage`}
-        className="grid min-h-0 flex-1 auto-rows-max content-center grid-cols-1 gap-4 overflow-y-auto sm:grid-cols-2 lg:grid-cols-3"
-      >
-        {status === 'connecting' && (
-          <p role="status" className="col-span-full text-center text-sm text-muted-foreground">
-            Connecting video…
-          </p>
-        )}
-        {people.map((person) => (
-          <Tile key={person.userId} {...tileProps(person)} />
-        ))}
-      </main>
+      <GridStage people={people} status={status} tileProps={tileProps} />
       {audioSinks}
     </>
   );

@@ -118,7 +118,7 @@ export function RoomShell({
 
   // ZyloRoom is always dark, whatever the dashboard's theme is set to.
   return (
-    <div className="dark flex min-h-dvh flex-col bg-background text-foreground">
+    <div className="dark flex h-dvh flex-col overflow-hidden bg-background text-foreground">
       <header className="flex items-center gap-3 border-b border-border px-4 py-3">
         <h1 className="min-w-0 flex-1 truncate font-semibold">{title}</h1>
         <Badge variant="outline" className="tabular-nums">

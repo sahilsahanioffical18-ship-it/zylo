@@ -102,9 +102,29 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     });
   }
 
+  // The one place the room hears who is presenting, so the lock and what every
+  // client believes cannot drift apart.
+  function broadcastScreen(meetingId) {
+    io.to(roomChannel(meetingId)).emit('screen:state', { sharerUserId: seats.screenSharer(meetingId)?.userId ?? null });
+  }
+
+  // Ends a share if `holderSocketId` holds the lock: release (synchronously, so a
+  // request racing this sees it gone), revoke at LiveKit (fire and forget; never
+  // rejects), tell the room.
+  function releaseScreen(meetingId, holderSocketId) {
+    const released = seats.releaseScreenLock(meetingId, holderSocketId);
+    if (!released) return;
+    livekit?.revokeScreenShare(meetingId, released.userId);
+    broadcastScreen(meetingId);
+  }
+
   // Presence and lobby are NOT broadcast here: callers admitting several people at
   // once broadcast one time at the end instead of once per person.
   async function admit(socket, meetingId, isHostUser, result) {
+    // A share belongs to the page that started it. When a newer page takes this seat,
+    // the old page's share ends now — before the awaits below, so it cannot keep
+    // presenting while the DB catches up — and the new page never inherits it.
+    if (result.replacedSocketId) releaseScreen(meetingId, result.replacedSocketId);
     await upsertParticipant(meetingId, socket.data.userId, isHostUser);
     await markStarted(meetingId);
     if (result.replacedSocketId) {
@@ -118,6 +138,8 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     socket.data.meetingId = meetingId;
     socket.join(roomChannel(meetingId));
     socket.emit('meeting:admitted');
+    // Arriving mid-presentation: say who is presenting; later changes arrive by broadcastScreen.
+    socket.emit('screen:state', { sharerUserId: seats.screenSharer(meetingId)?.userId ?? null });
   }
 
   // drainQueue already took the seat; this only runs the admission side effects.
@@ -140,6 +162,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       }
     }
     broadcastPresence(meetingId);
+    broadcastScreen(meetingId); // releaseSeat drops the lock with the seat
     broadcastLobby(meetingId);
     if (seats.listSeats(meetingId).length > 0) return;
     // Nobody is seated any more, so the meeting is over. Anyone still in the
@@ -237,6 +260,48 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       io.to(roomChannel(meetingId)).emit('chat:message', { userId, name: seat.name, text: clean, ts: Date.now() });
     });
 
+    // ZyloLive. From the seat check to tryTakeScreenLock nothing awaits, so two
+    // people pressing ZyloLive together cannot both win: Node finishes one
+    // handler's synchronous run before starting the other's.
+    on(socket, 'screen:request', async () => {
+      const { meetingId, userId } = socket.data;
+      if (!meetingId) return;
+      const seat = seats.seatFor(meetingId, userId);
+      if (!seat || seat.socketId !== socket.id) return; // lobby or replaced tab: ignored, like chat
+      const meta = liveMeetings.get(meetingId);
+      if (!meta) return;
+      if (!livekit) return socket.emit('screen:denied', { reason: 'unavailable' });
+      if (meta.screenSharePolicy === 'host_only' && meta.hostId !== userId) {
+        return socket.emit('screen:denied', { reason: 'host_only' });
+      }
+      const lock = seats.tryTakeScreenLock(meetingId, { userId, socketId: socket.id });
+      if (!lock.ok) {
+        const sharerName = seats.seatFor(meetingId, lock.sharerUserId)?.name ?? 'someone';
+        return socket.emit('screen:denied', { reason: 'busy', sharerName });
+      }
+      try {
+        await livekit.grantScreenShare(meetingId, userId);
+      } catch (err) {
+        console.error('screen share grant failed:', err.message);
+        seats.releaseScreenLock(meetingId, socket.id);
+        return socket.emit('screen:denied', { reason: 'unavailable' });
+      }
+      // The lock can be released while the grant is in flight (host stop, policy
+      // switch, this tab closing), and that path's revoke may have reached LiveKit
+      // before our grant did. Revoke again rather than leave a permission with no lock.
+      if (seats.screenSharer(meetingId)?.socketId !== socket.id) {
+        livekit.revokeScreenShare(meetingId, userId);
+        return;
+      }
+      socket.emit('screen:granted');
+      broadcastScreen(meetingId);
+    });
+
+    on(socket, 'screen:stop', () => {
+      const { meetingId } = socket.data;
+      if (meetingId) releaseScreen(meetingId, socket.id); // only the holder's socket releases
+    });
+
     on(socket, 'lobby:admit', async ({ userId } = {}, ack) => {
       const guard = hostGuard(socket);
       if (!guard) return;
@@ -303,6 +368,9 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     on(socket, 'disconnect', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
+      // A share never outlives the page that started it: closing the tab or losing the
+      // socket ends it now, not when the seat's 30 s grace runs out (Deviation 1).
+      releaseScreen(meetingId, socket.id);
       // A newer connection may already hold this queue entry (two tabs). Never
       // pull it out from under them.
       if (seats.queueSocketId(meetingId, userId) === socket.id && seats.removeFromQueue(meetingId, userId)) {

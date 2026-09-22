@@ -125,7 +125,17 @@ function recordingLivekit() {
     calls,
     callsTo: (name) => calls.filter(([n]) => n === name).map(([, ...args]) => args),
     evict: record('evict'),
+    grantScreenShare: record('grantScreenShare'),
+    revokeScreenShare: record('revokeScreenShare'),
   };
+}
+
+// Takes ZyloLive for `client`, then lets the grant's broadcast settle.
+async function shareScreen(client) {
+  const granted = waitForEvent(client, 'screen:granted');
+  client.emit('screen:request');
+  await granted;
+  await settle();
 }
 
 // One test's whole world — fresh DB, real handlers, recording LiveKit — torn down in t.after.
@@ -161,4 +171,5 @@ module.exports = {
   settle,
   recordingLivekit,
   roomHarness,
+  shareScreen,
 };

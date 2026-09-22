@@ -29,7 +29,7 @@ subscription logic to port. It is not the base repo.
 | **ZyloCall** | Instant meeting you start right now | Dashboard primary "ZyloCall · Start now" button |
 | **ZyloRoom** | The in-meeting room: video stage, controls, lobby, host controls | Room top bar, pre-join ("Join ZyloRoom"), waiting card |
 | **ZyloLive** | Screen sharing / presenting | Control bar "ZyloLive" share button; stage banner "ZyloLive · Priya is presenting"; toasts ("ZyloLive is in use by Priya") |
-| **ZyloChat** | In-meeting chat (human; AI joins it in Phase 6) | Control bar "ZyloChat" button and side-panel tab |
+| **ZyloChat** | In-meeting chat (human; AI joins it in Phase 8) | Control bar "ZyloChat" button and side-panel tab |
 
 Brand names are **UI copy only**, kept in one `web/lib/brand.ts` constant so a future rename is a
 one-file change. Code identifiers, socket events and routes stay technical (`screen:*`,
@@ -54,7 +54,7 @@ downstream data, no card needed.
 
 - **Concurrency:** 20 people is well under 100.
 - **Minutes:** one 1-hour, 20-person meeting uses 1,200 minutes, so about **4 such meetings a month**.
-- **Data:** a rough estimate, to be measured in Phase 5. About 10–14 GB per 20-person hour with
+- **Data:** a rough estimate, to be measured in Phase 7. About 10–14 GB per 20-person hour with
   speaker view, so about 3–5 such meetings a month.
 
 **Conclusion:** develop and load-test on local `livekit-server --dev` (free, no limits) and use the
@@ -116,7 +116,7 @@ plugin dark palette with the **same indigo + green pair** on slate. It's filed u
 - **Live / Admitted / speaking ring / ZyloLive banner:** `--accent` `#059669`.
 - **Waiting / lobby / Scheduled-soon:** amber `#D97706` with `#000000` text (amber taken from the plugin's color data).
 - **Error / Leave / End:** `--destructive`.
-- **AI in ZyloChat (Phase 6):** the `--secondary` indigo tint, so AI bubbles stay visibly different from human messages.
+- **AI in ZyloChat (Phase 8):** the `--secondary` indigo tint, so AI bubbles stay visibly different from human messages.
 
 **Typography.** Plus Jakarta Sans only; the plugin's "Friendly SaaS" pairing.
 - Loaded with `next/font/google`.
@@ -243,7 +243,7 @@ meeting it holds `{ seats: Map<userId, {socketId, name, graceTimer}>, queue: use
   between check and set**. Node runs one handler step at a time, so two requests that arrive
   together can't both see "1 seat left"; the first to reach the server wins.
 - DB lookups (meeting exists, user not removed) run before this block, never inside it.
-- `ponytail:` single process only. With more than one server instance (Phase 5), move to Redis with
+- `ponytail:` single process only. With more than one server instance (Phase 7), move to Redis with
   an atomic Lua script.
 
 **Auto mode:**
@@ -498,7 +498,22 @@ the next phase starts.
 - A participant sending `host:*` → `forbidden`. With policy `host_only`, their request is denied.
 - End for all → everyone sees the ended screen, and the meeting appears in Previous.
 
-### Phase 5 — Hardening, load test, deploy
+### Phase 5 — UI/UX polish and responsiveness
+- A video grid that fits the number of people in the room at every screen size (best-fit columns,
+  no scrolling until tiles would drop under 120px wide).
+- The room is exactly one screen tall; the control bar fits one row at 320px.
+- Responsive audit at 320, 375, 480, 768, 1024, 1025 and 1440px: no horizontal scroll anywhere.
+- A ZyloChat toast for new messages while chat is closed.
+- "Mute for me" in the People list: local-only, never sent to the server.
+- Plan: `docs/superpowers/plans/2026-09-23-zylo-phase-5.md`.
+
+### Phase 6 — Zylo Translator Convo (1-on-1 real-time translation)
+- A `zylo-translator-convo` route: a 2-person meeting (`max_participants = 2`) shared by link.
+- Browser speech recognition → translation (Chrome's on-device Translator API, MyMemory as the
+  fallback) → `speechSynthesis` in the listener's language. Zero cost, no server-side AI.
+- Planned after Phase 5 ships.
+
+### Phase 7 — Hardening, load test, deploy
 - **Rate limits** keyed on userId: join requests, token route, ZyloChat, and failed code lookups
   (plan.md 7d-style escalating backoff).
 - **Graceful shutdown** on `SIGTERM`, and **structured logs** with meetingId and userId.
@@ -510,7 +525,7 @@ the next phase starts.
 - **Deploy:** Vercel (web), Railway or Fly (server), managed Postgres, LiveKit Cloud free tier. With
   more than one server instance, move seats and the lock to Redis.
 
-### Phase 6 — AI in ZyloChat (Grok) — last, known issues to fix first
+### Phase 8 — AI in ZyloChat (Grok) — last, known issues to fix first
 - `server/lib/ai.js` (sketch in plan.md Phase 0).
 - `ai:message` → `ai:chunk` / `ai:done` streamed into ZyloChat for every seated member.
 - 1 request per 3 s per user, 2,000-character cap, mediator prompt.
@@ -518,7 +533,7 @@ the next phase starts.
 - AI bubbles use the secondary indigo tint.
 - Confirm the current model slug on console.x.ai first.
 
-### Phase 7 — Proactive stuck detection
+### Phase 9 — Proactive stuck detection
 - Follows plan.md Phase 4: LiveKit active-speaker silence plus text heuristics → Grok judgment call
   posted into ZyloChat, with cooldown and a host-controlled snooze.
 

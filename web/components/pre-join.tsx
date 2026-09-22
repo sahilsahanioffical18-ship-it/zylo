@@ -144,7 +144,7 @@ export function PreJoin({ code, onJoin }: Props) {
             />
             {!(stream && camOn) && (
               <div className="absolute inset-0 grid place-items-center">
-                <span className="grid size-24 place-items-center rounded-full bg-muted text-3xl font-bold text-muted-foreground">
+                <span className="grid size-16 place-items-center rounded-full bg-muted text-xl font-bold text-muted-foreground sm:size-24 sm:text-3xl">
                   {initials(name)}
                 </span>
               </div>

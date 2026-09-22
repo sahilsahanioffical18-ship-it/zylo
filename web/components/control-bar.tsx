@@ -54,7 +54,7 @@ export function ControlBar({
   onEndForAll: () => void;
 }) {
   return (
-    <footer className="flex flex-wrap items-center justify-center gap-2 border-t border-border px-3 py-3 sm:gap-3 sm:px-4">
+    <footer className="flex flex-wrap items-center justify-center gap-2 border-t border-border px-2 py-3 sm:gap-3 sm:px-4">
       <MediaToggle
         on={micOn}
         label="microphone"

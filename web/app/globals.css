@@ -143,6 +143,13 @@
   html {
     @apply font-sans;
   }
+  /* Tailwind v4 dropped the pointer cursor on buttons; MASTER.md's checklist wants it back. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"],
+  [role="radio"] {
+    cursor: pointer;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

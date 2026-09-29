@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { validateChatText } from '@/lib/chat-rules';
+import { connectRetryDelay, rateLimitMessage } from '@/lib/rate-limit';
 import { screenDeniedMessage, type ScreenDenial } from '@/lib/screen-share';
 import type { Admission, IncomingCaption, OutgoingCaption, ScreenSharePolicy } from '@/lib/types';
 
@@ -80,13 +81,19 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
       },
     });
     socketRef.current = socket;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
     // lang rides every join-request, including the one a reconnect re-emits, so a
     // language chosen after the socket already opened isn't lost on a network blip.
     socket.on('connect', () => socket.emit('meeting:join-request', { meetingId, lang: langRef.current }));
     // The server is down or the token was refused. Never dress this up as a
     // missing meeting — socket.io keeps retrying, and 'connect' recovers us.
-    socket.on('connect_error', () => setState({ status: 'offline' }));
+    socket.on('connect_error', (err) => {
+      setState({ status: 'offline' });
+      // Refused by the server's connection limit: socket.io won't retry that one.
+      const wait = connectRetryDelay(err);
+      if (wait !== null) retryTimer = setTimeout(() => socket.connect(), wait);
+    });
     socket.on('meeting:waiting', ({ position, manual }: { position: number; manual: boolean }) =>
       setState({ status: 'waiting', position, manual }),
     );
@@ -127,12 +134,14 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
     socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));
     socket.on('screen:granted', () => setShareGrant((n) => n + 1));
     socket.on('screen:denied', (denial: ScreenDenial) => toast.error(screenDeniedMessage(denial, brand.live)));
+    socket.on('rate-limited', ({ event }: { event: string }) => toast.error(rateLimitMessage(event)));
     socket.on('screen:state', ({ sharerUserId: id }: { sharerUserId: string | null }) => setSharerUserId(id));
     // Translator Convo only; the server never echoes a caption back to its sender
     // (see room.js's convo:caption — it uses socket.to, not io.to).
     socket.on('convo:caption', (c: IncomingCaption) => onCaptionRef.current?.(c));
 
     return () => {
+      clearTimeout(retryTimer);
       socket.disconnect();
       socketRef.current = null;
     };

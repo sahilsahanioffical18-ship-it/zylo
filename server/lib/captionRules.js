@@ -1,6 +1,8 @@
 // Twin of web/lib/convo-languages.ts — the two lists must name the same codes;
 // test/convoLangs.test.js fails if they drift.
 
+const { takeToken } = require('./rateLimit');
+
 const CONVO_LANGS = Object.freeze([
   'hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ml', 'ur', 'en', 'ru', 'es', 'fr', 'de', 'ar', 'zh', 'ja', 'pt',
 ]);
@@ -53,19 +55,7 @@ function validateTranslation(translation) {
 const RATE = 8;
 const BURST = 12;
 
-// ponytail: in memory, per socket (bucket lives on socket.data), so a
-// reconnect gets a fresh bucket — fine at 2 seats. Move it to Redis alongside
-// seats.js in Phase 7 if abuse across reconnects becomes a real problem.
-function takeToken(bucket, now, rate = RATE, burst = BURST) {
-  const elapsed = Math.max(0, now - bucket.at) / 1000;
-  bucket.tokens = Math.min(burst, bucket.tokens + elapsed * rate);
-  bucket.at = now;
-  if (bucket.tokens < 1) return false;
-  bucket.tokens -= 1;
-  return true;
-}
-
-const allowCaption = (bucket, now) => takeToken(bucket, now);
+const allowCaption = (bucket, now) => takeToken(bucket, now, RATE, BURST);
 
 module.exports = {
   CONVO_LANGS,

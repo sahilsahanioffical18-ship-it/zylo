@@ -32,6 +32,9 @@ async function setupTestDb() {
 
 const quietLog = { warn: () => {} };
 
+// For suites that test something else and would trip a real limit by volume alone.
+const unlimitedLimiter = { take: async () => ({ allowed: true, remaining: 1, retryAfterMs: 0 }) };
+
 // A clean Redis for one test: database 1 (never the dev data in 0), emptied first,
 // closed when the test ends. Needs `npm run db:up`.
 async function setupTestRedis(t) {
@@ -192,6 +195,7 @@ module.exports = {
   setupTestDb,
   setupTestRedis,
   quietLog,
+  unlimitedLimiter,
   fakeSocketAuth,
   startSocketServer,
   connectClient,

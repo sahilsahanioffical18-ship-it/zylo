@@ -8,6 +8,7 @@ const { createApp } = require('./app');
 const { createDb } = require('./lib/db');
 const { createLivekit } = require('./lib/livekit');
 const { createRedis } = require('./lib/redis');
+const { createLimiter } = require('./lib/rateLimit');
 const { clerkAuth, clerkSocketAuth } = require('./lib/auth');
 const { registerRoomHandlers, closeStaleMeetings } = require('./lib/room');
 
@@ -28,6 +29,8 @@ async function main() {
   }
   const redis = createRedis();
   if (!redis) console.warn("WARNING: REDIS_URL is not set — rate limits and the translation cache stay in this server's memory.");
+  const limiter = createLimiter({ redis });
+  const trustProxy = Number(process.env.TRUST_PROXY) || 0;
 
   if (db) {
     try {
@@ -39,7 +42,7 @@ async function main() {
     }
   }
 
-  const app = createApp({ db, auth: clerkAuth({ db }), livekit, redis });
+  const app = createApp({ db, auth: clerkAuth({ db }), livekit, redis, limiter, trustProxy });
   const httpServer = http.createServer(app);
   const io = new Server(httpServer, { cors: { origin: CLIENT_ORIGIN } });
   io.use(clerkSocketAuth({ db }));

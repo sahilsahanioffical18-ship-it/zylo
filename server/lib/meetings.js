@@ -1,6 +1,7 @@
 const express = require('express');
 const { generateCode, isValidCode, validateCreateMeeting } = require('./meetingRules');
 const seats = require('./seats');
+const { limitRequests } = require('./limitMiddleware');
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -40,8 +41,11 @@ async function getCard(db, id, userId) {
   return rows[0] ? toCard(rows[0], userId) : null;
 }
 
-function meetingsRouter(db, livekit) {
+function meetingsRouter(db, livekit, limiter) {
   const router = express.Router();
+  // Per user, on top of the app-wide 'api' limit: creating can spam, lookups can
+  // guess codes, and every token request makes a call to LiveKit.
+  const perUser = (policy) => limitRequests(limiter, policy, (req) => req.userId);
 
   router.get('/dashboard', async (req, res) => {
     // ponytail: newest 200 visible meetings, bucketed in JS; paginate Previous when users outgrow it.
@@ -72,7 +76,7 @@ function meetingsRouter(db, livekit) {
     res.json({ live, upcoming, previous: previous.slice(0, 50) });
   });
 
-  router.post('/meetings', async (req, res) => {
+  router.post('/meetings', perUser('create'), async (req, res) => {
     const { value, error } = validateCreateMeeting(req.body);
     if (error) return res.status(400).json({ error });
 
@@ -98,14 +102,14 @@ function meetingsRouter(db, livekit) {
     }
   });
 
-  router.get('/meetings/:id', async (req, res) => {
+  router.get('/meetings/:id', perUser('lookup'), async (req, res) => {
     if (!isValidCode(req.params.id)) return res.status(400).json({ error: 'That is not a valid meeting code.' });
     const meeting = await getCard(db, req.params.id, req.userId);
     if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
     res.json({ meeting, isHost: meeting.isHost });
   });
 
-  router.get('/meetings/:id/livekit-token', async (req, res) => {
+  router.get('/meetings/:id/livekit-token', perUser('lkToken'), async (req, res) => {
     const { id } = req.params;
     if (!isValidCode(id)) return res.status(400).json({ error: 'That is not a valid meeting code.' });
     if (!livekit) return res.status(503).json({ error: 'LIVEKIT is not configured on the server.' });

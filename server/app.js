@@ -3,6 +3,8 @@ const cors = require('cors');
 const { meetingsRouter } = require('./lib/meetings');
 const { googleRouter } = require('./lib/google');
 const { livekitWebhook } = require('./lib/webhook');
+const { createLimiter } = require('./lib/rateLimit');
+const { limitRequests } = require('./lib/limitMiddleware');
 
 // Both probes mean "can we actually reach it", not "is it configured" — a
 // health endpoint that calls a configured-but-dead dependency healthy is a lie
@@ -15,14 +17,24 @@ async function reachable(probe) {
   try { await probe(); return true; } catch { return false; }
 }
 
-// `google` is only ever set by tests (a fake Google + a fresh cache).
-function createApp({ db, auth, livekit, redis = null, google = {} }) {
+// `google` is only ever set by tests (a fake Google + a fresh cache) and server.js
+// (the Redis cache). Without a `limiter`, one is made on `redis` (memory without it).
+function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ redis }), trustProxy = 0, google = {} }) {
   const app = express();
-  app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000' }));
+  // TRUST_PROXY hops: behind our load balancer req.ip must be the client, not the
+  // balancer, or every user would share one per-IP bucket.
+  app.set('trust proxy', trustProxy);
+  // exposedHeaders: without it the browser hides these two from the app's fetch().
+  app.use(cors({
+    origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000',
+    exposedHeaders: ['Retry-After', 'RateLimit-Remaining'],
+  }));
   // Before express.json(), deliberately: the webhook verifies a signature over the
-  // raw bytes. Outside /api, deliberately: Clerk cannot authenticate LiveKit.
-  // Not mounted without LiveKit: there is no secret to verify it with.
+  // raw bytes. Outside /api, deliberately: Clerk cannot authenticate LiveKit. Before
+  // the IP limit, deliberately: it is signed already, and dropping one could leave a
+  // removed person in the room. Not mounted without LiveKit: no secret to verify with.
   if (livekit) app.use(livekitWebhook(livekit));
+  app.use(limitRequests(limiter, 'ip', (req) => req.ip));
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/health', async (_req, res) => {
@@ -39,9 +51,11 @@ function createApp({ db, auth, livekit, redis = null, google = {} }) {
     next();
   });
   app.use('/api', auth);
+  // After auth, so the bucket is the user's, whichever IP they come from.
+  app.use('/api', limitRequests(limiter, 'api', (req) => req.userId));
 
   app.use('/api', googleRouter(google)); // /api/tts and /api/translate
-  if (db) app.use('/api', meetingsRouter(db, livekit));
+  if (db) app.use('/api', meetingsRouter(db, livekit, limiter));
 
   app.use((err, _req, res, _next) => {
     const status = err.status || err.statusCode || 500;

@@ -54,7 +54,7 @@ function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ 
   // After auth, so the bucket is the user's, whichever IP they come from.
   app.use('/api', limitRequests(limiter, 'api', (req) => req.userId));
 
-  app.use('/api', googleRouter(google)); // /api/tts and /api/translate
+  app.use('/api', googleRouter({ ...google, limiter })); // /api/tts and /api/translate
   if (db) app.use('/api', meetingsRouter(db, livekit, limiter));
 
   app.use((err, _req, res, _next) => {

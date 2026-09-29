@@ -1,9 +1,10 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../app');
-const { createCache } = require('../lib/cache');
+const { createCache, createRedisCache } = require('../lib/cache');
+const { createLimiter } = require('../lib/rateLimit');
 const { USER_BURST: BURST, GLOBAL_BURST } = require('../lib/google');
-const { listen, fakeAuth } = require('./helpers');
+const { listen, fakeAuth, setupTestRedis } = require('./helpers');
 
 const fakeDb = { query: async () => ({ rows: [] }) };
 // Google's gtx answer shape: [[[translated, original, ...], ...], ...] — one entry per sentence.
@@ -22,8 +23,10 @@ function fakeGoogle(respond = () => gtx('Hallo, wie geht es dir heute?')) {
   return { fetchUpstream, calls };
 }
 
-async function start(google, opts = {}) {
-  return listen(createApp({ db: fakeDb, auth: fakeAuth, google: { fetchUpstream: google.fetchUpstream, cache: createCache(), ...opts } }));
+async function start(google, { now } = {}) {
+  return listen(
+    createApp({ db: fakeDb, auth: fakeAuth, limiter: createLimiter({ now }), google: { fetchUpstream: google.fetchUpstream, cache: createCache() } }),
+  );
 }
 
 const translate = (base, query, user = 'u1') =>
@@ -160,4 +163,19 @@ test('translate and tts share one per-user budget of upstream calls', async () =
   } finally {
     await close();
   }
+});
+
+test('with the Redis cache, a translation made through one server is a hit on another', async (t) => {
+  const redis = await setupTestRedis(t);
+  const google = fakeGoogle();
+  const app = () => createApp({ db: fakeDb, auth: fakeAuth, google: { fetchUpstream: google.fetchUpstream, cache: createRedisCache(redis) } });
+  const serverA = await listen(app());
+  const serverB = await listen(app());
+  t.after(serverA.close);
+  t.after(serverB.close);
+  await translate(serverA.base, { from: 'en', to: 'de', text: 'Hello, how are you today?' });
+  const res = await translate(serverB.base, { from: 'en', to: 'de', text: 'Hello, how are you today?' });
+  assert.equal(res.headers.get('x-cache'), 'HIT');
+  assert.deepEqual(await res.json(), { text: 'Hallo, wie geht es dir heute?' });
+  assert.equal(google.calls.length, 1);
 });

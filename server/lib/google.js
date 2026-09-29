@@ -1,6 +1,8 @@
 const express = require('express');
-const { isConvoLang, takeToken, MAX_CAPTION_LENGTH } = require('./captionRules');
+const { isConvoLang, MAX_CAPTION_LENGTH } = require('./captionRules');
 const { createCache } = require('./cache');
+const { createLimiter, POLICIES } = require('./rateLimit');
+const { sendTooMany } = require('./limitMiddleware');
 
 // Translator Convo's free online helpers, both Google's unkeyed web endpoints:
 //
@@ -25,14 +27,12 @@ const googleLang = (code) => GOOGLE_LANG[code] ?? code;
 // requests that carry one (checked 2026-09-24), and Node's fetch sends none.
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36';
 
-// Upstream budgets. A convo needs well under one call a second per person (one
-// translation plus a voice clip or two per sentence), so a user gets 2/s with a
-// burst of 10; the whole server gets 20/s, so no one user, or a buggy client loop,
-// can get the server's IP rate-limited by Google for everyone.
-const USER_RATE = 2;
-const USER_BURST = 10;
-const GLOBAL_RATE = 20;
-const GLOBAL_BURST = 40;
+// Upstream budgets live in rateLimit.js (POLICIES.google and POLICIES.googleAll). A
+// convo needs well under one call a second per person, so a user gets 2/s with a
+// burst of 10, and the whole deployment 20/s, so no one user (or a buggy client
+// loop) can get our IP rate-limited by Google for everyone.
+const USER_BURST = POLICIES.google.burst;
+const GLOBAL_BURST = POLICIES.googleAll.burst;
 
 const cleanText = (value) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '');
 
@@ -68,21 +68,17 @@ async function fetchGoogleTranslation(fetchUpstream, from, to, text) {
   }
 }
 
-function googleRouter({ fetchUpstream = fetch, cache = createCache(), now = Date.now } = {}) {
+function googleRouter({ fetchUpstream = fetch, cache = createCache(), limiter = createLimiter() } = {}) {
   const router = express.Router();
-  // One budget per user for BOTH routes, plus one for the whole server, spent only
-  // on upstream calls: a cache hit costs Google nothing. ponytail: in-process Maps,
-  // never pruned (a few bytes per user who ever asked); move to Redis with the
-  // cache in Phase 7.
-  const buckets = new Map();
-  let serverBucket = null;
-  const allowUpstream = (userId) => {
-    const t = now();
-    if (!buckets.has(userId)) buckets.set(userId, { tokens: USER_BURST, at: t });
-    serverBucket ??= { tokens: GLOBAL_BURST, at: t };
-    // The user's own budget first, so one user over theirs never spends the server's.
-    return takeToken(buckets.get(userId), t, USER_RATE, USER_BURST) && takeToken(serverBucket, t, GLOBAL_RATE, GLOBAL_BURST);
-  };
+  // Spent only on upstream calls: a cache hit costs Google nothing. The user's own
+  // budget first, so one user over theirs never spends the whole deployment's.
+  async function upstreamRefusal(userId) {
+    for (const [policy, id] of [['google', userId], ['googleAll', 'all']]) {
+      const result = await limiter.take(policy, id);
+      if (!result.allowed) return result;
+    }
+    return null;
+  }
 
   router.get('/tts', async (req, res, next) => {
     try {
@@ -96,7 +92,8 @@ function googleRouter({ fetchUpstream = fetch, cache = createCache(), now = Date
       let audio = await cache.get(key);
       const hit = audio !== null;
       if (!hit) {
-        if (!allowUpstream(req.userId)) return res.status(429).json({ error: 'Too many requests. Slow down.' });
+        const refused = await upstreamRefusal(req.userId);
+        if (refused) return sendTooMany(res, refused.retryAfterMs);
         audio = await fetchGoogleVoice(fetchUpstream, lang, text);
         if (!audio) return res.status(502).json({ error: 'The online voice is unavailable right now.' });
         await cache.set(key, audio);
@@ -118,10 +115,13 @@ function googleRouter({ fetchUpstream = fetch, cache = createCache(), now = Date
       }
 
       const key = `tr\n${from}>${to}\n${text}`;
-      let translated = await cache.get(key);
+      // The Redis cache hands back bytes; the in-memory one, the string it was given.
+      const cached = await cache.get(key);
+      let translated = cached === null ? null : cached.toString();
       const hit = translated !== null;
       if (!hit) {
-        if (!allowUpstream(req.userId)) return res.status(429).json({ error: 'Too many requests. Slow down.' });
+        const refused = await upstreamRefusal(req.userId);
+        if (refused) return sendTooMany(res, refused.retryAfterMs);
         translated = await fetchGoogleTranslation(fetchUpstream, from, to, text);
         if (!translated) return res.status(502).json({ error: 'Online translation is unavailable right now.' });
         await cache.set(key, translated);

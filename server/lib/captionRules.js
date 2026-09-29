@@ -1,8 +1,6 @@
 // Twin of web/lib/convo-languages.ts — the two lists must name the same codes;
 // test/convoLangs.test.js fails if they drift.
 
-const { takeToken } = require('./rateLimit');
-
 const CONVO_LANGS = Object.freeze([
   'hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ml', 'ur', 'en', 'ru', 'es', 'fr', 'de', 'ar', 'zh', 'ja', 'pt',
 ]);
@@ -46,25 +44,10 @@ function validateTranslation(translation) {
   return { lang, text: trimmed };
 }
 
-// The first rate limit in Zylo. Captions need one where chat didn't: a client
-// throttles interim results to ~4/s but that's a courtesy, not a guarantee, and
-// Socket.IO enforces no size or rate limit of its own (chatRules' MAX_CHAT_LENGTH
-// is the only other guard, and it caps size, not frequency).
-//
-// A token bucket: refills at RATE tokens/second up to BURST, spends 1 per call.
-const RATE = 8;
-const BURST = 12;
-
-const allowCaption = (bucket, now) => takeToken(bucket, now, RATE, BURST);
-
 module.exports = {
   CONVO_LANGS,
   isConvoLang,
   MAX_CAPTION_LENGTH,
   MAX_TRANSLATION_LENGTH,
   validateCaption,
-  allowCaption,
-  takeToken,
-  RATE,
-  BURST,
 };

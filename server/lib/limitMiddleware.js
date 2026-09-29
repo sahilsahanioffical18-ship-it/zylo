@@ -29,4 +29,18 @@ function forwardedIp(forwardedFor, remoteAddress, hops) {
   return chain[Math.max(0, chain.length - hops)];
 }
 
-module.exports = { limitRequests, sendTooMany, forwardedIp };
+// Socket.IO middleware, run before auth so a reconnect storm never reaches token
+// verification. socket.io does not retry a connection a middleware refused, so the
+// refusal carries retryAfterMs for the client to retry on its own.
+function limitConnections(limiter, hops) {
+  return async (socket, next) => {
+    const ip = forwardedIp(socket.handshake.headers['x-forwarded-for'], socket.handshake.address, hops);
+    const { allowed, retryAfterMs } = await limiter.take('connect', ip);
+    if (allowed) return next();
+    const err = new Error('Too many connections. Try again shortly.');
+    err.data = { retryAfterMs };
+    next(err);
+  };
+}
+
+module.exports = { limitRequests, sendTooMany, forwardedIp, limitConnections };

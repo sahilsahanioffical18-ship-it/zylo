@@ -2,11 +2,8 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   validateCaption,
-  allowCaption,
   MAX_CAPTION_LENGTH,
   MAX_TRANSLATION_LENGTH,
-  BURST,
-  RATE,
 } = require('../lib/captionRules');
 
 const base = () => ({ id: 'abc-123', text: 'hello there', lang: 'hi', final: true });
@@ -83,30 +80,4 @@ test('keeps a valid translation, trimmed', () => {
 test('accepts translation text at exactly 1000 characters', () => {
   const clean = validateCaption({ ...base(), translation: { lang: 'ru', text: 'x'.repeat(MAX_TRANSLATION_LENGTH) } });
   assert.equal(clean.translation.text.length, MAX_TRANSLATION_LENGTH);
-});
-
-test('allowCaption: a burst of 12 passes, the 13th fails', () => {
-  const bucket = { tokens: BURST, at: 0 };
-  for (let i = 0; i < BURST; i++) {
-    assert.equal(allowCaption(bucket, 0), true, `token ${i}`);
-  }
-  assert.equal(allowCaption(bucket, 0), false);
-});
-
-test('allowCaption: refills at 8/s — 250ms buys back 2 tokens', () => {
-  const bucket = { tokens: 0, at: 0 };
-  assert.equal(allowCaption(bucket, 0), false);
-  assert.equal(allowCaption(bucket, 250), true);
-  assert.equal(allowCaption(bucket, 250), true);
-  assert.equal(allowCaption(bucket, 250), false);
-});
-
-test('allowCaption: tokens never exceed BURST, even after a long idle', () => {
-  const bucket = { tokens: BURST, at: 0 };
-  assert.equal(allowCaption(bucket, 0), true); // burn one down to 11
-  const farFuture = 1000 * RATE * 1000; // absurdly long idle
-  for (let i = 0; i < BURST; i++) {
-    assert.equal(allowCaption(bucket, farFuture), true, `token ${i}`);
-  }
-  assert.equal(allowCaption(bucket, farFuture), false);
 });

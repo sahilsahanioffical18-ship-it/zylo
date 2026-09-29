@@ -9,6 +9,7 @@ const { createDb } = require('./lib/db');
 const { createLivekit } = require('./lib/livekit');
 const { createRedis } = require('./lib/redis');
 const { createLimiter } = require('./lib/rateLimit');
+const { limitConnections } = require('./lib/limitMiddleware');
 const { createCache, createRedisCache } = require('./lib/cache');
 const { clerkAuth, clerkSocketAuth } = require('./lib/auth');
 const { registerRoomHandlers, closeStaleMeetings } = require('./lib/room');
@@ -49,6 +50,7 @@ async function main() {
   });
   const httpServer = http.createServer(app);
   const io = new Server(httpServer, { cors: { origin: CLIENT_ORIGIN } });
+  io.use(limitConnections(limiter, trustProxy)); // before auth: a flood never reaches token checks
   io.use(clerkSocketAuth({ db }));
   if (db) registerRoomHandlers(io, { db, livekit });
   else console.warn('WARNING: DATABASE_URL is not set — ZyloRoom sockets will refuse every join request.');

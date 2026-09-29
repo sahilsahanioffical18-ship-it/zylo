@@ -1,8 +1,20 @@
 const seats = require('./seats');
 const { validateChatText } = require('./chatRules');
-const { isConvoLang, validateCaption, allowCaption, BURST } = require('./captionRules');
+const { isConvoLang, validateCaption } = require('./captionRules');
+const { SOCKET_POLICIES, takeToken } = require('./rateLimit');
 
 const roomChannel = (meetingId) => `meeting:${meetingId}`;
+
+// Per-socket buckets (SOCKET_POLICIES). A socket lives on one server for its whole
+// life, so these need no Redis round trip; captions are the busiest event in Zylo.
+// The per-IP connection limit (limitConnections) stops a reconnect from buying a
+// fresh bucket.
+function allowEvent(socket, name) {
+  const { rate, burst } = SOCKET_POLICIES[name];
+  const now = Date.now();
+  const buckets = (socket.data.buckets ??= {});
+  return takeToken((buckets[name] ??= { tokens: burst, at: now }), now, rate, burst);
+}
 
 function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS } = {}) {
   // Settings for every meeting that is currently live, so the host check and the
@@ -180,6 +192,10 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
   // Every host-only event runs through this. Authorization is a server check:
   // whether the client renders the button is irrelevant.
   function hostGuard(socket) {
+    if (!allowEvent(socket, 'host')) {
+      socket.emit('rate-limited', { event: 'host' });
+      return null;
+    }
     const { meetingId, userId } = socket.data;
     const meta = meetingId ? liveMeetings.get(meetingId) : null;
     if (!meta || meta.hostId !== userId) {
@@ -200,6 +216,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
 
   io.on('connection', (socket) => {
     on(socket, 'meeting:join-request', async ({ meetingId, lang } = {}) => {
+      if (!allowEvent(socket, 'meeting:join-request')) return socket.emit('rate-limited', { event: 'meeting:join-request' });
       if (typeof meetingId !== 'string') return socket.emit('meeting:denied', { reason: 'not_found' });
       const meta = await loadMeetingMeta(meetingId);
       if (!meta) return socket.emit('meeting:denied', { reason: 'not_found' });
@@ -252,6 +269,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     on(socket, 'convo:set-lang', ({ lang } = {}) => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
+      if (!allowEvent(socket, 'convo:set-lang')) return;
       const seat = seats.seatFor(meetingId, userId);
       if (!seat || seat.socketId !== socket.id) return;
       const meta = liveMeetings.get(meetingId);
@@ -277,11 +295,9 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       if (!seat || seat.socketId !== socket.id) return;
       const meta = liveMeetings.get(meetingId);
       if (!meta || meta.mode !== 'translator') return;
-      // Captions are chatty (interim results, client-throttled to ~4/s) and
-      // Socket.IO has no rate guard of its own — this is the first rate limit
-      // in Zylo. The bucket lives on the socket, so it's per-connection.
-      const now = Date.now();
-      if (!allowCaption((socket.data.captionBucket ??= { tokens: BURST, at: now }), now)) return;
+      // Captions are chatty (interim results, client-throttled to ~4/s); extras past
+      // the bucket are dropped silently, since the next interim replaces them anyway.
+      if (!allowEvent(socket, 'convo:caption')) return;
       const clean = validateCaption(payload);
       if (!clean) return; // a client bug or a probe; see chat:message above
       socket.to(roomChannel(meetingId)).emit('convo:caption', { userId, name: seat.name, ...clean, ts: Date.now() });
@@ -306,6 +322,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     on(socket, 'chat:message', ({ text } = {}) => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
+      if (!allowEvent(socket, 'chat:message')) return socket.emit('rate-limited', { event: 'chat:message' });
       const seat = seats.seatFor(meetingId, userId);
       if (!seat || seat.socketId !== socket.id) return;
       const clean = validateChatText(text);
@@ -319,6 +336,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     on(socket, 'screen:request', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
+      if (!allowEvent(socket, 'screen:request')) return socket.emit('rate-limited', { event: 'screen:request' });
       const seat = seats.seatFor(meetingId, userId);
       if (!seat || seat.socketId !== socket.id) return; // lobby or replaced tab: ignored, like chat
       const meta = liveMeetings.get(meetingId);

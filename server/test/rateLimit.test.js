@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createLimiter, POLICIES, takeToken } = require('../lib/rateLimit');
+const { createLimiter, POLICIES, SOCKET_POLICIES, takeToken } = require('../lib/rateLimit');
 const { setupTestRedis, quietLog } = require('./helpers');
 
 // A clock the test moves by hand, so refills are exact.
@@ -102,4 +102,14 @@ test('takeToken: never holds more than the burst, however long it sat idle', () 
   const bucket = { tokens: 2, at: 0 };
   takeToken(bucket, 10 * 60_000, 1, 3);
   assert.equal(bucket.tokens, 2); // refilled to 3, then spent 1
+});
+
+test('captions: a burst of 12 passes, the 13th is dropped, and 250 ms buys back 2', () => {
+  const { rate, burst } = SOCKET_POLICIES['convo:caption'];
+  const bucket = { tokens: burst, at: 0 };
+  for (let i = 0; i < burst; i++) assert.equal(takeToken(bucket, 0, rate, burst), true, `caption ${i + 1}`);
+  assert.equal(takeToken(bucket, 0, rate, burst), false);
+  assert.equal(takeToken(bucket, 250, rate, burst), true);
+  assert.equal(takeToken(bucket, 250, rate, burst), true);
+  assert.equal(takeToken(bucket, 250, rate, burst), false);
 });

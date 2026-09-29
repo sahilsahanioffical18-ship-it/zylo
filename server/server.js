@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const { createApp } = require('./app');
 const { createDb } = require('./lib/db');
 const { createLivekit } = require('./lib/livekit');
+const { createRedis } = require('./lib/redis');
 const { clerkAuth, clerkSocketAuth } = require('./lib/auth');
 const { registerRoomHandlers, closeStaleMeetings } = require('./lib/room');
 
@@ -25,6 +26,8 @@ async function main() {
       'WARNING: LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not set — the LiveKit token route will return 503.',
     );
   }
+  const redis = createRedis();
+  if (!redis) console.warn("WARNING: REDIS_URL is not set — rate limits and the translation cache stay in this server's memory.");
 
   if (db) {
     try {
@@ -36,7 +39,7 @@ async function main() {
     }
   }
 
-  const app = createApp({ db, auth: clerkAuth({ db }), livekit });
+  const app = createApp({ db, auth: clerkAuth({ db }), livekit, redis });
   const httpServer = http.createServer(app);
   const io = new Server(httpServer, { cors: { origin: CLIENT_ORIGIN } });
   io.use(clerkSocketAuth({ db }));

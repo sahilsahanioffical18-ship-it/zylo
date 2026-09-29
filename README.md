@@ -21,7 +21,7 @@ Next.js 16 · React 19 · Tailwind v4 · shadcn/ui · Clerk · Express 5 · Post
 Prerequisites: Node 22+, Docker, and a [Clerk](https://clerk.com) application with Email and Google sign-in.
 
 ```bash
-npm run db:up
+npm run db:up                              # starts Postgres and Redis
 cp server/.env.example server/.env        # add CLERK_PUBLISHABLE_KEY and CLERK_SECRET_KEY
 cp web/.env.local.example web/.env.local  # add NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY and CLERK_SECRET_KEY
 npm --prefix server install

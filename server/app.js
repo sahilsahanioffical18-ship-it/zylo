@@ -16,7 +16,7 @@ async function reachable(probe) {
 }
 
 // `google` is only ever set by tests (a fake Google + a fresh cache).
-function createApp({ db, auth, livekit, google = {} }) {
+function createApp({ db, auth, livekit, redis = null, google = {} }) {
   const app = express();
   app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000' }));
   // Before express.json(), deliberately: the webhook verifies a signature over the
@@ -26,11 +26,12 @@ function createApp({ db, auth, livekit, google = {} }) {
   app.use(express.json({ limit: '32kb' }));
 
   app.get('/health', async (_req, res) => {
-    const [dbOk, livekitOk] = await Promise.all([
+    const [dbOk, livekitOk, redisOk] = await Promise.all([
       reachable(db ? () => db.query('SELECT 1') : null),
       reachable(livekit ? () => livekit.ping() : null),
+      reachable(redis ? () => redis.ping() : null),
     ]);
-    res.json({ ok: true, db: dbOk, livekit: livekitOk });
+    res.json({ ok: true, db: dbOk, livekit: livekitOk, redis: redisOk });
   });
 
   app.use('/api', (_req, res, next) => {

@@ -6,6 +6,7 @@ const { Server } = require('socket.io');
 const { io: ioClient } = require('socket.io-client');
 const seats = require('../lib/seats');
 const { registerRoomHandlers } = require('../lib/room');
+const { createRedis, whenReady } = require('../lib/redis');
 
 async function listen(app) {
   const server = app.listen(0);
@@ -27,6 +28,18 @@ async function setupTestDb() {
   await db.query(fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8'));
   await db.query('TRUNCATE meeting_participants, meeting_invites, meetings, users');
   return db;
+}
+
+const quietLog = { warn: () => {} };
+
+// A clean Redis for one test: database 1 (never the dev data in 0), emptied first,
+// closed when the test ends. Needs `npm run db:up`.
+async function setupTestRedis(t) {
+  const redis = createRedis(process.env.TEST_REDIS_URL || 'redis://localhost:6379/1', { log: quietLog });
+  await whenReady(redis);
+  await redis.flushdb();
+  t.after(() => redis.quit());
+  return redis;
 }
 
 // Test-only socket auth: trusts the handshake's userId. Production always uses
@@ -175,6 +188,8 @@ module.exports = {
   listen,
   fakeAuth,
   setupTestDb,
+  setupTestRedis,
+  quietLog,
   fakeSocketAuth,
   startSocketServer,
   connectClient,

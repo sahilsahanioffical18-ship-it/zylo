@@ -18,13 +18,24 @@ function isValidCode(code) {
   return typeof code === 'string' && CODE_RE.test(code);
 }
 
+// A Translator Convo is a 2-seat, link-shared, instant call: scheduling and
+// invites don't apply, and it never waits for a host, so admission is always
+// auto and the seat count is always 2. Everything else about it is a normal
+// meeting.
+const TRANSLATOR_INSTANT_MSG = 'A Translator Convo starts right away and is shared by link.';
+
 function validateCreateMeeting(body, now = Date.now()) {
   const b = body && typeof body === 'object' ? body : {};
+
+  const mode = b.mode ?? 'standard';
+  if (mode !== 'standard' && mode !== 'translator') return { error: 'mode must be standard or translator.' };
+  const isTranslator = mode === 'translator';
 
   const title = typeof b.title === 'string' ? b.title.trim() : '';
   if (title.length > 120) return { error: 'Title must be 120 characters or fewer.' };
 
   const isScheduled = b.scheduledFor !== undefined && b.scheduledFor !== null && b.scheduledFor !== '';
+  if (isTranslator && isScheduled) return { error: TRANSLATOR_INSTANT_MSG };
   let scheduledFor = null;
   if (isScheduled) {
     if (!title) return { error: 'A scheduled meeting needs a title.' };
@@ -35,7 +46,7 @@ function validateCreateMeeting(body, now = Date.now()) {
     scheduledFor = new Date(time).toISOString();
   }
 
-  const admission = b.admission ?? 'auto';
+  const admission = isTranslator ? 'auto' : (b.admission ?? 'auto');
   if (admission !== 'auto' && admission !== 'manual') return { error: 'admission must be auto or manual.' };
 
   const screenSharePolicy = b.screenSharePolicy ?? 'anyone';
@@ -43,7 +54,7 @@ function validateCreateMeeting(body, now = Date.now()) {
     return { error: 'screenSharePolicy must be anyone or host_only.' };
   }
 
-  const maxParticipants = b.maxParticipants ?? 20;
+  const maxParticipants = isTranslator ? 2 : (b.maxParticipants ?? 20);
   if (!Number.isInteger(maxParticipants) || maxParticipants < 2 || maxParticipants > 20) {
     return { error: 'maxParticipants must be a whole number from 2 to 20.' };
   }
@@ -51,13 +62,15 @@ function validateCreateMeeting(body, now = Date.now()) {
   const rawEmails = b.inviteEmails ?? [];
   if (!Array.isArray(rawEmails)) return { error: 'inviteEmails must be a list.' };
   const inviteEmails = [...new Set(rawEmails.map((e) => String(e).trim().toLowerCase()).filter(Boolean))];
+  if (isTranslator && inviteEmails.length > 0) return { error: TRANSLATOR_INSTANT_MSG };
   if (inviteEmails.length > 20) return { error: 'You can invite up to 20 people.' };
   const invalid = inviteEmails.find((e) => !EMAIL_RE.test(e));
   if (invalid) return { error: `"${invalid}" is not a valid email.` };
 
   return {
     value: {
-      title: title || 'Instant meeting',
+      mode,
+      title: title || (isTranslator ? 'Translator Convo' : 'Instant meeting'),
       scheduledFor,
       admission,
       screenSharePolicy,

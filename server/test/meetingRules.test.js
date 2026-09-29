@@ -16,9 +16,10 @@ test('isValidCode accepts only the exact format', () => {
   }
 });
 
-test('empty body gives instant-meeting defaults', () => {
+test('empty body gives instant-meeting defaults, mode standard', () => {
   assert.deepEqual(validateCreateMeeting({}, NOW), {
     value: {
+      mode: 'standard',
       title: 'Instant meeting',
       scheduledFor: null,
       admission: 'auto',
@@ -27,6 +28,31 @@ test('empty body gives instant-meeting defaults', () => {
       inviteEmails: [],
     },
   });
+});
+
+test('mode must be standard or translator', () => {
+  assert.match(validateCreateMeeting({ mode: 'group' }, NOW).error, /mode/);
+  assert.equal(validateCreateMeeting({ mode: 'standard' }, NOW).value.mode, 'standard');
+});
+
+test('translator mode forces 2 seats and auto admission, ignoring input', () => {
+  const { value } = validateCreateMeeting({ mode: 'translator', maxParticipants: 20, admission: 'manual' }, NOW);
+  assert.equal(value.mode, 'translator');
+  assert.equal(value.maxParticipants, 2);
+  assert.equal(value.admission, 'auto');
+  assert.equal(value.title, 'Translator Convo');
+});
+
+test('translator mode rejects scheduledFor and non-empty inviteEmails', () => {
+  const inAnHour = new Date(NOW + 60 * 60 * 1000).toISOString();
+  assert.match(
+    validateCreateMeeting({ mode: 'translator', scheduledFor: inAnHour }, NOW).error,
+    /starts right away/,
+  );
+  assert.match(
+    validateCreateMeeting({ mode: 'translator', inviteEmails: ['sam@example.com'] }, NOW).error,
+    /starts right away/,
+  );
 });
 
 test('scheduled meetings need a title and a future time within a year', () => {

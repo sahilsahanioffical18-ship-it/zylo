@@ -1,13 +1,15 @@
 'use client';
 
+import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 import { useUser } from '@clerk/nextjs';
-import { CalendarClock, LogIn, PhoneCall } from 'lucide-react';
+import { CalendarClock, Languages, LogIn, PhoneCall } from 'lucide-react';
 import { toast } from 'sonner';
 import { JoinWithCode } from '@/components/join-with-code';
 import { MeetingsSection } from '@/components/meetings-section';
 import { ScheduleDialog } from '@/components/schedule-dialog';
 import { StartZyloCallButton } from '@/components/start-zylocall-button';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { useApi } from '@/lib/api';
 import { brand } from '@/lib/brand';
@@ -68,7 +70,7 @@ export function DashboardView() {
         </p>
       </div>
 
-      <section aria-label="Start or join a meeting" className="grid gap-4 md:grid-cols-3">
+      <section aria-label="Start or join a meeting" className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Card>
           <CardHeader className="space-y-2">
             <span className="grid size-10 place-items-center rounded-xl bg-primary text-primary-foreground">
@@ -103,6 +105,20 @@ export function DashboardView() {
           </CardHeader>
           <CardContent>
             <JoinWithCode />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="space-y-2">
+            <span className="grid size-10 place-items-center rounded-xl bg-accent text-accent-foreground">
+              <Languages className="size-5" aria-hidden="true" />
+            </span>
+            <CardTitle className="text-base font-bold">Zylo Translator Convo</CardTitle>
+            <CardDescription>Talk face to face in two languages: live captions and spoken translation, free.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button asChild className="h-11 w-full">
+              <Link href="/zylo-translator-convo">Try it</Link>
+            </Button>
           </CardContent>
         </Card>
       </section>

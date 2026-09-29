@@ -48,6 +48,21 @@ test('POST /meetings creates an instant meeting hosted by the caller', async () 
   assert.equal(body.meeting.maxParticipants, 20);
 });
 
+test('POST /meetings defaults to mode standard', async () => {
+  const { status, body } = await api('user_alice', 'POST', '/meetings', {});
+  assert.equal(status, 201);
+  assert.equal(body.meeting.mode, 'standard');
+});
+
+test('POST /meetings with mode translator returns a 2-seat, auto-admission card', async () => {
+  const { status, body } = await api('user_alice', 'POST', '/meetings', { mode: 'translator' });
+  assert.equal(status, 201);
+  assert.equal(body.meeting.mode, 'translator');
+  assert.equal(body.meeting.maxParticipants, 2);
+  assert.equal(body.meeting.admission, 'auto');
+  assert.equal(body.meeting.title, 'Translator Convo');
+});
+
 test('POST /meetings rejects invalid input with 400', async () => {
   const { status, body } = await api('user_alice', 'POST', '/meetings', { maxParticipants: 50 });
   assert.equal(status, 400);

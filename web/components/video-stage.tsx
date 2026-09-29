@@ -38,10 +38,15 @@ function ScreenVideo({ track }: { track: VideoTrack }) {
 // The RoomAudioRenderer replacement we took on by declining @livekit/components-react:
 // one hidden <audio> per subscribed remote audio track, never given the local track
 // (that would cause echo). The room as a whole is never muted — `muted` here is
-// per person, driven by the viewer's own "Mute for me" choice in the People list.
+// per person, driven by the viewer's own "Mute for me" choice in the People list
+// (Translator Convo's "Partner's voice" setting also lands here as `muted`, ORed
+// together with "Mute for me" at the call site below — mutedForMe always wins).
 // Keyed by track sid at the call site so a real track change remounts this and
 // re-runs the attach effect, while an unrelated snapshot update does not.
-function AudioSink({ track, muted }: { track: RemoteAudioTrack; muted: boolean }) {
+// ponytail: iOS ignores HTMLMediaElement.volume outright, so Translator Convo's
+// "Low" plays there exactly like "Full" — only the during-speech mute (still a real
+// `muted` toggle, which iOS does honor) actually ducks the partner's voice on iOS.
+function AudioSink({ track, muted, volume = 1 }: { track: RemoteAudioTrack; muted: boolean; volume?: number }) {
   const ref = useAttach<HTMLAudioElement>(track);
   // livekit-client unmutes attached elements behind React's back (attach() and
   // room.startAudio() both set muted = false), so re-assert on every volumechange.
@@ -50,11 +55,12 @@ function AudioSink({ track, muted }: { track: RemoteAudioTrack; muted: boolean }
     if (!el) return;
     const apply = () => {
       if (el.muted !== muted) el.muted = muted;
+      if (el.volume !== volume) el.volume = volume;
     };
     apply();
     el.addEventListener('volumechange', apply);
     return () => el.removeEventListener('volumechange', apply);
-  }, [ref, track, muted]);
+  }, [ref, track, muted, volume]);
   return <audio ref={ref} autoPlay playsInline />;
 }
 
@@ -124,7 +130,17 @@ function Tile({
   );
 }
 
-function GridStage({ people, status, tileProps }: { people: Person[]; status: LiveKitStatus; tileProps: (person: Person) => TileData }) {
+function GridStage({
+  people,
+  status,
+  tileProps,
+  subtitle,
+}: {
+  people: Person[];
+  status: LiveKitStatus;
+  tileProps: (person: Person) => TileData;
+  subtitle?: React.ReactNode;
+}) {
   const ref = useRef<HTMLElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
@@ -169,6 +185,7 @@ function GridStage({ people, status, tileProps }: { people: Person[]; status: Li
           <Tile key={person.userId} {...tileProps(person)} size={{ width: fit.tileWidth, height: fit.tileHeight }} />
         ))}
       </div>
+      {subtitle}
     </main>
   );
 }
@@ -184,6 +201,8 @@ export function VideoStage({
   status,
   view,
   screenTracks,
+  subtitle,
+  partnerVolume,
 }: {
   people: Person[];
   selfUserId: string;
@@ -195,6 +214,11 @@ export function VideoStage({
   status: LiveKitStatus;
   view: StageView;
   screenTracks: Map<string, VideoTrack>;
+  // Translator Convo only: renders nothing (undefined) for a standard meeting.
+  subtitle?: React.ReactNode;
+  // Translator Convo only: the partner's real-voice level, from RoomShell's
+  // "Partner's voice" setting (see lib/partner-voice.ts).
+  partnerVolume?: { userId: string; volume: number; muted: boolean };
 }) {
   const tileProps = (person: Person) => ({
     person,
@@ -212,9 +236,12 @@ export function VideoStage({
       {/* ponytail: muted keys on the person's identity, so muting them for me also
           silences their ZyloLive screen-share audio (same participant, same key).
           Split it per source (mic vs screen) if anyone asks. */}
-      {audioTracks.map(({ sid, identity, track }) => (
-        <AudioSink key={sid} track={track} muted={mutedForMe.has(identity)} />
-      ))}
+      {audioTracks.map(({ sid, identity, track }) => {
+        const forThisPerson = partnerVolume?.userId === identity ? partnerVolume : undefined;
+        // "Mute for me" always wins over the Translator Convo voice setting.
+        const muted = mutedForMe.has(identity) || Boolean(forThisPerson?.muted);
+        return <AudioSink key={sid} track={track} muted={muted} volume={forThisPerson?.volume} />;
+      })}
     </div>
   );
 
@@ -227,7 +254,7 @@ export function VideoStage({
           <p role="status" className="rounded-lg bg-success px-4 py-2 text-sm font-semibold text-success-foreground">
             {presentingBanner(view, brand.live)}
           </p>
-          <div className="grid min-h-0 flex-1 place-items-center overflow-hidden rounded-2xl border border-border bg-card">
+          <div className="relative grid min-h-0 flex-1 place-items-center overflow-hidden rounded-2xl border border-border bg-card">
             {view.isSelf ? (
               <p className="max-w-sm px-6 text-center text-sm text-muted-foreground">
                 Everyone can see your screen. Press {brand.live} in the controls when you’re done.
@@ -239,6 +266,7 @@ export function VideoStage({
                 Waiting for {view.sharerName}’s screen…
               </p>
             )}
+            {subtitle}
           </div>
           <ul aria-label="People" className="flex shrink-0 gap-3 overflow-x-auto pb-1">
             {people.map((person) => (
@@ -255,7 +283,7 @@ export function VideoStage({
 
   return (
     <>
-      <GridStage people={people} status={status} tileProps={tileProps} />
+      <GridStage people={people} status={status} tileProps={tileProps} subtitle={subtitle} />
       {audioSinks}
     </>
   );

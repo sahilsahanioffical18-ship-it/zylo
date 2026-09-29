@@ -7,11 +7,15 @@ import { CalendarX, Mic, MicOff, Video, VideoOff } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
+import { ConvoChecklist } from '@/components/convo-checklist';
+import { LanguageSelect } from '@/components/language-select';
 import { MediaToggle } from '@/components/media-toggle';
 import { ZyloLogo } from '@/components/zylo-logo';
 import { ApiError, useApi } from '@/lib/api';
 import { brand } from '@/lib/brand';
+import { defaultLanguage } from '@/lib/convo-languages';
 import { initials } from '@/lib/format';
 import { mediaErrorMessage } from '@/lib/media-error';
 import type { MeetingCard } from '@/lib/types';
@@ -23,8 +27,9 @@ type LoadState =
 
 type Props = {
   code: string;
-  onJoin: (meeting: MeetingCard, prefs: { micOn: boolean; camOn: boolean }) => void;
+  onJoin: (meeting: MeetingCard, prefs: { micOn: boolean; camOn: boolean }, lang?: string) => void;
 };
+
 
 export function Notice({ title, text }: { title: string; text: string }) {
   return (
@@ -53,6 +58,10 @@ export function PreJoin({ code, onJoin }: Props) {
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
+  // Translator Convo only. SSR-safe default; corrected client-side once the meeting
+  // (and so its mode) is known — see the effect below.
+  const [lang, setLang] = useState('en');
+  const [checkOpen, setCheckOpen] = useState(false); // the checklist probes only once opened
 
   useEffect(() => {
     let cancelled = false;
@@ -106,6 +115,22 @@ export function PreJoin({ code, onJoin }: Props) {
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = stream;
   }, [stream]);
+
+  const isTranslator = load.status === 'ready' && load.meeting.mode === 'translator';
+  useEffect(() => {
+    if (!isTranslator) return;
+    // Deferred a tick so this isn't a synchronous setState-in-effect (matches the
+    // async-callback pattern the rest of this codebase uses, e.g. use-meeting.ts).
+    Promise.resolve().then(() => {
+      let stored: string | null = null;
+      try {
+        stored = localStorage.getItem('zylo.convoLang');
+      } catch {
+        // localStorage unavailable (private mode, etc.) — fall through to the browser default.
+      }
+      setLang(stored ?? defaultLanguage(navigator.languages));
+    });
+  }, [isTranslator]);
 
   function toggle(kind: 'audio' | 'video') {
     if (!stream) return;
@@ -172,9 +197,12 @@ export function PreJoin({ code, onJoin }: Props) {
                     {meeting.isHost ? 'You are the host' : `Hosted by ${meeting.host.name}`}
                   </p>
                   <div className="flex flex-wrap gap-2">
-                    <Badge variant="outline">
-                      {meeting.admission === 'manual' ? 'Host admits each person' : 'Join instantly'}
-                    </Badge>
+                    {/* Admission doesn't apply here: a translator convo is always auto (link-shared, 2 seats). */}
+                    {meeting.mode !== 'translator' && (
+                      <Badge variant="outline">
+                        {meeting.admission === 'manual' ? 'Host admits each person' : 'Join instantly'}
+                      </Badge>
+                    )}
                     <Badge variant="outline">
                       {brand.live}: {meeting.screenSharePolicy === 'host_only' ? 'host only' : 'anyone'}
                     </Badge>
@@ -193,6 +221,27 @@ export function PreJoin({ code, onJoin }: Props) {
               )}
             </div>
 
+            {isTranslator && (
+              <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="pre-join-lang">I speak</Label>
+                  <LanguageSelect id="pre-join-lang" value={lang} onChange={setLang} />
+                </div>
+                <details className="rounded-lg border border-border p-3 text-sm" onToggle={(e) => setCheckOpen(e.currentTarget.open)}>
+                  <summary className="cursor-pointer font-medium">Check this device</summary>
+                  <div className="mt-3">
+                    {/* ponytail: there's no partner yet at pre-join, so this is a best guess at
+                        who's on the other end — 'ru' if you speak 'hi', else 'hi'. */}
+                    {checkOpen && <ConvoChecklist myLang={lang} partnerLang={lang === 'hi' ? 'ru' : 'hi'} />}
+                  </div>
+                </details>
+                <p className="text-xs text-muted-foreground">
+                  Your speech may be processed by your browser’s speech service; translations use on-device Chrome AI
+                  when available, otherwise the free MyMemory service; if your device has no voice for a language, Google reads the translations.
+                </p>
+              </div>
+            )}
+
             <p className="text-sm text-muted-foreground">
               Joining as <span className="font-semibold text-foreground">{name}</span>
             </p>
@@ -200,7 +249,7 @@ export function PreJoin({ code, onJoin }: Props) {
             <Button
               className="h-12 w-full text-base"
               disabled={!meeting}
-              onClick={() => meeting && onJoin(meeting, { micOn, camOn })}
+              onClick={() => meeting && onJoin(meeting, { micOn, camOn }, isTranslator ? lang : undefined)}
             >
               Join {brand.room}
             </Button>

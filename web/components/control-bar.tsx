@@ -1,6 +1,6 @@
 'use client';
 
-import { MessageSquare, Mic, MicOff, PhoneOff, ScreenShare, ScreenShareOff, Users, Video, VideoOff } from 'lucide-react';
+import { Languages, MessageSquare, Mic, MicOff, PhoneOff, ScreenShare, ScreenShareOff, Users, Video, VideoOff } from 'lucide-react';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -22,7 +22,7 @@ import { canShareScreen } from '@/lib/screen-share';
 // gone, and PhoneOff plus aria-label keeps it readable to screen readers either way.
 const LEAVE_BUTTON_CLASS = 'h-11 w-11 rounded-full px-0 sm:h-12 sm:w-auto sm:px-6';
 
-export type PanelTab = 'chat' | 'people';
+export type PanelTab = 'captions' | 'chat' | 'people';
 
 export function ControlBar({
   micOn,
@@ -38,6 +38,7 @@ export function ControlBar({
   onLeave,
   isHost,
   onEndForAll,
+  translator = false,
 }: {
   micOn: boolean;
   camOn: boolean;
@@ -52,7 +53,14 @@ export function ControlBar({
   onLeave: () => void;
   isHost: boolean;
   onEndForAll: () => void;
+  // Translator Convo only: the "chat" button (there's no room in the 320px budget —
+  // see the comment below — for a dedicated Captions button) opens the Captions tab
+  // instead of ZyloChat.
+  translator?: boolean;
 }) {
+  const chatTab: PanelTab = translator ? 'captions' : 'chat';
+  const ChatIcon = translator ? Languages : MessageSquare;
+  const chatLabel = translator ? 'Captions' : brand.chat;
   // 320px budget: 6 controls × 44 + 5 gaps × 8 = 304 = 320 − px-2 × 2, zero slack.
   // A 7th control below sm needs a "More" menu, or the bar wraps to two rows.
   return (
@@ -104,13 +112,13 @@ export function ControlBar({
             size="icon"
             variant="secondary"
             className="size-11 rounded-full sm:size-12"
-            aria-label={brand.chat}
-            onClick={() => onOpenPanel('chat')}
+            aria-label={chatLabel}
+            onClick={() => onOpenPanel(chatTab)}
           >
-            <MessageSquare className="size-5" />
+            <ChatIcon className="size-5" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>{brand.chat}</TooltipContent>
+        <TooltipContent>{chatLabel}</TooltipContent>
       </Tooltip>
 
       <Tooltip>

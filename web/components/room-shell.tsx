@@ -6,16 +6,21 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { CaptionsPanel } from '@/components/captions-panel';
 import { ChatPanel } from '@/components/chat-panel';
 import { ControlBar, type PanelTab } from '@/components/control-bar';
 import { PeoplePanel } from '@/components/people-panel';
+import { SubtitleOverlay } from '@/components/subtitle-overlay';
 import { VideoStage } from '@/components/video-stage';
 import { brand } from '@/lib/brand';
 import { shouldToast, toastPreview } from '@/lib/chat-toast';
+import { languageFor } from '@/lib/convo-languages';
+import { partnerVolume as partnerVolumeFor, type PartnerVoiceSetting } from '@/lib/partner-voice';
 import { stageView } from '@/lib/screen-share';
 import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { useLiveKitRoom } from '@/lib/use-livekit-room';
 import type { ChatMessage, LobbyEntry, Person } from '@/lib/use-meeting';
+import type { useTranslatorConvo } from '@/lib/use-translator-convo';
 
 // Tailwind's lg: where the Chat/People panel docks beside the stage instead of opening as a Sheet.
 const DOCKED_QUERY = '(min-width: 1024px)';
@@ -43,6 +48,13 @@ export function RoomShell({
   onEndForAll,
   messages,
   onSendChat,
+  convo,
+  myLang,
+  onChangeLang,
+  readAloud,
+  onReadAloud,
+  headphones,
+  onHeadphones,
 }: {
   title: string;
   maxParticipants: number;
@@ -66,12 +78,25 @@ export function RoomShell({
   onEndForAll: () => void;
   messages: ChatMessage[];
   onSendChat: (text: string) => void;
+  // Translator Convo only. Its presence IS the mode flag (`translator` below) —
+  // every other translator-only prop just below is only ever read once this exists.
+  convo?: ReturnType<typeof useTranslatorConvo>;
+  myLang: string;
+  onChangeLang: (lang: string) => void;
+  readAloud: boolean;
+  onReadAloud: (value: boolean) => void;
+  headphones: boolean;
+  onHeadphones: (value: boolean) => void;
 }) {
+  const translator = Boolean(convo);
   const view = stageView(sharerUserId, selfUserId, people);
-  const [tab, setTab] = useState<PanelTab>('people'); // People is the default: the host's
-  // lobby (admit/deny) and the admission setting live there, and hiding those behind a
-  // tab would regress Phase 2 behaviour.
+  // People is the default for a standard meeting: the host's lobby (admit/deny) and
+  // the admission setting live there, and hiding those behind a tab would regress
+  // Phase 2 behaviour. Translator Convo defaults to Captions instead (plan: Task 6).
+  const [tab, setTab] = useState<PanelTab>(() => (translator ? 'captions' : 'people'));
   const [sheetOpen, setSheetOpen] = useState(false);
+  // Translator Convo only, session-only: how loud the partner's real voice plays.
+  const [partnerVoice, setPartnerVoice] = useState<PartnerVoiceSetting>('low');
   // Session-only, local to this viewer: never persisted, never sent to the server.
   const [mutedForMe, setMutedForMe] = useState<Set<string>>(() => new Set());
 
@@ -132,6 +157,7 @@ export function RoomShell({
       onMute={onMute}
       onStopShare={onStopShare}
       onKick={onKick}
+      translator={translator}
     />
   );
 
@@ -143,9 +169,27 @@ export function RoomShell({
       className="flex h-full min-h-0 flex-col lg:rounded-2xl lg:border lg:border-border lg:bg-card lg:p-4"
     >
       <TabsList className="w-full">
+        {/* Captions comes first and is the default tab in translator mode (plan: Task 6). */}
+        {convo && <TabsTrigger value="captions">Captions</TabsTrigger>}
         <TabsTrigger value="chat">{brand.chat}</TabsTrigger>
         <TabsTrigger value="people">People ({people.length})</TabsTrigger>
       </TabsList>
+      {convo && (
+        <TabsContent value="captions" className="min-h-0 flex-1">
+          <CaptionsPanel
+            convo={convo}
+            myLang={myLang}
+            onChangeLang={onChangeLang}
+            readAloud={readAloud}
+            onReadAloud={onReadAloud}
+            headphones={headphones}
+            onHeadphones={onHeadphones}
+            partnerVoice={partnerVoice}
+            onPartnerVoice={setPartnerVoice}
+            selfUserId={selfUserId}
+          />
+        </TabsContent>
+      )}
       <TabsContent value="chat" className="min-h-0 flex-1">
         <ChatPanel messages={messages} selfUserId={selfUserId} onSend={onSendChat} />
       </TabsContent>
@@ -155,6 +199,14 @@ export function RoomShell({
     </Tabs>
   );
   const waitingCount = isHost ? lobby.length : 0;
+  const panelTitle = translator ? 'Captions, chat and people' : 'Chat and people';
+
+  // Translator Convo only: the partner is the one other seat, and their real voice's
+  // volume follows the viewer's own "Partner's voice" setting, ducked to muted
+  // whenever this browser's translated speech is playing (lib/partner-voice.ts).
+  const partnerUserId = translator ? (people.find((p) => p.userId !== selfUserId)?.userId ?? null) : null;
+  const partnerLang = convo?.partnerLang ?? null;
+  const subtitle = convo ? <SubtitleOverlay line={convo.partnerLine} myLang={myLang} /> : undefined;
 
   // ZyloRoom is always dark, whatever the dashboard's theme is set to.
   return (
@@ -164,10 +216,15 @@ export function RoomShell({
         <Badge variant="outline" className="tabular-nums">
           {people.length}/{maxParticipants}
         </Badge>
-        {isHost && (
+        {isHost && !translator && (
           // cn() drops the badge's base inline-flex in favour of `hidden` (checked).
           <Badge variant="outline" className="hidden sm:inline-flex">
             {admission === 'manual' ? 'Host admits' : 'Join instantly'}
+          </Badge>
+        )}
+        {translator && partnerLang && (
+          <Badge variant="outline" className="hidden sm:inline-flex">
+            {languageFor(myLang)?.nativeName ?? myLang} ⇄ {languageFor(partnerLang)?.nativeName ?? partnerLang}
           </Badge>
         )}
       </header>
@@ -192,8 +249,10 @@ export function RoomShell({
           status={media.status}
           view={view}
           screenTracks={media.screenTracks}
+          subtitle={subtitle}
+          partnerVolume={partnerUserId ? { userId: partnerUserId, ...partnerVolumeFor(partnerVoice, convo?.speaking ?? false) } : undefined}
         />
-        <aside aria-label="Chat and people" className="hidden w-80 shrink-0 lg:block">
+        <aside aria-label={panelTitle} className="hidden w-80 shrink-0 lg:block">
           {panel}
         </aside>
       </div>
@@ -203,7 +262,7 @@ export function RoomShell({
       <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
         <SheetContent side="right" className="dark p-4 data-[side=right]:w-full data-[side=right]:max-w-sm">
           <SheetHeader className="p-0 pb-4">
-            <SheetTitle>Chat and people</SheetTitle>
+            <SheetTitle>{panelTitle}</SheetTitle>
           </SheetHeader>
           {panel}
         </SheetContent>
@@ -223,6 +282,7 @@ export function RoomShell({
         onLeave={onLeave}
         isHost={isHost}
         onEndForAll={onEndForAll}
+        translator={translator}
       />
     </div>
   );

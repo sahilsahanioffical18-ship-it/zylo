@@ -27,13 +27,28 @@ function createRedis(url = process.env.REDIS_URL, { log = console } = {}) {
   return redis;
 }
 
-// Resolves once the connection is usable. With no offline queue a command sent
-// before this rejects, so tests (and anything that must not start degraded) wait here.
-function whenReady(redis) {
+// Resolves once the connection is usable, rejects if it ends or is still not ready
+// after timeoutMs. The client retries forever and never ends on its own, so without
+// the timeout a down Redis would leave callers (tests, a must-not-start-degraded
+// boot) waiting for good. With no offline queue a command sent before ready rejects.
+function whenReady(redis, { timeoutMs = 3000 } = {}) {
   if (redis.status === 'ready') return Promise.resolve();
+  if (redis.status === 'end') return Promise.reject(new Error('Redis connection has ended'));
   return new Promise((resolve, reject) => {
-    redis.once('ready', resolve);
-    redis.once('end', () => reject(new Error('Redis connection ended before it was ready')));
+    const done = (settle, arg) => {
+      clearTimeout(timer);
+      redis.off('ready', onReady);
+      redis.off('end', onEnd);
+      settle(arg);
+    };
+    const onReady = () => done(resolve);
+    const onEnd = () => done(reject, new Error('Redis connection ended before it was ready'));
+    const timer = setTimeout(
+      () => done(reject, new Error(`Redis is not reachable after ${timeoutMs} ms. Is it running? Try: npm run db:up`)),
+      timeoutMs,
+    );
+    redis.on('ready', onReady);
+    redis.on('end', onEnd);
   });
 }
 

@@ -36,9 +36,11 @@ const quietLog = { warn: () => {} };
 // closed when the test ends. Needs `npm run db:up`.
 async function setupTestRedis(t) {
   const redis = createRedis(process.env.TEST_REDIS_URL || 'redis://localhost:6379/1', { log: quietLog });
+  // Registered before anything can throw, so a failed connect never leaks a client
+  // that keeps reconnecting and holds the test process open.
+  t.after(() => redis.disconnect());
   await whenReady(redis);
   await redis.flushdb();
-  t.after(() => redis.quit());
   return redis;
 }
 

@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../app');
-const { createRedis } = require('../lib/redis');
+const { createRedis, whenReady } = require('../lib/redis');
 const { listen, fakeAuth, setupTestRedis, quietLog, settle } = require('./helpers');
 
 const fakeDb = { query: async () => ({ rows: [] }) };
@@ -40,4 +40,12 @@ test('an outage is logged once however many retries fail, and the recovery once'
   redis.emit('ready'); // what the client emits when a retry finally connects
   assert.equal(warnings.length, 2);
   assert.match(warnings[1], /Redis reconnected/);
+});
+
+test('whenReady fails fast, naming the fix, when Redis is not reachable', async (t) => {
+  const redis = createRedis(DEAD_REDIS, { log: quietLog });
+  t.after(() => redis.disconnect());
+  const started = Date.now();
+  await assert.rejects(whenReady(redis, { timeoutMs: 300 }), /npm run db:up/);
+  assert.ok(Date.now() - started < 1000, 'should give up near timeoutMs, not hang');
 });

@@ -8,11 +8,13 @@ import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { validateChatText } from '@/lib/chat-rules';
 import { screenDeniedMessage, type ScreenDenial } from '@/lib/screen-share';
-import type { Admission, ScreenSharePolicy } from '@/lib/types';
+import type { Admission, IncomingCaption, OutgoingCaption, ScreenSharePolicy } from '@/lib/types';
 
-export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean };
+export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean; lang: string | null };
 export type LobbyEntry = { userId: string; name: string; imageUrl: string | null };
-export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied';
+// 'full' is Translator Convo only: a 2-seat link that's already taken (server: room.js's
+// meeting:join-request, "a translator convo is a 2-seat link, not a lobby").
+export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied' | 'full';
 export type ChatMessage = { userId: string; name: string; text: string; ts: number };
 
 // ponytail: keep the last 200 in memory; nothing is stored anyway, so scrollback has a
@@ -33,7 +35,7 @@ type AdmitAck = { ok: boolean; reason?: 'full' | 'gone' };
  * Joins a ZyloRoom over Socket.IO. Pass `null` while the user is still on the
  * pre-join screen: no socket opens, so nobody takes a seat before pressing Join.
  */
-export function useMeeting(meetingId: string | null) {
+export function useMeeting(meetingId: string | null, opts?: { lang?: string | null; onCaption?: (c: IncomingCaption) => void }) {
   const { getToken } = useAuth();
   const socketRef = useRef<Socket | null>(null);
   const [state, setState] = useState<MeetingState>({ status: 'connecting' });
@@ -45,6 +47,18 @@ export function useMeeting(meetingId: string | null) {
   // capture effect for why.
   const [shareGrant, setShareGrant] = useState(0);
   const [screenPolicy, setScreenPolicy] = useState<ScreenSharePolicy | null>(null);
+
+  // Translator Convo only. Refs (not deps of the join effect below) so a language
+  // change or a new onCaption closure never tears down and reopens the socket —
+  // the connect handler reads langRef.current fresh on every 'connect', including
+  // a reconnect, and convo:caption reads onCaptionRef.current the same way. Same
+  // no-dependency-array idiom as use-livekit-room.ts's prefsRef.
+  const langRef = useRef(opts?.lang ?? null);
+  const onCaptionRef = useRef(opts?.onCaption);
+  useEffect(() => {
+    langRef.current = opts?.lang ?? null;
+    onCaptionRef.current = opts?.onCaption;
+  });
 
   useEffect(() => {
     if (!meetingId) return;
@@ -67,7 +81,9 @@ export function useMeeting(meetingId: string | null) {
     });
     socketRef.current = socket;
 
-    socket.on('connect', () => socket.emit('meeting:join-request', { meetingId }));
+    // lang rides every join-request, including the one a reconnect re-emits, so a
+    // language chosen after the socket already opened isn't lost on a network blip.
+    socket.on('connect', () => socket.emit('meeting:join-request', { meetingId, lang: langRef.current }));
     // The server is down or the token was refused. Never dress this up as a
     // missing meeting — socket.io keeps retrying, and 'connect' recovers us.
     socket.on('connect_error', () => setState({ status: 'offline' }));
@@ -112,6 +128,9 @@ export function useMeeting(meetingId: string | null) {
     socket.on('screen:granted', () => setShareGrant((n) => n + 1));
     socket.on('screen:denied', (denial: ScreenDenial) => toast.error(screenDeniedMessage(denial, brand.live)));
     socket.on('screen:state', ({ sharerUserId: id }: { sharerUserId: string | null }) => setSharerUserId(id));
+    // Translator Convo only; the server never echoes a caption back to its sender
+    // (see room.js's convo:caption — it uses socket.to, not io.to).
+    socket.on('convo:caption', (c: IncomingCaption) => onCaptionRef.current?.(c));
 
     return () => {
       socket.disconnect();
@@ -177,6 +196,19 @@ export function useMeeting(meetingId: string | null) {
     socketRef.current?.emit('host:end-meeting', {});
   }, []);
 
+  // Translator Convo only. Identity (userId, name) is never sent — the server takes
+  // it from the seat, same as sendChat above, so the payload is exactly OutgoingCaption.
+  const sendCaption = useCallback((c: OutgoingCaption) => {
+    socketRef.current?.emit('convo:caption', c);
+  }, []);
+
+  // Updates the ref immediately (not just on next render) so a reconnect that races
+  // this call still re-joins with the language just chosen, then tells the server.
+  const setConvoLang = useCallback((lang: string) => {
+    langRef.current = lang;
+    socketRef.current?.emit('convo:set-lang', { lang });
+  }, []);
+
   return {
     state,
     lobby,
@@ -197,5 +229,7 @@ export function useMeeting(meetingId: string | null) {
     stopShareOf,
     setScreenPolicyMode,
     endMeeting,
+    sendCaption,
+    setConvoLang,
   };
 }

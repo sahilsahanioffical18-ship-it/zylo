@@ -12,10 +12,23 @@ export interface MeetingCard {
   admission: Admission;
   screenSharePolicy: ScreenSharePolicy;
   maxParticipants: number;
+  mode: 'standard' | 'translator';
   host: { name: string };
   isHost: boolean;
   participants: { name: string; imageUrl: string | null }[];
 }
+
+// Zylo Translator Convo caption payloads — the shapes carried over convo:caption.
+// Twin of server/lib/captionRules.js's validateCaption/validateTranslation.
+export type OutgoingCaption = {
+  id: string;
+  text: string;
+  lang: string;
+  final: boolean;
+  translation?: { lang: string; text: string };
+};
+
+export type IncomingCaption = OutgoingCaption & { userId: string; name: string; ts: number };
 
 export interface Dashboard {
   live: MeetingCard[];

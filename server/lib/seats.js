@@ -27,14 +27,15 @@ function cancelGrace(s, userId) {
   s.graceTimers.delete(userId);
 }
 
-function tryTakeSeat(meetingId, { userId, socketId, name, imageUrl, isHost, max }) {
+function tryTakeSeat(meetingId, { userId, socketId, name, imageUrl, isHost, max, lang = null }) {
   const s = state(meetingId);
   const existing = s.seats.get(userId);
   if (existing) {
-    // Reconnect or second tab: one seat per userId. The new socket takes over.
+    // Reconnect or second tab: one seat per userId. The new socket takes over,
+    // and this join's lang (not the stale one) is what the seat carries now.
     cancelGrace(s, userId);
     const replacedSocketId = existing.socketId === socketId ? null : existing.socketId;
-    s.seats.set(userId, { socketId, name, imageUrl, isHost });
+    s.seats.set(userId, { socketId, name, imageUrl, isHost, lang });
     return { ok: true, replacedSocketId };
   }
   if (!isHost) {
@@ -43,8 +44,19 @@ function tryTakeSeat(meetingId, { userId, socketId, name, imageUrl, isHost, max 
     for (const seat of s.seats.values()) if (!seat.isHost) taken += 1;
     if (taken >= max - 1) return { ok: false, replacedSocketId: null };
   }
-  s.seats.set(userId, { socketId, name, imageUrl, isHost });
+  s.seats.set(userId, { socketId, name, imageUrl, isHost, lang });
   return { ok: true, replacedSocketId: null };
+}
+
+// convo:set-lang's only write: a translator seat updates its own language without
+// touching socketId/name/isHost. Returns false for no seat, so the caller's guard
+// (seat exists && socket owns it) stays the single source of truth for whether
+// the write should happen at all.
+function setSeatLang(meetingId, userId, lang) {
+  const seat = meetings.get(meetingId)?.seats.get(userId);
+  if (!seat) return false;
+  seat.lang = lang;
+  return true;
 }
 
 function hasSeat(meetingId, userId) {
@@ -177,6 +189,7 @@ function clearMeeting(meetingId) {
 module.exports = {
   GRACE_MS,
   tryTakeSeat,
+  setSeatLang,
   hasSeat,
   seatFor,
   seatSocketId,

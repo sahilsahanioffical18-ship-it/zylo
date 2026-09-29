@@ -1,5 +1,6 @@
 const seats = require('./seats');
 const { validateChatText } = require('./chatRules');
+const { isConvoLang, validateCaption, allowCaption, BURST } = require('./captionRules');
 
 const roomChannel = (meetingId) => `meeting:${meetingId}`;
 
@@ -12,7 +13,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     const cached = liveMeetings.get(meetingId);
     if (cached) return cached;
     const { rows } = await db.query(
-      `SELECT host_id, admission, screen_share_policy, max_participants, ended_at
+      `SELECT host_id, admission, screen_share_policy, max_participants, mode, ended_at
        FROM meetings WHERE id = $1`,
       [meetingId],
     );
@@ -23,6 +24,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       admission: rows[0].admission,
       screenSharePolicy: rows[0].screen_share_policy,
       maxParticipants: rows[0].max_participants,
+      mode: rows[0].mode,
     };
     liveMeetings.set(meetingId, meta);
     return meta;
@@ -78,7 +80,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     io.to(roomChannel(meetingId)).emit('room:presence', {
       people: seats
         .listSeats(meetingId)
-        .map(({ userId, name, imageUrl, isHost }) => ({ userId, name, imageUrl, isHost })),
+        .map(({ userId, name, imageUrl, isHost, lang }) => ({ userId, name, imageUrl, isHost, lang: lang ?? null })),
     });
   }
 
@@ -197,7 +199,7 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     );
 
   io.on('connection', (socket) => {
-    on(socket, 'meeting:join-request', async ({ meetingId } = {}) => {
+    on(socket, 'meeting:join-request', async ({ meetingId, lang } = {}) => {
       if (typeof meetingId !== 'string') return socket.emit('meeting:denied', { reason: 'not_found' });
       const meta = await loadMeetingMeta(meetingId);
       if (!meta) return socket.emit('meeting:denied', { reason: 'not_found' });
@@ -212,7 +214,10 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       // and so can host:kick — the DB check above ran before either.
       if (!liveMeetings.has(meetingId)) return socket.emit('meeting:denied', { reason: 'ended' });
       if (meta.removed?.has(userId)) return socket.emit('meeting:denied', { reason: 'removed' });
-      const entry = { userId, socketId: socket.id, name, imageUrl };
+      // lang only means anything in a translator convo, and only if it is one of
+      // the supported codes — anything else silently becomes null, like chat.
+      const seatLang = meta.mode === 'translator' && isConvoLang(lang) ? lang : null;
+      const entry = { userId, socketId: socket.id, name, imageUrl, lang: seatLang };
 
       // Every DB read is done. From here down nothing awaits until the seat is
       // written, which is what makes the last-seat race safe.
@@ -228,6 +233,9 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
         max: meta.maxParticipants,
       });
       if (!result.ok) {
+        // A translator convo is a 2-seat link, not a lobby: a 3rd person is told
+        // straight away instead of joining a queue nobody will ever drain from.
+        if (meta.mode === 'translator') return socket.emit('meeting:denied', { reason: 'full' });
         seats.enqueue(meetingId, entry);
         socket.data.meetingId = meetingId;
         return broadcastLobby(meetingId);
@@ -236,6 +244,47 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       broadcastPresence(meetingId);
       // A host arriving needs to see whoever is already waiting for them.
       if (isHostUser) broadcastLobby(meetingId);
+    });
+
+    // Translator convos only. Requires the seat this socket actually holds (not
+    // the lobby, not a replaced or stale tab — same rule as chat/screen below),
+    // so nobody can set a language for a meeting they aren't seated in.
+    on(socket, 'convo:set-lang', ({ lang } = {}) => {
+      const { meetingId, userId } = socket.data;
+      if (!meetingId) return;
+      const seat = seats.seatFor(meetingId, userId);
+      if (!seat || seat.socketId !== socket.id) return;
+      const meta = liveMeetings.get(meetingId);
+      if (!meta || meta.mode !== 'translator') return;
+      if (!isConvoLang(lang)) return;
+      seats.setSeatLang(meetingId, userId, lang);
+      broadcastPresence(meetingId);
+    });
+
+    // Translator convos only. Same authorization shape as chat:message above —
+    // the seat this socket actually holds is the only thing that proves anything
+    // (not the lobby, not a replaced or stale tab) — plus two checks chat
+    // doesn't need: the meeting must be in translator mode, and the sender must
+    // still have tokens in its bucket. Identity (userId, name) comes from the
+    // seat, never the payload, for the same reason chat does it: nobody can
+    // caption as someone else. socket.to (not io.to) excludes the sender — it
+    // already rendered its own caption locally the instant it recognized it, so
+    // echoing it back would just be wasted bandwidth and a second render.
+    on(socket, 'convo:caption', (payload) => {
+      const { meetingId, userId } = socket.data;
+      if (!meetingId) return;
+      const seat = seats.seatFor(meetingId, userId);
+      if (!seat || seat.socketId !== socket.id) return;
+      const meta = liveMeetings.get(meetingId);
+      if (!meta || meta.mode !== 'translator') return;
+      // Captions are chatty (interim results, client-throttled to ~4/s) and
+      // Socket.IO has no rate guard of its own — this is the first rate limit
+      // in Zylo. The bucket lives on the socket, so it's per-connection.
+      const now = Date.now();
+      if (!allowCaption((socket.data.captionBucket ??= { tokens: BURST, at: now }), now)) return;
+      const clean = validateCaption(payload);
+      if (!clean) return; // a client bug or a probe; see chat:message above
+      socket.to(roomChannel(meetingId)).emit('convo:caption', { userId, name: seat.name, ...clean, ts: Date.now() });
     });
 
     on(socket, 'meeting:leave', async () => {
@@ -351,6 +400,10 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       const guard = hostGuard(socket);
       if (!guard) return;
       const { meetingId, meta } = guard;
+      // A translator convo is a 2-seat link convo: it is always auto admission,
+      // so there is no lobby to switch to manual — a silent no-op, like an
+      // unrecognized mode below.
+      if (meta.mode === 'translator') return;
       // The host is authenticated, so a malformed payload is a client bug, not an
       // authorization failure: ignore it rather than emit error:forbidden.
       if (mode !== 'auto' && mode !== 'manual') return;

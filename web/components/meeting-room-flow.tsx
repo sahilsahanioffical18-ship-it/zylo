@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useUser } from '@clerk/nextjs';
 import { Loader2 } from 'lucide-react';
@@ -8,9 +8,11 @@ import { Notice, PreJoin } from '@/components/pre-join';
 import { RoomShell } from '@/components/room-shell';
 import { WaitingCard } from '@/components/waiting-card';
 import { brand } from '@/lib/brand';
-import type { MeetingCard } from '@/lib/types';
+import type { IncomingCaption, MeetingCard } from '@/lib/types';
 import { useLiveKitRoom, type MediaPrefs } from '@/lib/use-livekit-room';
 import { useMeeting, type DeniedReason } from '@/lib/use-meeting';
+import { unlockSpeech } from '@/lib/use-speech-output';
+import { useTranslatorConvo } from '@/lib/use-translator-convo';
 
 // Module-level so it's a stable reference — allocating a fresh object per render
 // would needlessly re-run any effect that has it in a dependency array.
@@ -33,6 +35,10 @@ const DENIED_COPY: Record<DeniedReason, { title: string; text: string }> = {
     title: 'The host didn’t let you in',
     text: `Ask them for a new invite if you think this was a mistake, then open the ${brand.room} link again.`,
   },
+  full: {
+    title: 'This Translator Convo is full',
+    text: 'This Translator Convo already has two people.',
+  },
 };
 
 export function MeetingRoomFlow({ code }: { code: string }) {
@@ -43,6 +49,26 @@ export function MeetingRoomFlow({ code }: { code: string }) {
   // purely to stop <PreJoin> mounting (and calling getUserMedia) during the
   // window between setJoined(null) and router.push('/dashboard') landing.
   const [leaving, setLeaving] = useState(false);
+  const translator = joined?.meeting.mode === 'translator';
+
+  // Translator Convo only. PreJoin resolves the real language (its own select,
+  // defaulted from localStorage or the browser) and hands it to onJoin below,
+  // BEFORE this ever needs a value — so 'en' here is a type-only placeholder, never
+  // actually sent in a join-request. That's what closes the race that used to exist
+  // when this was corrected by an effect running after Join: the very first
+  // join-request now always carries the language the user actually chose.
+  const [myLang, setMyLang] = useState('en');
+  // Read aloud defaults on; lifted here (not local to RoomShell) because it also
+  // has to reach useTranslatorConvo below.
+  const [readAloud, setReadAloud] = useState(true);
+  // Off by default: without headphones, captioning while a translation plays would
+  // caption the speakers. Session-only, like the other convo settings.
+  const [headphones, setHeadphones] = useState(false);
+
+  // Assigned by use-translator-convo.ts; use-meeting.ts's onCaption just forwards
+  // here so a language/convo change never has to tear down and reopen the socket.
+  const captionSink = useRef<(c: IncomingCaption) => void>(() => {});
+
   // The socket only opens once Join is pressed, so nobody takes a seat while
   // they are still setting up their camera.
   const {
@@ -65,7 +91,9 @@ export function MeetingRoomFlow({ code }: { code: string }) {
     stopShareOf,
     setScreenPolicyMode,
     endMeeting,
-  } = useMeeting(joined ? code : null);
+    sendCaption,
+    setConvoLang,
+  } = useMeeting(joined ? code : null, { lang: translator ? myLang : null, onCaption: (c) => captionSink.current(c) });
   const selfUserId = user?.id ?? '';
   const presenting = sharerUserId !== null && sharerUserId === selfUserId;
   // One expression decides both "which screen" and "is LiveKit connected", so they
@@ -87,6 +115,41 @@ export function MeetingRoomFlow({ code }: { code: string }) {
     onEnded: stopScreen,
   });
 
+  // Translator Convo only. Partner is the first other seated person — Translator
+  // Convo is a 2-seat room, so there's at most one. Called unconditionally (hooks
+  // rule) regardless of mode/admission; `enabled` keeps every sub-hook idle
+  // otherwise, so a standard meeting behaves exactly as it did before this feature.
+  const people = state.status === 'admitted' ? state.people : [];
+  const partner = people.find((p) => p.userId !== selfUserId) ?? null;
+  const convo = useTranslatorConvo({
+    enabled: translator && state.status === 'admitted',
+    selfUserId,
+    myLang,
+    partner,
+    micOn: media.micOn,
+    localMicTrack: media.localMicTrack,
+    sendCaption,
+    captionSink,
+    readAloud,
+    headphones,
+  });
+
+  // Changing "I speak" in the Captions panel: updates the local render, tells the
+  // server (so presence and the seat's `lang` follow), and remembers the choice for
+  // next time — the same key PreJoin and the landing page read.
+  const handleChangeLang = useCallback(
+    (lang: string) => {
+      setMyLang(lang);
+      setConvoLang(lang);
+      try {
+        localStorage.setItem('zylo.convoLang', lang);
+      } catch {
+        // Not fatal — just means next time won't remember this choice.
+      }
+    },
+    [setConvoLang],
+  );
+
   // Tells the server first (releases the seat), then tears down locally right
   // away rather than waiting on a socket round-trip: setting joined to null
   // unmounts useMeeting's effect (disconnects the socket) and — because `joined`
@@ -104,7 +167,31 @@ export function MeetingRoomFlow({ code }: { code: string }) {
     // Never PreJoin (it would re-acquire the camera), never blank: if router.push never
     // lands, this still offers the way back.
     if (leaving) return <Notice title={`You left the ${brand.room}`} text="Taking you back to your dashboard…" />;
-    return <PreJoin code={code} onJoin={(meeting, prefs) => setJoined({ meeting, prefs })} />;
+    return (
+      <PreJoin
+        code={code}
+        onJoin={(meeting, prefs, lang) => {
+          // A user gesture (this click) is required to unlock speechSynthesis on
+          // iOS/Chrome — done here, not inside useSpeechOutput, so it fires even
+          // though that hook doesn't exist yet (joined is still null this render).
+          if (meeting.mode === 'translator') {
+            unlockSpeech();
+            // Set BEFORE setJoined, in the same handler: both land before the next
+            // render, so the join effect below (keyed on `joined`) reads the real
+            // language on its very first join-request, never PreJoin's placeholder.
+            if (lang) {
+              setMyLang(lang);
+              try {
+                localStorage.setItem('zylo.convoLang', lang);
+              } catch {
+                // Not fatal — just means next time won't remember this choice.
+              }
+            }
+          }
+          setJoined({ meeting, prefs });
+        }}
+      />
+    );
   }
 
   if (state.status === 'denied') {
@@ -163,6 +250,13 @@ export function MeetingRoomFlow({ code }: { code: string }) {
       onEndForAll={endMeeting}
       messages={messages}
       onSendChat={sendChat}
+      convo={translator ? convo : undefined} // RoomShell reads its presence as the mode flag
+      myLang={myLang}
+      onChangeLang={handleChangeLang}
+      readAloud={readAloud}
+      onReadAloud={setReadAloud}
+      headphones={headphones}
+      onHeadphones={setHeadphones}
     />
   );
 }

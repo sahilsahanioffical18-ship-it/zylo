@@ -28,6 +28,7 @@ function toCard(row, userId) {
     admission: row.admission,
     screenSharePolicy: row.screen_share_policy,
     maxParticipants: row.max_participants,
+    mode: row.mode,
     host: { name: row.host_name },
     isHost: row.host_id === userId,
     participants: row.participants,
@@ -80,14 +81,14 @@ function meetingsRouter(db, livekit) {
       try {
         await db.query(
           `WITH m AS (
-             INSERT INTO meetings (id, host_id, title, admission, screen_share_policy, max_participants, scheduled_for)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+             INSERT INTO meetings (id, host_id, title, admission, screen_share_policy, max_participants, scheduled_for, mode)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $9) RETURNING id
            ), invites AS (
              INSERT INTO meeting_invites (meeting_id, email) SELECT m.id, unnest($8::text[]) FROM m
            )
            SELECT id FROM m`,
           [id, req.userId, value.title, value.admission, value.screenSharePolicy, value.maxParticipants,
-            value.scheduledFor, value.inviteEmails],
+            value.scheduledFor, value.inviteEmails, value.mode],
         );
         return res.status(201).json({ meeting: await getCard(db, id, req.userId) });
       } catch (err) {

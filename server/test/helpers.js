@@ -72,12 +72,12 @@ function insertUser(db, { id, email, name, imageUrl = null }) {
 
 function insertMeeting(
   db,
-  { id, hostId, title = 'ZyloCall', admission = 'auto', screenSharePolicy = 'anyone', maxParticipants = 20 },
+  { id, hostId, title = 'ZyloCall', admission = 'auto', screenSharePolicy = 'anyone', maxParticipants = 20, mode = 'standard' },
 ) {
   return db.query(
-    `INSERT INTO meetings (id, host_id, title, admission, screen_share_policy, max_participants)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [id, hostId, title, admission, screenSharePolicy, maxParticipants],
+    `INSERT INTO meetings (id, host_id, title, admission, screen_share_policy, max_participants, mode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [id, hostId, title, admission, screenSharePolicy, maxParticipants, mode],
   );
 }
 
@@ -85,13 +85,21 @@ function insertMeeting(
 // running the real room handlers. graceMs is short so grace expiry is testable.
 async function startRoom(
   db,
-  { meetingId = 'abc-defg-hij', admission = 'auto', screenSharePolicy = 'anyone', maxParticipants = 3, graceMs = 60, livekit = null } = {},
+  {
+    meetingId = 'abc-defg-hij',
+    admission = 'auto',
+    screenSharePolicy = 'anyone',
+    maxParticipants = 3,
+    graceMs = 60,
+    livekit = null,
+    mode = 'standard',
+  } = {},
 ) {
   await insertUser(db, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
   await insertUser(db, { id: 'p1', email: 'p1@zylo.test', name: 'Priya One' });
   await insertUser(db, { id: 'p2', email: 'p2@zylo.test', name: 'Pablo Two' });
   await insertUser(db, { id: 'p3', email: 'p3@zylo.test', name: 'Pia Three' });
-  await insertMeeting(db, { id: meetingId, hostId: 'host', admission, screenSharePolicy, maxParticipants });
+  await insertMeeting(db, { id: meetingId, hostId: 'host', admission, screenSharePolicy, maxParticipants, mode });
   const server = await startSocketServer((io) => {
     io.use(fakeSocketAuth);
     registerRoomHandlers(io, { db, graceMs, livekit });

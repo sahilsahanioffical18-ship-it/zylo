@@ -71,10 +71,16 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
   const [speaking, setSpeaking] = useState<Set<string>>(new Set());
   const [micMuted, setMicMuted] = useState<Set<string>>(new Set());
   const [screenTracks, setScreenTracks] = useState<Map<string, VideoTrack>>(new Map());
+  // The local mic's MediaStreamTrack, for Translator Convo's SpeechRecognition to
+  // recognize directly (start(track)) instead of opening a second mic stream.
+  // stopMicTrackOnMute defaults to false in livekit-client, so muting keeps this same
+  // track (just silenced) rather than swapping it out — see snapshot() below.
+  const [localMicTrack, setLocalMicTrack] = useState<MediaStreamTrack | null>(null);
 
-  // micOn/camOn start false and are only set once the room actually connects
-  // (seeded from prefsRef.current there) — never from `prefs` directly, so
-  // `prefs` never has to appear in a dependency array.
+  // micOn/camOn start false and are seeded from prefsRef.current once a connection
+  // attempt starts — never from `prefs` directly, so `prefs` never has to appear in
+  // a dependency array. They are the user's CHOICE: the two media effects below
+  // only apply it to the Room once status is 'connected'.
   const [micOn, setMicOn] = useState(false);
   const [camOn, setCamOn] = useState(false);
 
@@ -101,6 +107,15 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
       if (cancelled) return;
       setStatus('connecting');
       setError(null);
+      // Seeded when connecting STARTS, not on success: the mic button (and
+      // Translator Convo's captions, which follow it) must reflect the pre-join
+      // choice even if video never connects. Once per hook instance — see
+      // hasSeededRef for why a reconnect must not re-seed.
+      if (!hasSeededRef.current) {
+        hasSeededRef.current = true;
+        setMicOn(prefsRef.current.micOn);
+        setCamOn(prefsRef.current.camOn);
+      }
     });
 
     // adaptiveStream/dynacast are RoomOptions (constructor). autoSubscribe is a
@@ -166,6 +181,13 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
       setMicMuted(muted);
       setSpeaking(speakers);
       setScreenTracks(screens);
+
+      // Identity (the MediaStreamTrack's own id), not object identity: publish,
+      // unpublish and republish all produce a new track object here, but a mute
+      // toggle re-invokes snapshot() (TrackMuted/TrackUnmuted) with the SAME track,
+      // and the functional update below keeps that render a no-op.
+      const micTrack = localMic?.track?.mediaStreamTrack ?? null;
+      setLocalMicTrack((prev) => (prev?.id === micTrack?.id ? prev : micTrack));
     }
 
     // Every remote audio publication gets subscribed regardless of video — we
@@ -293,17 +315,9 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
         order = [...room.remoteParticipants.keys()];
         apply();
         snapshot();
+        // The two media effects below apply micOn/camOn (seeded when connecting
+        // started) to this Room, and reapply the latest choice after a reconnect.
         setStatus('connected');
-        // Seed mic/cam from the pre-join prefs once, ever — not on every
-        // reconnect. After the first connect this is a no-op: micOn/camOn
-        // already hold the user's latest in-meeting choice, and the two media
-        // effects below reapply that choice to the fresh Room on their own
-        // once `status` cycles back to 'connected'.
-        if (!hasSeededRef.current) {
-          hasSeededRef.current = true;
-          setMicOn(prefsRef.current.micOn);
-          setCamOn(prefsRef.current.camOn);
-        }
       } catch (err) {
         if (cancelled) return;
         setStatus('error');
@@ -322,6 +336,7 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
       setSpeaking(new Set());
       setMicMuted(new Set());
       setScreenTracks(new Map());
+      setLocalMicTrack(null);
       // The AudioPlaybackStatusChanged listener above is gone (removeAllListeners
       // just ran), but its toast isn't: without this it survives past Leave onto
       // the dashboard, and its "Turn on sound" button would call startAudio() on
@@ -461,5 +476,6 @@ export function useLiveKitRoom(meetingId: string | null, prefs: MediaPrefs, shar
     toggleCam,
     screenTracks,
     stopScreenShare,
+    localMicTrack,
   };
 }

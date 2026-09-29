@@ -181,6 +181,7 @@ export function PeoplePanel({
   onMute,
   onStopShare,
   onKick,
+  translator = false,
 }: {
   people: Person[];
   lobby: LobbyEntry[];
@@ -199,13 +200,16 @@ export function PeoplePanel({
   onMute: (userId: string) => void;
   onStopShare: (userId: string) => void;
   onKick: (userId: string) => void;
+  // A translator convo is always auto (link-shared, 2 seats) and the server ignores
+  // this setting for it, so it's hidden here rather than shown but inert.
+  translator?: boolean;
 }) {
   // The room is exactly one screen tall, so nothing here can rely on the page
   // scrolling: the panel scrolls itself once settings + lobby outgrow it, and the
   // people list keeps min-h-40 so it never collapses to nothing.
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto">
-      {isHost && (
+      {isHost && !translator && (
         <ChoiceGroup
           legend="Admission"
           name="room-admission"

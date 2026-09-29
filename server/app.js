@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { meetingsRouter } = require('./lib/meetings');
+const { googleRouter } = require('./lib/google');
 const { livekitWebhook } = require('./lib/webhook');
 
 // Both probes mean "can we actually reach it", not "is it configured" — a
@@ -14,7 +15,8 @@ async function reachable(probe) {
   try { await probe(); return true; } catch { return false; }
 }
 
-function createApp({ db, auth, livekit }) {
+// `google` is only ever set by tests (a fake Google + a fresh cache).
+function createApp({ db, auth, livekit, google = {} }) {
   const app = express();
   app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000' }));
   // Before express.json(), deliberately: the webhook verifies a signature over the
@@ -37,6 +39,7 @@ function createApp({ db, auth, livekit }) {
   });
   app.use('/api', auth);
 
+  app.use('/api', googleRouter(google)); // /api/tts and /api/translate
   if (db) app.use('/api', meetingsRouter(db, livekit));
 
   app.use((err, _req, res, _next) => {

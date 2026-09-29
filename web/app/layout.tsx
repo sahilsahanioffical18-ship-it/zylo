@@ -7,7 +7,10 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { brand } from '@/lib/brand';
 import './globals.css';
 
-const sans = Plus_Jakarta_Sans({ variable: '--font-sans', subsets: ['latin'] });
+// cyrillic-ext + a generic fallback: without them, Russian falls outside this font's
+// downloaded glyphs and Hindi (no Devanagari glyphs in this font at all) both land on
+// whatever serif the browser picks by default, instead of a sans-serif caption.
+const sans = Plus_Jakarta_Sans({ variable: '--font-sans', subsets: ['latin', 'cyrillic-ext'], fallback: ['system-ui', 'sans-serif'] });
 
 export const metadata: Metadata = {
   title: { default: brand.product, template: `%s · ${brand.product}` },

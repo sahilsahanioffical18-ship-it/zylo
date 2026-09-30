@@ -4,8 +4,8 @@ const { createHash } = require('node:crypto');
 const { AccessToken } = require('livekit-server-sdk');
 const { createApp } = require('../app');
 const { createLivekit } = require('../lib/livekit');
-const seats = require('../lib/seats');
-const { listen, fakeAuth } = require('./helpers');
+const { createRoomStore } = require('../lib/roomStore');
+const { listen, fakeAuth, setupTestRedis, seatInStore } = require('./helpers');
 
 const API_KEY = 'devkey';
 const API_SECRET = 'secret';
@@ -14,11 +14,11 @@ const MEETING_ID = 'web-hook-evt';
 // The real createLivekit — so the signature check and evict are the real code —
 // over a RoomServiceClient stand-in that records removals. db: null on purpose:
 // the webhook must not depend on /api's guards.
-async function start(t, { configured = true } = {}) {
+async function start(t, { configured = true, store = null } = {}) {
   const removed = [];
   const rooms = { removeParticipant: async (room, identity) => { removed.push([room, identity]); } };
   const livekit = configured ? createLivekit({ url: 'ws://127.0.0.1:7880', apiKey: API_KEY, apiSecret: API_SECRET, rooms }) : null;
-  const server = await listen(createApp({ db: null, auth: fakeAuth, livekit }));
+  const server = await listen(createApp({ db: null, auth: fakeAuth, livekit, store }));
   t.after(() => server.close());
   return { server, removed };
 }
@@ -75,7 +75,8 @@ test('a webhook whose body changed after signing is rejected', async (t) => {
 });
 
 test('someone joining LiveKit without a seat is evicted', async (t) => {
-  const { server, removed } = await start(t);
+  const store = createRoomStore(await setupTestRedis(t), { serverId: 'test' });
+  const { server, removed } = await start(t, { store });
   const body = event('participant_joined', 'intruder');
   const authorization = await sign(body);
   const status = await post(server, body, { authorization });
@@ -84,9 +85,9 @@ test('someone joining LiveKit without a seat is evicted', async (t) => {
 });
 
 test('a seat holder joining LiveKit is left alone', async (t) => {
-  const { server, removed } = await start(t);
-  seats.tryTakeSeat(MEETING_ID, { userId: 'p1', socketId: 's1', name: 'Priya One', imageUrl: null, isHost: false, max: 20 });
-  t.after(() => seats.clearMeeting(MEETING_ID));
+  const store = createRoomStore(await setupTestRedis(t), { serverId: 'test' });
+  const { server, removed } = await start(t, { store });
+  await seatInStore(store, MEETING_ID, { userId: 'p1', socketId: 's1', name: 'Priya One' });
   const body = event('participant_joined', 'p1');
   const authorization = await sign(body);
   const status = await post(server, body, { authorization });

@@ -3,8 +3,17 @@ const assert = require('node:assert/strict');
 const { TokenVerifier, TrackSource } = require('livekit-server-sdk');
 const { createLivekit } = require('../lib/livekit');
 const { createApp } = require('../app');
-const seats = require('../lib/seats');
-const { listen, fakeAuth, setupTestDb, insertUser, insertMeeting } = require('./helpers');
+const { createRoomStore } = require('../lib/roomStore');
+const {
+  listen,
+  fakeAuth,
+  setupTestDb,
+  connectTestRedis,
+  unlimitedLimiter,
+  seatInStore,
+  insertUser,
+  insertMeeting,
+} = require('./helpers');
 
 const API_KEY = 'devkey';
 const API_SECRET = 'secret';
@@ -163,12 +172,16 @@ async function tokenApi(server, userId, id) {
 }
 
 let tokenDb;
+let redis; // one Redis for the file; each test that seats someone clears its meeting afterwards
+let store;
 let good; // working livekit: real mintToken, recording ensureRoom/ping stubs
 let noLivekit; // app built with livekit: null
 let broken; // livekit whose ensureRoom rejects the way the real server does when unreachable
 
 before(async () => {
   tokenDb = await setupTestDb();
+  redis = await connectTestRedis();
+  store = createRoomStore(redis, { serverId: 'test' });
   await insertUser(tokenDb, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
   // Deliberately NOT 'Priya One' — the seat is given that name below, and the
   // whole point of test 5 is that the token's name can only come from the seat,
@@ -181,9 +194,9 @@ before(async () => {
   const { livekit, ensureRoomCalls, callOrder } = fakeLivekit();
   good = {
     livekit, ensureRoomCalls, callOrder,
-    server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit })),
+    server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit, store, limiter: unlimitedLimiter })),
   };
-  noLivekit = { server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit: null })) };
+  noLivekit = { server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit: null, store, limiter: unlimitedLimiter })) };
 
   const brokenLivekit = fakeLivekit().livekit;
   // The real observed failure: LiveKit's ServerError carries `.status = 401` —
@@ -195,7 +208,7 @@ before(async () => {
       { name: 'Unauthorized', status: 401 },
     );
   };
-  broken = { server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit: brokenLivekit })) };
+  broken = { server: await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit: brokenLivekit, store, limiter: unlimitedLimiter })) };
 });
 
 after(async () => {
@@ -204,6 +217,9 @@ after(async () => {
   await broken.server.close();
   await tokenDb.close();
 });
+
+// Its own hook: a before() that failed halfway must still close the connection.
+after(() => redis?.disconnect());
 
 test('a malformed meeting code is rejected before anything else', async () => {
   const { status, body } = await tokenApi(good.server, 'p1', 'not-a-code');
@@ -229,10 +245,8 @@ test('a token request without a seat is refused', async () => {
 });
 
 test('a seat holder gets a token scoped to their meeting and identity', async (t) => {
-  seats.tryTakeSeat(MEETING_ID, {
-    userId: 'p1', socketId: 's1', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
-  });
-  t.after(() => seats.clearMeeting(MEETING_ID));
+  await seatInStore(store, MEETING_ID, { userId: 'p1', socketId: 's1', name: 'Priya One' });
+  t.after(() => store.clearMeeting(MEETING_ID));
 
   const { status, body } = await tokenApi(good.server, 'p1', MEETING_ID);
   assert.equal(status, 200);
@@ -246,10 +260,8 @@ test('a seat holder gets a token scoped to their meeting and identity', async (t
 });
 
 test("the LiveKit room is created with the meeting's cap before the token is minted", async (t) => {
-  seats.tryTakeSeat(MEETING_ID, {
-    userId: 'p1', socketId: 's1', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
-  });
-  t.after(() => seats.clearMeeting(MEETING_ID));
+  await seatInStore(store, MEETING_ID, { userId: 'p1', socketId: 's1', name: 'Priya One' });
+  t.after(() => store.clearMeeting(MEETING_ID));
   good.ensureRoomCalls.length = 0;
   good.callOrder.length = 0;
 
@@ -262,20 +274,16 @@ test("the LiveKit room is created with the meeting's cap before the token is min
 });
 
 test('a seat for a meeting that no longer exists gets 404, not 500', async (t) => {
-  seats.tryTakeSeat(MISSING_MEETING_ID, {
-    userId: 'p1', socketId: 's2', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
-  });
-  t.after(() => seats.clearMeeting(MISSING_MEETING_ID));
+  await seatInStore(store, MISSING_MEETING_ID, { userId: 'p1', socketId: 's2', name: 'Priya One' });
+  t.after(() => store.clearMeeting(MISSING_MEETING_ID));
 
   const { status } = await tokenApi(good.server, 'p1', MISSING_MEETING_ID);
   assert.equal(status, 404);
 });
 
 test('a removed user is refused even though they still hold a seat', async (t) => {
-  seats.tryTakeSeat(MEETING_ID, {
-    userId: 'p2', socketId: 's3', name: 'Pablo Two', imageUrl: null, isHost: false, max: 20,
-  });
-  t.after(() => seats.clearMeeting(MEETING_ID));
+  await seatInStore(store, MEETING_ID, { userId: 'p2', socketId: 's3', name: 'Pablo Two' });
+  t.after(() => store.clearMeeting(MEETING_ID));
   await tokenDb.query(
     `INSERT INTO meeting_participants (meeting_id, user_id, role, removed_at) VALUES ($1, 'p2', 'participant', now())`,
     [MEETING_ID],
@@ -287,10 +295,8 @@ test('a removed user is refused even though they still hold a seat', async (t) =
 });
 
 test('an unreachable LiveKit is a 503, not a 500', async (t) => {
-  seats.tryTakeSeat(MEETING_ID, {
-    userId: 'p1', socketId: 's4', name: 'Priya One', imageUrl: null, isHost: false, max: 20,
-  });
-  t.after(() => seats.clearMeeting(MEETING_ID));
+  await seatInStore(store, MEETING_ID, { userId: 'p1', socketId: 's4', name: 'Priya One' });
+  t.after(() => store.clearMeeting(MEETING_ID));
 
   const { status, body } = await tokenApi(broken.server, 'p1', MEETING_ID);
   assert.equal(status, 503);
@@ -423,14 +429,14 @@ test('a seat released while the room is being created gets 403, not a token', as
   // The race the re-check exists for: a kick, a Leave or a grace expiry lands
   // during the ensureRoom await, after the route's first seat check passed.
   livekit.ensureRoom = async () => {
-    seats.releaseSeat(MEETING_ID, 'p1', { immediate: true });
+    await store.releaseSeat(MEETING_ID, 'p1');
   };
-  const server = await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit }));
+  const server = await listen(createApp({ db: tokenDb, auth: fakeAuth, livekit, store, limiter: unlimitedLimiter }));
   t.after(async () => {
     await server.close();
-    seats.clearMeeting(MEETING_ID);
+    await store.clearMeeting(MEETING_ID);
   });
-  seats.tryTakeSeat(MEETING_ID, { userId: 'p1', socketId: 's5', name: 'Priya One', imageUrl: null, isHost: false, max: 20 });
+  await seatInStore(store, MEETING_ID, { userId: 'p1', socketId: 's5', name: 'Priya One' });
 
   const { status, body } = await tokenApi(server, 'p1', MEETING_ID);
   assert.equal(status, 403);

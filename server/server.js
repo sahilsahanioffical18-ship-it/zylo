@@ -1,6 +1,7 @@
 require('dotenv').config({ quiet: true });
 
 const fs = require('node:fs');
+const { randomUUID } = require('node:crypto');
 const http = require('node:http');
 const path = require('node:path');
 const { Server } = require('socket.io');
@@ -9,6 +10,7 @@ const { createDb } = require('./lib/db');
 const { createLivekit } = require('./lib/livekit');
 const { createRedis } = require('./lib/redis');
 const { createLimiter } = require('./lib/rateLimit');
+const { createRoomStore } = require('./lib/roomStore');
 const { limitConnections } = require('./lib/limitMiddleware');
 const { createCache, createRedisCache } = require('./lib/cache');
 const { clerkAuth, clerkSocketAuth } = require('./lib/auth');
@@ -32,6 +34,8 @@ async function main() {
   const redis = createRedis();
   if (!redis) console.warn("WARNING: REDIS_URL is not set — rate limits and the translation cache stay in this server's memory.");
   const limiter = createLimiter({ redis });
+  // One id per process: seats and the screen lock record which server holds them.
+  const store = redis ? createRoomStore(redis, { serverId: randomUUID() }) : null;
   // Proxy hops to trust for the client IP: a non-negative integer, else 0 (a bad value must not silently pass).
   const rawTrust = (process.env.TRUST_PROXY || '').trim();
   const validTrust = /^\d+$/.test(rawTrust);
@@ -41,23 +45,23 @@ async function main() {
   if (db) {
     try {
       await db.query(fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8'));
-      // A crash leaves meetings marked live; in-memory seats did not survive it.
-      await closeStaleMeetings(db);
+      // A crash leaves meetings marked live and rooms in Redis; with one API server, both are stale now.
+      if (store) await closeStaleMeetings(db, store);
     } catch (err) {
       console.warn(`WARNING: could not apply db/schema.sql (${err.message}). Is Postgres running? Try: npm run db:up`);
     }
   }
 
   const app = createApp({
-    db, auth: clerkAuth({ db }), livekit, redis, limiter, trustProxy,
+    db, auth: clerkAuth({ db }), livekit, redis, limiter, trustProxy, store,
     google: { cache: redis ? createRedisCache(redis) : createCache() },
   });
   const httpServer = http.createServer(app);
   const io = new Server(httpServer, { cors: { origin: CLIENT_ORIGIN } });
   io.use(limitConnections(limiter, trustProxy)); // before auth: a flood never reaches token checks
   io.use(clerkSocketAuth({ db }));
-  if (db) registerRoomHandlers(io, { db, livekit });
-  else console.warn('WARNING: DATABASE_URL is not set — ZyloRoom sockets will refuse every join request.');
+  if (db && store) registerRoomHandlers(io, { db, livekit, store });
+  else console.warn('WARNING: DATABASE_URL or REDIS_URL is not set — ZyloRoom sockets will refuse every join request.');
 
   httpServer.listen(PORT, () => console.log(`Zylo API listening on :${PORT}`));
 }

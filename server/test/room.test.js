@@ -1,36 +1,32 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const seats = require('../lib/seats');
 const { registerRoomHandlers, closeStaleMeetings } = require('../lib/room');
+const { createRoomStore } = require('../lib/roomStore');
 const {
   setupTestDb,
+  setupTestRedis,
+  connectTestRedis,
+  seedMeeting,
   fakeSocketAuth,
   startSocketServer,
+  startRoom,
+  takeOverSeat,
+  seatInStore,
   connectClient,
   waitForEvent,
+  settle,
   insertUser,
   insertMeeting,
 } = require('./helpers');
 
 // setupTestDb truncates every table and node:test runs these sequentially, so one
-// id is enough. t.after clears the in-memory seat state to match.
+// id is enough. Each startRoom brings a freshly emptied Redis to match.
 const MEETING_ID = 'abc-defg-hij';
 
 // maxParticipants = 3 everywhere, matching the spec's acceptance list:
 // the host plus 2 others.
 async function scenario(db, { admission = 'auto', maxParticipants = 3 } = {}) {
-  const meetingId = MEETING_ID;
-  await insertUser(db, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
-  await insertUser(db, { id: 'p1', email: 'p1@zylo.test', name: 'Priya One' });
-  await insertUser(db, { id: 'p2', email: 'p2@zylo.test', name: 'Pablo Two' });
-  await insertUser(db, { id: 'p3', email: 'p3@zylo.test', name: 'Pia Three' });
-  await insertMeeting(db, { id: meetingId, hostId: 'host', admission, maxParticipants });
-
-  const server = await startSocketServer((io) => {
-    io.use(fakeSocketAuth);
-    registerRoomHandlers(io, { db, graceMs: 60 });
-  });
-  return { meetingId, server };
+  return startRoom(db, { admission, maxParticipants });
 }
 
 test('auto mode: two people race for the last seat, exactly one is admitted', async (t) => {
@@ -40,7 +36,6 @@ test('auto mode: two people race for the last seat, exactly one is admitted', as
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -84,7 +79,6 @@ test('auto mode: an explicit leave admits the waiting user', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -117,12 +111,11 @@ test('a dropped connection keeps the seat for the grace period, then frees it', 
   const db = await setupTestDb();
   // Same reasoning as the previous test: max 2 so host + p1 fill the one
   // non-host slot, making p2's solo request queue instead of being admitted.
-  const { meetingId, server } = await scenario(db, { maxParticipants: 2 });
+  const { meetingId, server, store } = await scenario(db, { maxParticipants: 2 });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -144,20 +137,65 @@ test('a dropped connection keeps the seat for the grace period, then frees it', 
   p1.disconnect();
   // graceMs is 60 in these tests; the seat must still be held well inside it.
   await new Promise((r) => setTimeout(r, 15));
-  assert.equal(seats.hasSeat(meetingId, 'p1'), true);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), true);
 
   await waitForEvent(c2, 'meeting:admitted');
-  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), false);
+});
+
+// The grace timer must not start until Redis has stamped the deadline: a timer that
+// fires first finds nothing overdue, and the seat would never be freed.
+test('a dropped seat is still freed when stamping its grace deadline is slower than the grace period', async (t) => {
+  const db = await setupTestDb();
+  const redis = await connectTestRedis();
+  const meetingId = await seedMeeting(db, { maxParticipants: 2 });
+  const real = createRoomStore(redis, { serverId: 'slow' });
+  const store = { ...real, markGrace: async (...args) => { await settle(150); return real.markGrace(...args); } };
+  let handlers;
+  const server = await startSocketServer((io) => {
+    io.use(fakeSocketAuth);
+    handlers = registerRoomHandlers(io, { db, graceMs: 60, store });
+  });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await settle(300); // in-flight disconnect handling
+    handlers.stop();
+    await server.close();
+    await redis.quit();
+    await db.close();
+  });
+
+  for (const userId of ['host', 'p1']) {
+    const c = connectClient(server.url, userId);
+    clients.push(c);
+    const admitted = waitForEvent(c, 'meeting:admitted');
+    c.emit('meeting:join-request', { meetingId });
+    await admitted;
+  }
+  const [, p1] = clients;
+  const p2 = connectClient(server.url, 'p2');
+  clients.push(p2);
+  const waiting = waitForEvent(p2, 'meeting:waiting');
+  p2.emit('meeting:join-request', { meetingId });
+  await waiting;
+
+  const admitted = [];
+  p2.on('meeting:admitted', () => admitted.push(true));
+  p1.disconnect();
+  await settle(600);
+
+  assert.equal(admitted.length, 1);
+  assert.equal(await real.hasSeat(meetingId, 'p1'), false);
 });
 
 test('a second tab takes the seat over and the first tab is told', async (t) => {
   const db = await setupTestDb();
-  const { meetingId, server } = await scenario(db);
+  const { meetingId, server, store } = await scenario(db);
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -174,12 +212,12 @@ test('a second tab takes the seat over and the first tab is told', async (t) => 
   second.emit('meeting:join-request', { meetingId });
   await Promise.all([replaced, secondAdmitted]);
 
-  assert.equal(seats.listSeats(meetingId).length, 1);
+  assert.equal((await store.listSeats(meetingId)).length, 1);
 
   // The replaced tab must not be able to release the new tab's seat.
   first.disconnect();
   await new Promise((r) => setTimeout(r, 60));
-  assert.equal(seats.hasSeat(meetingId, 'p1'), true);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), true);
 });
 
 test('a request for an unknown meeting is denied', async (t) => {
@@ -189,7 +227,6 @@ test('a request for an unknown meeting is denied', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -207,7 +244,6 @@ test('a removed user cannot rejoin', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -226,12 +262,11 @@ test('a removed user cannot rejoin', async (t) => {
 test('a stale tab dropping out of the queue does not evict a newer tab for the same user', async (t) => {
   const db = await setupTestDb();
   // max 2 so host + p1 fill the room's one non-host slot, putting p2 in the queue.
-  const { meetingId, server } = await scenario(db, { maxParticipants: 2 });
+  const { meetingId, server, store } = await scenario(db, { maxParticipants: 2 });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -263,8 +298,8 @@ test('a stale tab dropping out of the queue does not evict a newer tab for the s
   // It must not evict tab B's queue entry.
   tabA.disconnect();
   await new Promise((r) => setTimeout(r, 30));
-  assert.equal(seats.queuedEntries(meetingId).length, 1);
-  assert.equal(seats.queueSocketId(meetingId, 'p2'), tabB.id);
+  assert.equal((await store.queuedEntries(meetingId)).length, 1);
+  assert.equal(await store.queueSocketId(meetingId, 'p2'), tabB.id);
 
   // When a seat frees, tab B — not the dropped tab A — is the one admitted.
   const admittedB = waitForEvent(tabB, 'meeting:admitted');
@@ -279,7 +314,6 @@ test('manual mode: the host sees the lobby, admits and denies', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -331,12 +365,11 @@ test('manual mode: the host sees the lobby, admits and denies', async (t) => {
 
 test('manual mode: admitting into a full ZyloRoom is refused, and they stay in the lobby', async (t) => {
   const db = await setupTestDb();
-  const { meetingId, server } = await scenario(db, { admission: 'manual' });
+  const { meetingId, server, store } = await scenario(db, { admission: 'manual' });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -364,19 +397,18 @@ test('manual mode: admitting into a full ZyloRoom is refused, and they stay in t
   // max is 3 (host + 2), so the third admit must be refused.
   const ack = await new Promise((resolve) => host.emit('lobby:admit', { userId: 'p3' }, resolve));
   assert.deepEqual(ack, { ok: false, reason: 'full' });
-  assert.equal(seats.hasSeat(meetingId, 'p3'), false);
-  assert.deepEqual(seats.queuedEntries(meetingId).map((e) => e.userId), ['p3']);
+  assert.equal(await store.hasSeat(meetingId, 'p3'), false);
+  assert.deepEqual((await store.queuedEntries(meetingId)).map((e) => e.userId), ['p3']);
   c3.disconnect();
 });
 
 test('a non-host lobby:admit is forbidden', async (t) => {
   const db = await setupTestDb();
-  const { meetingId, server } = await scenario(db, { admission: 'manual' });
+  const { meetingId, server, store } = await scenario(db, { admission: 'manual' });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -412,7 +444,7 @@ test('a non-host lobby:admit is forbidden', async (t) => {
   const forbidden = waitForEvent(c1, 'error:forbidden');
   c1.emit('lobby:admit', { userId: 'p2' });
   await forbidden;
-  assert.equal(seats.hasSeat(meetingId, 'p2'), false);
+  assert.equal(await store.hasSeat(meetingId, 'p2'), false);
 
   // A waiting user has a meetingId too, and is just as forbidden.
   const forbiddenAgain = waitForEvent(c2, 'error:forbidden');
@@ -427,7 +459,6 @@ test('switching manual to auto drains the lobby in order until seats run out', a
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -477,7 +508,6 @@ test('everyone leaving ends the meeting in the database', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -522,7 +552,6 @@ test('ZyloChat reaches seated members only, with the name taken from the seat', 
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -589,7 +618,6 @@ test('a waiting user cannot send ZyloChat', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -627,7 +655,6 @@ test('ZyloChat drops everything that fails validation, silently', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -665,8 +692,6 @@ test("a message never reaches a different meeting's ZyloRoom", async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
-    seats.clearMeeting(OTHER_MEETING_ID);
     await db.close();
   });
 
@@ -703,7 +728,6 @@ test('a tab that was replaced cannot post to ZyloChat', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -740,25 +764,20 @@ test('a tab that was replaced cannot post to ZyloChat', async (t) => {
 });
 
 // Pins the seat.socketId !== socket.id guard by itself, deterministically. In the
-// real join path, seats.tryTakeSeat() moves the seat to a new socket
-// synchronously, but admit() only nulls the OLD socket's socket.data.meetingId
-// after two `await`s (upsertParticipant, markStarted) — so there is a real
-// window where the old socket's meetingId is still set and the seat already
-// points elsewhere. The 'a tab that was replaced cannot post' test above can't
-// land inside that window (by the time the client sees 'meeting:replaced', the
-// server has already nulled meetingId, so that test actually proves the
-// !meetingId guard). Here we recreate the window directly: call tryTakeSeat
-// against the seats module, bypassing admit() entirely, so p1's original socket
-// keeps its meetingId. If seat.socketId !== socket.id were ever deleted from the
-// handler, this is the test that would catch it.
+// real join path the store's join script moves the seat to the new socket, and the
+// old socket's socket.data.meetingId is never cleared (it may live on another
+// server): the socketId check is the only thing that stops a replaced tab acting.
+// Here we recreate that directly: take the seat over in the store, bypassing the
+// join handler entirely, so p1's original socket keeps its meetingId. If
+// seat.socketId !== socket.id were ever deleted from the handler, this is the test
+// that would catch it.
 test('a socket the seat no longer points at cannot post', async (t) => {
   const db = await setupTestDb();
-  const { meetingId, server } = await scenario(db);
+  const { meetingId, server, store } = await scenario(db);
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -777,16 +796,8 @@ test('a socket the seat no longer points at cannot post', async (t) => {
   // Repoint the seat to a synthetic socket without going through admit(), so
   // p1's real socket keeps socket.data.meetingId set even though the seat no
   // longer points at it.
-  const seat = seats.seatFor(meetingId, 'p1');
-  seats.tryTakeSeat(meetingId, {
-    userId: 'p1',
-    socketId: 'synthetic-other-tab',
-    name: seat.name,
-    imageUrl: seat.imageUrl,
-    isHost: false,
-    max: 3,
-  });
-  assert.equal(seats.seatFor(meetingId, 'p1').socketId, 'synthetic-other-tab');
+  await takeOverSeat(store, meetingId, 'p1', 'synthetic-other-tab');
+  assert.equal((await store.seatFor(meetingId, 'p1')).socketId, 'synthetic-other-tab');
 
   const hostChat = [];
   host.on('chat:message', (m) => hostChat.push(m));
@@ -804,7 +815,6 @@ test('a socket that never joined a meeting cannot post', async (t) => {
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -827,6 +837,82 @@ test('a socket that never joined a meeting cannot post', async (t) => {
   assert.equal(hostChat.length, 0);
 });
 
+// A lobby entry whose tab has already closed but whose entry is still queued (its
+// disconnect not yet handled, or handled on another server): put in the store directly.
+const closedTabEntry = { userId: 'p2', socketId: 'closed-tab', name: 'Pablo Two', imageUrl: null, lang: null };
+
+test('auto mode: a seat drained to a tab that already closed goes on to the next in the lobby', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server, store } = await scenario(db, { maxParticipants: 2 });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    await db.close();
+  });
+
+  for (const userId of ['host', 'p1']) {
+    const c = connectClient(server.url, userId);
+    clients.push(c);
+    const admitted = waitForEvent(c, 'meeting:admitted');
+    c.emit('meeting:join-request', { meetingId });
+    await admitted;
+  }
+  const [, p1] = clients;
+  assert.equal((await store.join(meetingId, closedTabEntry, { isHost: false })).result, 'queued');
+  const p3 = connectClient(server.url, 'p3');
+  clients.push(p3);
+  const waiting = waitForEvent(p3, 'meeting:waiting');
+  p3.emit('meeting:join-request', { meetingId });
+  await waiting;
+
+  const admitted = [];
+  p3.on('meeting:admitted', () => admitted.push(true));
+  p1.emit('meeting:leave');
+  await settle(300);
+
+  assert.equal(admitted.length, 1);
+  assert.equal(await store.hasSeat(meetingId, 'p2'), false);
+  assert.equal(await store.hasSeat(meetingId, 'p3'), true);
+});
+
+test('auto mode: the host admitting a tab that already closed hands the seat to the next in the lobby', async (t) => {
+  const db = await setupTestDb();
+  const { meetingId, server, store } = await scenario(db, { maxParticipants: 2 });
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await server.close();
+    await db.close();
+  });
+
+  for (const userId of ['host', 'p1']) {
+    const c = connectClient(server.url, userId);
+    clients.push(c);
+    const admitted = waitForEvent(c, 'meeting:admitted');
+    c.emit('meeting:join-request', { meetingId });
+    await admitted;
+  }
+  const [host] = clients;
+  assert.equal((await store.join(meetingId, closedTabEntry, { isHost: false })).result, 'queued');
+  const p3 = connectClient(server.url, 'p3');
+  clients.push(p3);
+  const waiting = waitForEvent(p3, 'meeting:waiting');
+  p3.emit('meeting:join-request', { meetingId });
+  await waiting;
+
+  // A seat frees without the handlers' drain (as if that call had not run yet).
+  await store.releaseSeat(meetingId, 'p1');
+  const admitted = [];
+  p3.on('meeting:admitted', () => admitted.push(true));
+  const ack = await new Promise((resolve) => host.emit('lobby:admit', { userId: 'p2' }, resolve));
+  await settle(300);
+
+  assert.deepEqual(ack, { ok: false, reason: 'gone' });
+  assert.equal(admitted.length, 1);
+  assert.equal(await store.hasSeat(meetingId, 'p3'), true);
+});
+
 test('the boot sweep closes meetings a crash left open', async (t) => {
   const db = await setupTestDb();
   t.after(async () => db.close());
@@ -836,7 +922,11 @@ test('the boot sweep closes meetings a crash left open', async (t) => {
   await insertMeeting(db, { id: 'fut-uree-eet', hostId: 'host' });
   await db.query("UPDATE meetings SET started_at = now() - interval '2 hours' WHERE id = 'sta-lemt-ing'");
 
-  await closeStaleMeetings(db);
+  const store = createRoomStore(await setupTestRedis(t), { serverId: 'boot' });
+  await seatInStore(store, 'sta-lemt-ing', { userId: 'p1' }); // a room the dead process left in Redis
+
+  await closeStaleMeetings(db, store);
+  assert.deepEqual(await store.liveMeetings(), []);
 
   const { rows } = await db.query('SELECT id, ended_at FROM meetings ORDER BY id');
   const byId = Object.fromEntries(rows.map((r) => [r.id, r.ended_at]));

@@ -1,7 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const seats = require('../lib/seats');
-const { roomHarness, waitForEvent, collect, settle, insertMeeting, connectClient } = require('./helpers');
+const { roomHarness, waitForEvent, collect, settle, insertMeeting, connectClient, takeOverSeat } = require('./helpers');
 
 const caption = (overrides = {}) => ({ id: 'cap-1', text: 'hello there', lang: 'hi', final: true, ...overrides });
 
@@ -130,11 +129,11 @@ test('a replaced tab cannot send a caption', async (t) => {
 });
 
 // Pins the seat.socketId !== socket.id check by itself, the same technique
-// translator.test.js and room.test.js use for convo:set-lang / chat:message: a
-// real stale socket gets filtered by socket.data.meetingId being nulled before
-// this line is ever reached, so this recreates the window directly.
+// translator.test.js and room.test.js use for convo:set-lang / chat:message: the
+// seat is taken over in the store, bypassing the join handler, so p1's real socket
+// keeps its meetingId while the seat has already moved on.
 test('a socket the seat no longer points at cannot send a caption', async (t) => {
-  const { meetingId, connect } = await roomHarness(t, { mode: 'translator', maxParticipants: 2 });
+  const { meetingId, connect, store } = await roomHarness(t, { mode: 'translator', maxParticipants: 2 });
 
   const host = connect('host');
   const hostAdmitted = waitForEvent(host, 'meeting:admitted');
@@ -146,17 +145,8 @@ test('a socket the seat no longer points at cannot send a caption', async (t) =>
   p1.emit('meeting:join-request', { meetingId, lang: 'hi' });
   await p1Admitted;
 
-  const seat = seats.seatFor(meetingId, 'p1');
-  seats.tryTakeSeat(meetingId, {
-    userId: 'p1',
-    socketId: 'synthetic-other-tab',
-    name: seat.name,
-    imageUrl: seat.imageUrl,
-    isHost: false,
-    max: 2,
-    lang: 'hi',
-  });
-  assert.equal(seats.seatFor(meetingId, 'p1').socketId, 'synthetic-other-tab');
+  await takeOverSeat(store, meetingId, 'p1', 'synthetic-other-tab');
+  assert.equal((await store.seatFor(meetingId, 'p1')).socketId, 'synthetic-other-tab');
 
   const hostCaptions = collect(host, 'convo:caption');
   p1.emit('convo:caption', caption());
@@ -284,7 +274,6 @@ test('no caption leak across meetings', async (t) => {
   const { db, meetingId, connect, server } = await roomHarness(t, { mode: 'translator', maxParticipants: 2 });
   const OTHER_MEETING_ID = 'oth-erme-eti';
   await insertMeeting(db, { id: OTHER_MEETING_ID, hostId: 'p2', mode: 'translator', maxParticipants: 2 });
-  t.after(() => seats.clearMeeting(OTHER_MEETING_ID));
 
   const host = connect('host');
   const hostAdmitted = waitForEvent(host, 'meeting:admitted');

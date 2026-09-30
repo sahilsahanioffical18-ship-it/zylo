@@ -1,17 +1,25 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const seats = require('../lib/seats');
-const { roomHarness, collect, settle, shareScreen, waitForEvent, setupTestDb, startRoom, seat } = require('./helpers');
+const {
+  roomHarness,
+  collect,
+  settle,
+  shareScreen,
+  waitForEvent,
+  setupTestDb,
+  startRoom,
+  seat,
+  takeOverSeat,
+} = require('./helpers');
 
 test('without LiveKit configured a ZyloLive request is answered unavailable', async (t) => {
   const db = await setupTestDb();
-  const { meetingId, server } = await startRoom(db); // livekit defaults to null
+  const { meetingId, server, store } = await startRoom(db); // livekit defaults to null
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await settle();
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -22,11 +30,11 @@ test('without LiveKit configured a ZyloLive request is answered unavailable', as
   await settle();
 
   assert.deepEqual(denied, [{ reason: 'unavailable' }]);
-  assert.equal(seats.screenSharer(meetingId), null);
+  assert.equal(await store.screenSharer(meetingId), null);
 });
 
 test('two people press ZyloLive at the same instant: exactly one is granted', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   await join('host');
   const p1 = await join('p1');
   const p2 = await join('p2');
@@ -46,7 +54,8 @@ test('two people press ZyloLive at the same instant: exactly one is granted', as
 
   const winnerUserId = p1Won ? 'p1' : 'p2';
   const loserDenied = p1Won ? denied2 : denied1;
-  assert.deepEqual(loserDenied, [{ reason: 'busy', sharerName: seats.seatFor(meetingId, winnerUserId).name }]);
+  const winnerName = (await store.seatFor(meetingId, winnerUserId)).name;
+  assert.deepEqual(loserDenied, [{ reason: 'busy', sharerName: winnerName }]);
   assert.equal(livekit.callsTo('grantScreenShare').length, 1);
 });
 
@@ -66,7 +75,7 @@ test('with policy host_only a participant is denied and the host is granted', as
 });
 
 test('a waiting user cannot take ZyloLive', async (t) => {
-  const { meetingId, livekit, connect, join } = await roomHarness(t, { maxParticipants: 2 });
+  const { meetingId, livekit, connect, join, store } = await roomHarness(t, { maxParticipants: 2 });
   await join('host');
   await join('p1');
 
@@ -83,40 +92,32 @@ test('a waiting user cannot take ZyloLive', async (t) => {
 
   assert.deepEqual(granted, []);
   assert.deepEqual(denied, []);
-  assert.equal(seats.screenSharer(meetingId), null);
+  assert.equal(await store.screenSharer(meetingId), null);
   assert.equal(livekit.callsTo('grantScreenShare').length, 0);
   assert.equal(console.error.mock.callCount(), 0);
 });
 
 test('a socket the seat no longer points at cannot take ZyloLive', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   await join('host');
   const p1 = await join('p1');
 
   // Repoint the seat to a synthetic socket without going through admit(), so
   // p1's real socket keeps socket.data.meetingId set even though the seat no
   // longer points at it. Same trick as room.test.js's chat test.
-  const seat = seats.seatFor(meetingId, 'p1');
-  seats.tryTakeSeat(meetingId, {
-    userId: 'p1',
-    socketId: 'synthetic-other-tab',
-    name: seat.name,
-    imageUrl: seat.imageUrl,
-    isHost: false,
-    max: 3,
-  });
+  await takeOverSeat(store, meetingId, 'p1', 'synthetic-other-tab');
 
   const granted = collect(p1, 'screen:granted');
   p1.emit('screen:request');
   await settle();
 
   assert.deepEqual(granted, []);
-  assert.equal(seats.screenSharer(meetingId), null);
+  assert.equal(await store.screenSharer(meetingId), null);
   assert.equal(livekit.callsTo('grantScreenShare').length, 0);
 });
 
 test('the sharer stopping releases the lock, revokes the permission and tells the room', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   const host = await join('host');
   const p1 = await join('p1');
 
@@ -126,12 +127,12 @@ test('the sharer stopping releases the lock, revokes the permission and tells th
   await settle();
 
   assert.deepEqual(states, [{ sharerUserId: null }]);
-  assert.equal(seats.screenSharer(meetingId), null);
+  assert.equal(await store.screenSharer(meetingId), null);
   assert.deepEqual(livekit.callsTo('revokeScreenShare'), [[meetingId, 'p1']]);
 });
 
 test('someone other than the sharer cannot stop the share', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   await join('host');
   const p1 = await join('p1');
   const p2 = await join('p2');
@@ -140,12 +141,12 @@ test('someone other than the sharer cannot stop the share', async (t) => {
   p2.emit('screen:stop');
   await settle();
 
-  assert.equal(seats.screenSharer(meetingId)?.userId, 'p1');
+  assert.equal((await store.screenSharer(meetingId))?.userId, 'p1');
   assert.equal(livekit.callsTo('revokeScreenShare').length, 0);
 });
 
 test('the sharer closing their tab frees the lock at once, not at grace expiry', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   const host = await join('host');
   const p1 = await join('p1');
 
@@ -154,7 +155,7 @@ test('the sharer closing their tab frees the lock at once, not at grace expiry',
   p1.disconnect();
   await settle(20); // well inside the 60ms grace window
 
-  assert.equal(seats.hasSeat(meetingId, 'p1'), true);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), true);
   assert.deepEqual(states, [{ sharerUserId: null }]);
   assert.deepEqual(livekit.callsTo('revokeScreenShare'), [[meetingId, 'p1']]);
 });
@@ -196,7 +197,7 @@ test('someone admitted mid-presentation is told who is presenting', async (t) =>
 });
 
 test('a grant LiveKit refuses is denied, and frees the lock for the next person', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   await join('host');
   const p1 = await join('p1');
   const p2 = await join('p2');
@@ -210,25 +211,25 @@ test('a grant LiveKit refuses is denied, and frees the lock for the next person'
   p1.emit('screen:request');
   await settle();
   assert.deepEqual(denied, [{ reason: 'unavailable' }]);
-  assert.equal(seats.screenSharer(meetingId), null);
+  assert.equal(await store.screenSharer(meetingId), null);
   // I3: the grant may have applied at LiveKit before it rejected (a timeout, a 5xx
   // after application), so the catch revokes too, not just releases the lock.
   assert.deepEqual(livekit.callsTo('revokeScreenShare'), [[meetingId, 'p1']]);
 
   livekit.grantScreenShare = recordingGrant;
   await shareScreen(p2);
-  assert.equal(seats.screenSharer(meetingId)?.userId, 'p2');
+  assert.equal((await store.screenSharer(meetingId))?.userId, 'p2');
 });
 
 test('a lock released while its grant is in flight is revoked again and never granted', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   await join('host');
   const p1 = await join('p1');
 
   livekit.grantScreenShare = async (mtgId, userId) => {
     livekit.calls.push(['grantScreenShare', mtgId, userId]);
     // What a host stop, a policy switch, or the tab closing does mid-grant.
-    seats.releaseScreenLock(mtgId, seats.screenSharer(mtgId).socketId);
+    await store.releaseScreenLock(mtgId, (await store.screenSharer(mtgId)).socketId);
   };
 
   const granted = collect(p1, 'screen:granted');

@@ -1,6 +1,5 @@
 const express = require('express');
 const { generateCode, isValidCode, validateCreateMeeting } = require('./meetingRules');
-const seats = require('./seats');
 const { limitRequests } = require('./limitMiddleware');
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -41,7 +40,7 @@ async function getCard(db, id, userId) {
   return rows[0] ? toCard(rows[0], userId) : null;
 }
 
-function meetingsRouter(db, livekit, limiter) {
+function meetingsRouter(db, livekit, limiter, store) {
   const router = express.Router();
   // Per user, on top of the app-wide 'api' limit: creating can spam, lookups can
   // guess codes, and every token request makes a call to LiveKit.
@@ -114,7 +113,7 @@ function meetingsRouter(db, livekit, limiter) {
     if (!isValidCode(id)) return res.status(400).json({ error: 'That is not a valid meeting code.' });
     if (!livekit) return res.status(503).json({ error: 'LIVEKIT is not configured on the server.' });
 
-    const seat = seats.seatFor(id, req.userId);
+    const seat = store ? await store.seatFor(id, req.userId) : null;
     if (!seat) return res.status(403).json({ error: 'You do not hold a seat in this meeting.' });
 
     const { rows } = await db.query(
@@ -142,7 +141,7 @@ function meetingsRouter(db, livekit, limiter) {
     // Re-check after the awaits above: a kick, a Leave or a grace expiry can release
     // the seat while the DB query and ensureRoom are in flight, and a token minted
     // now would outlive the seat by 10 minutes.
-    if (!seats.seatFor(id, req.userId)) return res.status(403).json({ error: 'You do not hold a seat in this meeting.' });
+    if (!(await store.seatFor(id, req.userId))) return res.status(403).json({ error: 'You do not hold a seat in this meeting.' });
 
     // Local signing, no network: nothing here for the 503 mapping to cover.
     const token = await livekit.mintToken({ meetingId: id, userId: req.userId, name: seat.name });

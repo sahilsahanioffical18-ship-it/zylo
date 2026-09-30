@@ -19,7 +19,7 @@ async function reachable(probe) {
 
 // `google` is only ever set by tests (a fake Google + a fresh cache) and server.js
 // (the Redis cache). Without a `limiter`, one is made on `redis` (memory without it).
-function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ redis }), trustProxy = 0, google = {} }) {
+function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ redis }), trustProxy = 0, google = {}, store = null }) {
   const app = express();
   // TRUST_PROXY hops: behind our load balancer req.ip must be the client, not the
   // balancer, or every user would share one per-IP bucket.
@@ -33,7 +33,7 @@ function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ 
   // raw bytes. Outside /api, deliberately: Clerk cannot authenticate LiveKit. Before
   // the IP limit, deliberately: it is signed already, and dropping one could leave a
   // removed person in the room. Not mounted without LiveKit: no secret to verify with.
-  if (livekit) app.use(livekitWebhook(livekit));
+  if (livekit) app.use(livekitWebhook(livekit, store));
   app.use(limitRequests(limiter, 'ip', (req) => req.ip));
   app.use(express.json({ limit: '32kb' }));
 
@@ -55,7 +55,7 @@ function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ 
   app.use('/api', limitRequests(limiter, 'api', (req) => req.userId));
 
   app.use('/api', googleRouter({ ...google, limiter })); // /api/tts and /api/translate
-  if (db) app.use('/api', meetingsRouter(db, livekit, limiter));
+  if (db) app.use('/api', meetingsRouter(db, livekit, limiter, store));
 
   app.use((err, _req, res, _next) => {
     const status = err.status || err.statusCode || 500;

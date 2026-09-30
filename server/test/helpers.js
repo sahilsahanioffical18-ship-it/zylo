@@ -4,7 +4,7 @@ const { createDb } = require('../lib/db');
 const http = require('node:http');
 const { Server } = require('socket.io');
 const { io: ioClient } = require('socket.io-client');
-const seats = require('../lib/seats');
+const { createRoomStore } = require('../lib/roomStore');
 const { registerRoomHandlers } = require('../lib/room');
 const { createRedis, whenReady } = require('../lib/redis');
 
@@ -35,15 +35,25 @@ const quietLog = { warn: () => {} };
 // For suites that test something else and would trip a real limit by volume alone.
 const unlimitedLimiter = { take: async () => ({ allowed: true, remaining: 1, retryAfterMs: 0 }) };
 
-// A clean Redis for one test: database 1 (never the dev data in 0), emptied first,
-// closed when the test ends. Needs `npm run db:up`.
-async function setupTestRedis(t) {
+// A clean Redis connection the caller closes: database 1 (never the dev data in 0),
+// emptied first. Needs `npm run db:up`. A dead Redis fails here and the client is
+// closed on the way out, so it never keeps reconnecting and holds the test process open.
+async function connectTestRedis() {
   const redis = createRedis(process.env.TEST_REDIS_URL || 'redis://localhost:6379/1', { log: quietLog });
-  // Registered before anything can throw, so a failed connect never leaks a client
-  // that keeps reconnecting and holds the test process open.
+  try {
+    await whenReady(redis);
+    await redis.flushdb();
+  } catch (err) {
+    redis.disconnect();
+    throw err;
+  }
+  return redis;
+}
+
+// The same, closed when the test ends.
+async function setupTestRedis(t) {
+  const redis = await connectTestRedis();
   t.after(() => redis.disconnect());
-  await whenReady(redis);
-  await redis.flushdb();
   return redis;
 }
 
@@ -99,30 +109,65 @@ function insertMeeting(
   );
 }
 
-// The four users and one meeting most socket tests need, and a Socket.IO server
-// running the real room handlers. graceMs is short so grace expiry is testable.
-async function startRoom(
+// The four users and one meeting most socket tests need.
+async function seedMeeting(
   db,
-  {
-    meetingId = 'abc-defg-hij',
-    admission = 'auto',
-    screenSharePolicy = 'anyone',
-    maxParticipants = 3,
-    graceMs = 60,
-    livekit = null,
-    mode = 'standard',
-  } = {},
+  { meetingId = 'abc-defg-hij', admission = 'auto', screenSharePolicy = 'anyone', maxParticipants = 3, mode = 'standard' } = {},
 ) {
   await insertUser(db, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
   await insertUser(db, { id: 'p1', email: 'p1@zylo.test', name: 'Priya One' });
   await insertUser(db, { id: 'p2', email: 'p2@zylo.test', name: 'Pablo Two' });
   await insertUser(db, { id: 'p3', email: 'p3@zylo.test', name: 'Pia Three' });
   await insertMeeting(db, { id: meetingId, hostId: 'host', admission, screenSharePolicy, maxParticipants, mode });
+  return meetingId;
+}
+
+// A Socket.IO server running the real room handlers on a room store. graceMs is
+// short so grace expiry is testable. close() lets in-flight disconnect handling
+// finish, stops the handlers' timers, closes the server, and lets the handling of
+// any socket that closing it disconnected finish too, while Redis is still up.
+async function startRoomServer(db, redis, { serverId = 'server-a', graceMs = 60, livekit = null } = {}) {
+  const store = createRoomStore(redis, { serverId });
+  let handlers;
   const server = await startSocketServer((io) => {
     io.use(fakeSocketAuth);
-    registerRoomHandlers(io, { db, graceMs, livekit });
+    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store });
   });
-  return { meetingId, server };
+  return {
+    url: server.url,
+    store,
+    handlers,
+    close: async () => {
+      await settle();
+      handlers.stop();
+      await server.close();
+      await settle();
+    },
+  };
+}
+
+// The four users, one meeting, and a room server. Brings its own Redis (closed by
+// server.close()) unless one is passed in.
+async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, ...meeting } = {}) {
+  const ownRedis = !redis;
+  const conn = redis ?? (await connectTestRedis());
+  let room;
+  let meetingId;
+  try {
+    meetingId = await seedMeeting(db, meeting);
+    room = await startRoomServer(db, conn, { serverId, graceMs, livekit });
+  } catch (err) {
+    if (ownRedis) conn.disconnect(); // fail, don't leak
+    throw err;
+  }
+  const close = async () => {
+    try {
+      await room.close();
+    } finally {
+      if (ownRedis) await conn.quit();
+    }
+  };
+  return { meetingId, server: { url: room.url, close }, store: room.store, handlers: room.handlers };
 }
 
 // Connects userId and resolves once they hold a seat.
@@ -170,29 +215,37 @@ async function shareScreen(client) {
 async function roomHarness(t, options = {}) {
   const db = await setupTestDb();
   const livekit = recordingLivekit();
-  const { meetingId, server } = await startRoom(db, { ...options, livekit });
+  const { meetingId, server, store } = await startRoom(db, { ...options, livekit });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
-    // Cancel any grace timers a disconnect just started before they can fire against
-    // a pool that's about to close — clearMeeting cancels them outright instead of
-    // racing settle()'s fixed delay against the timer's own graceMs.
-    seats.clearMeeting(meetingId);
-    // Give the server's own disconnect handling (onSeatFreed's DB query, among
-    // others) a chance to finish before the pool it needs goes away.
-    await settle();
     await server.close();
     await db.close();
   });
   const connect = (userId) => { const c = connectClient(server.url, userId); clients.push(c); return c; };
   const join = async (userId) => { const c = await seat(server.url, userId, meetingId); clients.push(c); return c; };
-  return { db, livekit, meetingId, server, connect, join };
+  return { db, livekit, meetingId, server, store, connect, join };
+}
+
+// Another tab taking this user's seat, as the real join path does it.
+async function takeOverSeat(store, meetingId, userId, socketId) {
+  const s = await store.seatFor(meetingId, userId);
+  return store.join(meetingId, { userId, socketId, name: s.name, imageUrl: s.imageUrl, lang: s.lang }, { isHost: s.isHost });
+}
+
+// A seat with no socket server behind it, for HTTP routes that only read the store.
+async function seatInStore(store, meetingId, { userId, socketId = `${userId}-socket`, name = userId, isHost = false }) {
+  await store.initMeta(meetingId, {
+    hostId: isHost ? userId : 'host', admission: 'auto', screenSharePolicy: 'anyone', maxParticipants: 20, mode: 'standard',
+  });
+  return store.join(meetingId, { userId, socketId, name, imageUrl: null, lang: null }, { isHost });
 }
 
 module.exports = {
   listen,
   fakeAuth,
   setupTestDb,
+  connectTestRedis,
   setupTestRedis,
   quietLog,
   unlimitedLimiter,
@@ -202,6 +255,8 @@ module.exports = {
   waitForEvent,
   insertUser,
   insertMeeting,
+  seedMeeting,
+  startRoomServer,
   startRoom,
   seat,
   collect,
@@ -209,4 +264,6 @@ module.exports = {
   recordingLivekit,
   roomHarness,
   shareScreen,
+  takeOverSeat,
+  seatInStore,
 };

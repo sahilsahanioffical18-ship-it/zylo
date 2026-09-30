@@ -3,6 +3,7 @@ const path = require('node:path');
 const { createDb } = require('../lib/db');
 const http = require('node:http');
 const { Server } = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
 const { io: ioClient } = require('socket.io-client');
 const { createRoomStore } = require('../lib/roomStore');
 const { registerRoomHandlers } = require('../lib/room');
@@ -127,12 +128,27 @@ async function seedMeeting(
 // finish, stops the handlers' timers, closes the server, and lets the handling of
 // any socket that closing it disconnected finish too, while Redis is still up.
 // decorateStore wraps the store the handlers get (a test counting or delaying calls).
-async function startRoomServer(db, redis, { serverId = 'server-a', graceMs = 60, livekit = null, decorateStore = (s) => s } = {}) {
+// adapter: true wires the Socket.IO Redis adapter, so several servers act as one. The
+// sweep timers never run here; tests call handlers.sweep() themselves.
+async function startRoomServer(
+  db,
+  redis,
+  { serverId = 'server-a', graceMs = 60, livekit = null, adapter = false, decorateStore = (s) => s } = {},
+) {
   const store = decorateStore(createRoomStore(redis, { serverId }));
+  // The adapter's own connections, with the offline queue on (as in server.js).
+  // duplicate() copies redis.js's 500 ms commandTimeout / 1 s socketTimeout, which
+  // would fail the adapter's SUBSCRIBE while the connection isn't ready yet: cleared.
+  const pubsub = adapter
+    ? [0, 1].map(() =>
+        redis.duplicate({ enableOfflineQueue: true, maxRetriesPerRequest: null, commandTimeout: undefined, socketTimeout: undefined }),
+      )
+    : [];
   let handlers;
   const server = await startSocketServer((io) => {
+    if (adapter) io.adapter(createAdapter(pubsub[0], pubsub[1]));
     io.use(fakeSocketAuth);
-    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store });
+    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, sweepMs: 0 });
   });
   return {
     url: server.url,
@@ -143,6 +159,7 @@ async function startRoomServer(db, redis, { serverId = 'server-a', graceMs = 60,
       handlers.stop();
       await server.close();
       await settle();
+      await Promise.all(pubsub.map((c) => c.quit()));
     },
   };
 }
@@ -228,6 +245,40 @@ async function roomHarness(t, options = {}) {
   return { db, livekit, meetingId, server, store, connect, join };
 }
 
+// Two room servers sharing one Redis and one database, like two API servers behind a
+// load balancer. A client picks its server by which one it connects to.
+async function twoServerHarness(t, meeting = {}) {
+  const db = await setupTestDb();
+  const redis = await connectTestRedis();
+  const livekit = recordingLivekit();
+  const meetingId = await seedMeeting(db, meeting);
+  const a = await startRoomServer(db, redis, { serverId: 'server-a', livekit, adapter: true });
+  const b = await startRoomServer(db, redis, { serverId: 'server-b', livekit, adapter: true });
+  await Promise.all([a.store.beat(), b.store.beat()]);
+  await settle(200); // let both adapters' subscriptions land
+  const clients = [];
+  t.after(async () => {
+    clients.forEach((c) => c.disconnect());
+    await a.close();
+    await b.close();
+    await redis.quit();
+    await db.close();
+  });
+  const clientsOf = (server) => ({
+    connect: (userId) => {
+      const c = connectClient(server.url, userId);
+      clients.push(c);
+      return c;
+    },
+    join: async (userId) => {
+      const c = await seat(server.url, userId, meetingId);
+      clients.push(c);
+      return c;
+    },
+  });
+  return { db, redis, livekit, meetingId, a: { ...a, ...clientsOf(a) }, b: { ...b, ...clientsOf(b) } };
+}
+
 // Another tab taking this user's seat, as the real join path does it.
 async function takeOverSeat(store, meetingId, userId, socketId) {
   const s = await store.seatFor(meetingId, userId);
@@ -264,6 +315,7 @@ module.exports = {
   settle,
   recordingLivekit,
   roomHarness,
+  twoServerHarness,
   shareScreen,
   takeOverSeat,
   seatInStore,

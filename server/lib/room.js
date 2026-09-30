@@ -5,6 +5,10 @@ const { GRACE_MS } = require('./roomStore');
 
 const roomChannel = (meetingId) => `meeting:${meetingId}`;
 
+const SWEEP_MS = 15_000;
+const HEARTBEAT_MS = 10_000;
+const IDLE_ROOM_MS = 60_000;
+
 // Per-socket buckets (SOCKET_POLICIES). A socket lives on one server for its whole
 // life, so these need no Redis round trip; captions are the busiest event in Zylo.
 // The per-IP connection limit (limitConnections) stops a reconnect from buying a
@@ -23,7 +27,10 @@ function allowEvent(socket, name) {
 // work with the default in-memory adapter too. socket.data.meetingId is only a hint:
 // every handler that acts checks in the store that this socket holds the seat or
 // lobby entry it acts through.
-function registerRoomHandlers(io, { db, store, livekit = null, graceMs = GRACE_MS }) {
+function registerRoomHandlers(
+  io,
+  { db, store, livekit = null, graceMs = GRACE_MS, sweepMs = SWEEP_MS, idleRoomMs = IDLE_ROOM_MS },
+) {
   const graceTimers = new Set();
   let stopped = false;
 
@@ -248,6 +255,80 @@ function registerRoomHandlers(io, { db, store, livekit = null, graceMs = GRACE_M
         .then(() => handler(...args))
         .catch((err) => console.error(`socket ${event} failed:`, err.message)),
     );
+
+  // Crash recovery, run by every server every sweepMs. Each step is a script that
+  // checks before it changes anything, so servers sweeping at once is harmless.
+  // ponytail: walks every live meeting with a few round trips each; fine for hundreds
+  // of rooms. Split the live set per server if that ever stops being true.
+  async function sweep() {
+    const alive = new Map();
+    // Gone: its server's heartbeat stopped, or it is ours and not connected here.
+    const gone = async ({ serverId, socketId }) => {
+      if (serverId === store.serverId) return !io.sockets.sockets.has(socketId);
+      if (!alive.has(serverId)) alive.set(serverId, await store.isServerAlive(serverId));
+      return !alive.get(serverId);
+    };
+    for (const meetingId of await store.liveMeetings()) {
+      if (!(await store.getMeta(meetingId))) {
+        await store.forgetLive(meetingId);
+        continue;
+      }
+      let seatFreed = false;
+      let lobbyChanged = false;
+      for (const seat of await store.listSeats(meetingId)) {
+        if (seat.graceUntil) {
+          if (seat.serverId === store.serverId && io.sockets.sockets.has(seat.socketId)) {
+            // Stamped by another server while our heartbeat had lapsed; we're still here.
+            await store.keepSeat(meetingId, seat.userId, seat.socketId);
+          } else if (await store.releaseIfStale(meetingId, seat.userId, seat.socketId)) {
+            livekit?.evict(meetingId, seat.userId);
+            seatFreed = true;
+          }
+        } else if (await gone(seat)) {
+          // Released on a later sweep, unless they come back first.
+          await store.markGrace(meetingId, seat.userId, seat.socketId, graceMs);
+        }
+      }
+      for (const entry of await store.queuedEntries(meetingId)) {
+        if ((await gone(entry)) && (await store.removeFromQueue(meetingId, entry.userId, entry.socketId))) lobbyChanged = true;
+      }
+      const sharer = await store.screenSharer(meetingId);
+      if (sharer && (await gone(sharer))) await releaseScreen(meetingId, sharer.socketId);
+      if (seatFreed) await onSeatFreed(meetingId);
+      else if (lobbyChanged) await broadcastLobby(meetingId);
+      else if (await store.clearIfIdle(meetingId, idleRoomMs)) await markEnded(meetingId);
+    }
+    // Live in Postgres but held by no server: a crash, or Redis lost its data.
+    const { rows } = await db.query('SELECT id FROM meetings WHERE started_at IS NOT NULL AND ended_at IS NULL');
+    if (rows.length === 0) return;
+    const live = new Set(await store.liveMeetings());
+    for (const { id } of rows) if (!live.has(id)) await markEnded(id);
+  }
+
+  let sweeping = false;
+  let sweepFailing = false;
+  async function runSweep() {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      await sweep();
+      sweepFailing = false;
+    } catch (err) {
+      if (!sweepFailing) console.error('room sweep failed:', err.message); // once per outage
+      sweepFailing = true;
+    } finally {
+      sweeping = false;
+    }
+  }
+
+  // Redis being down is already logged once by redis.js; a missed beat just retries.
+  const beat = () => store.beat().catch(() => {});
+  const timers = [];
+  if (sweepMs > 0) {
+    beat();
+    timers.push(setInterval(beat, HEARTBEAT_MS), setInterval(runSweep, sweepMs));
+    timers.forEach((timer) => timer.unref());
+  }
 
   io.on('connection', (socket) => {
     on(socket, 'meeting:join-request', async ({ meetingId, lang } = {}) => {
@@ -515,21 +596,15 @@ function registerRoomHandlers(io, { db, store, livekit = null, graceMs = GRACE_M
   });
 
   return {
-    // Cancels pending grace timers and starts no new ones (tests; shutdown later).
+    sweep: runSweep,
+    // Cancels timers and pending grace periods, and starts no new ones (tests; shutdown later).
     stop() {
       stopped = true;
+      timers.forEach((timer) => clearInterval(timer));
       for (const timer of graceTimers) clearTimeout(timer);
       graceTimers.clear();
     },
   };
 }
 
-// Boot clean-up while there is one API server (Task 10 replaces it with the sweeper):
-// rooms left in Redis belong to a process that is gone, and so do meetings marked
-// started but never ended.
-async function closeStaleMeetings(db, store) {
-  for (const code of await store.liveMeetings()) await store.clearMeeting(code);
-  await db.query('UPDATE meetings SET ended_at = now() WHERE started_at IS NOT NULL AND ended_at IS NULL');
-}
-
-module.exports = { registerRoomHandlers, closeStaleMeetings, roomChannel };
+module.exports = { registerRoomHandlers, roomChannel };

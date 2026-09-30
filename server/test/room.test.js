@@ -1,21 +1,18 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { registerRoomHandlers, closeStaleMeetings } = require('../lib/room');
+const { registerRoomHandlers } = require('../lib/room');
 const { createRoomStore } = require('../lib/roomStore');
 const {
   setupTestDb,
-  setupTestRedis,
   connectTestRedis,
   seedMeeting,
   fakeSocketAuth,
   startSocketServer,
   startRoom,
   takeOverSeat,
-  seatInStore,
   connectClient,
   waitForEvent,
   settle,
-  insertUser,
   insertMeeting,
 } = require('./helpers');
 
@@ -911,25 +908,4 @@ test('auto mode: the host admitting a tab that already closed hands the seat to 
   assert.deepEqual(ack, { ok: false, reason: 'gone' });
   assert.equal(admitted.length, 1);
   assert.equal(await store.hasSeat(meetingId, 'p3'), true);
-});
-
-test('the boot sweep closes meetings a crash left open', async (t) => {
-  const db = await setupTestDb();
-  t.after(async () => db.close());
-
-  await insertUser(db, { id: 'host', email: 'host@zylo.test', name: 'Hana Host' });
-  await insertMeeting(db, { id: 'sta-lemt-ing', hostId: 'host' });
-  await insertMeeting(db, { id: 'fut-uree-eet', hostId: 'host' });
-  await db.query("UPDATE meetings SET started_at = now() - interval '2 hours' WHERE id = 'sta-lemt-ing'");
-
-  const store = createRoomStore(await setupTestRedis(t), { serverId: 'boot' });
-  await seatInStore(store, 'sta-lemt-ing', { userId: 'p1' }); // a room the dead process left in Redis
-
-  await closeStaleMeetings(db, store);
-  assert.deepEqual(await store.liveMeetings(), []);
-
-  const { rows } = await db.query('SELECT id, ended_at FROM meetings ORDER BY id');
-  const byId = Object.fromEntries(rows.map((r) => [r.id, r.ended_at]));
-  assert.notEqual(byId['sta-lemt-ing'], null);
-  assert.equal(byId['fut-uree-eet'], null); // never started, so never ended
 });

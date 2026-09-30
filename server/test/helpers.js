@@ -145,13 +145,16 @@ async function startRoomServer(
       )
     : [];
   let handlers;
+  let socketServer;
   const server = await startSocketServer((io) => {
+    socketServer = io; // for tests that watch what the handlers ask it
     if (adapter) io.adapter(createAdapter(pubsub[0], pubsub[1]));
     io.use(fakeSocketAuth);
     handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, sweepMs: 0 });
   });
   return {
     url: server.url,
+    io: socketServer,
     store,
     handlers,
     close: async () => {

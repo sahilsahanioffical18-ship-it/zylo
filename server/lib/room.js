@@ -88,7 +88,20 @@ function registerRoomHandlers(
       [meetingId, userId, isHostUser ? 'host' : 'participant'],
     );
 
-  const isConnected = async (socketId) => (await io.in(socketId).fetchSockets()).length > 0;
+  // Asks as little as it can: a socket of ours is in this process, a server whose
+  // heartbeat lapsed has none, and only a live other server is asked over the adapter.
+  // That ask can time out (the adapter counts a dead server until its connection
+  // drops); then we can't tell, and treat it as connected: a tab that is gone is
+  // released by its own disconnect, or by the sweep, but a wrong "gone" loses a waiter.
+  const isConnected = async (socketId, serverId) => {
+    if (serverId === store.serverId) return io.sockets.sockets.has(socketId);
+    if (!(await store.isServerAlive(serverId))) return false;
+    try {
+      return (await io.in(socketId).fetchSockets()).length > 0;
+    } catch {
+      return true;
+    }
+  };
 
   // Every seat release goes through here, so none can forget LiveKit: the seat is
   // the only thing that authorizes media. socketId: release only if that socket
@@ -174,7 +187,7 @@ function registerRoomHandlers(
 
   // drainQueue already took the seat; a tab that closed meanwhile hands it straight back.
   async function admitDrained(entry, meetingId) {
-    if (!(await isConnected(entry.socketId))) {
+    if (!(await isConnected(entry.socketId, entry.serverId))) {
       await freeSeat(meetingId, entry.userId, entry.socketId);
       return;
     }
@@ -182,11 +195,14 @@ function registerRoomHandlers(
   }
 
   // Seats everyone the lobby has room for (nobody while admission is manual). A seat
-  // handed back by a closed tab is offered again, so it is asked until a round seats no one.
+  // handed back by a closed tab is offered again, so it is asked until a round seats no
+  // one. Resolves to whether anyone was seated.
   async function drainLobby(meetingId) {
+    let seated = false;
     for (;;) {
       const drained = await store.drainQueue(meetingId);
-      if (drained.length === 0) return;
+      if (drained.length === 0) return seated;
+      seated = true;
       for (const entry of drained) await admitDrained(entry, meetingId);
     }
   }
@@ -268,41 +284,71 @@ function registerRoomHandlers(
       if (!alive.has(serverId)) alive.set(serverId, await store.isServerAlive(serverId));
       return !alive.get(serverId);
     };
+    // One room failing must not skip the rest: keep going, then report the first error.
+    let failure = null;
     for (const meetingId of await store.liveMeetings()) {
-      if (!(await store.getMeta(meetingId))) {
-        await store.forgetLive(meetingId);
-        continue;
-      }
-      let seatFreed = false;
-      let lobbyChanged = false;
-      for (const seat of await store.listSeats(meetingId)) {
-        if (seat.graceUntil) {
-          if (seat.serverId === store.serverId && io.sockets.sockets.has(seat.socketId)) {
-            // Stamped by another server while our heartbeat had lapsed; we're still here.
-            await store.keepSeat(meetingId, seat.userId, seat.socketId);
-          } else if (await store.releaseIfStale(meetingId, seat.userId, seat.socketId)) {
-            livekit?.evict(meetingId, seat.userId);
-            seatFreed = true;
-          }
-        } else if (await gone(seat)) {
-          // Released on a later sweep, unless they come back first.
-          await store.markGrace(meetingId, seat.userId, seat.socketId, graceMs);
+      try {
+        if (!(await store.getMeta(meetingId))) {
+          await store.forgetLive(meetingId);
+          continue;
         }
+        let seatFreed = false;
+        let lobbyChanged = false;
+        for (const seat of await store.listSeats(meetingId)) {
+          if (seat.graceUntil) {
+            if (seat.serverId === store.serverId && io.sockets.sockets.has(seat.socketId)) {
+              // Stamped by another server while our heartbeat had lapsed; we're still here.
+              await store.keepSeat(meetingId, seat.userId, seat.socketId);
+            } else if (await store.releaseIfStale(meetingId, seat.userId, seat.socketId)) {
+              livekit?.evict(meetingId, seat.userId);
+              seatFreed = true;
+            }
+          } else if (await gone(seat)) {
+            // Released on a later sweep, unless they come back first.
+            await store.markGrace(meetingId, seat.userId, seat.socketId, graceMs);
+          }
+        }
+        const queued = await store.queuedEntries(meetingId);
+        for (const entry of queued) {
+          if ((await gone(entry)) && (await store.removeFromQueue(meetingId, entry.userId, entry.socketId))) lobbyChanged = true;
+        }
+        const sharer = await store.screenSharer(meetingId);
+        if (sharer && (await gone(sharer))) await releaseScreen(meetingId, sharer.socketId);
+        // Anyone still waiting is offered a seat on every pass, not only the one that freed
+        // one: an earlier drain may have failed halfway. One script call, and it seats no
+        // one when there is nothing to do (or admission is manual).
+        const seated = queued.length > 0 && (await drainLobby(meetingId));
+        if (seatFreed || seated) await onSeatFreed(meetingId);
+        else if (lobbyChanged) await broadcastLobby(meetingId);
+        else if (await store.clearIfIdle(meetingId, idleRoomMs)) await markEnded(meetingId);
+      } catch (err) {
+        failure ??= err;
       }
-      for (const entry of await store.queuedEntries(meetingId)) {
-        if ((await gone(entry)) && (await store.removeFromQueue(meetingId, entry.userId, entry.socketId))) lobbyChanged = true;
-      }
-      const sharer = await store.screenSharer(meetingId);
-      if (sharer && (await gone(sharer))) await releaseScreen(meetingId, sharer.socketId);
-      if (seatFreed) await onSeatFreed(meetingId);
-      else if (lobbyChanged) await broadcastLobby(meetingId);
-      else if (await store.clearIfIdle(meetingId, idleRoomMs)) await markEnded(meetingId);
     }
     // Live in Postgres but held by no server: a crash, or Redis lost its data.
-    const { rows } = await db.query('SELECT id FROM meetings WHERE started_at IS NOT NULL AND ended_at IS NULL');
-    if (rows.length === 0) return;
-    const live = new Set(await store.liveMeetings());
-    for (const { id } of rows) if (!live.has(id)) await markEnded(id);
+    try {
+      const { rows } = await db.query('SELECT id FROM meetings WHERE started_at IS NOT NULL AND ended_at IS NULL');
+      const live = new Set(rows.length > 0 ? await store.liveMeetings() : []);
+      for (const { id } of rows) {
+        if (live.has(id)) continue;
+        // Its code may only have dropped out of the live set: put it back, don't end it.
+        if (await store.getMeta(id)) {
+          await store.markLive(id);
+          continue;
+        }
+        // Ended as "End for all" does: the row, then whoever is still in the room, the
+        // tombstone that refuses a rejoin, and LiveKit. Only the server that changed the
+        // row does the rest, so two sweeps don't both do it.
+        const { rowCount } = await markEnded(id);
+        if (rowCount === 0) continue;
+        io.to(roomChannel(id)).emit('meeting:ended');
+        await store.clearMeeting(id, { ended: true });
+        livekit?.endRoom(id); // never rejects
+      }
+    } catch (err) {
+      failure ??= err;
+    }
+    if (failure) throw failure;
   }
 
   let sweeping = false;
@@ -468,7 +514,7 @@ function registerRoomHandlers(
       if (outcome.result === 'gone') return ack?.({ ok: false, reason: 'gone' });
       // Full: the host is told, and the person keeps their place in the lobby.
       if (outcome.result === 'full') return ack?.({ ok: false, reason: 'full' });
-      if (!(await isConnected(outcome.entry.socketId))) {
+      if (!(await isConnected(outcome.entry.socketId, outcome.entry.serverId))) {
         await freeSeat(meetingId, userId, outcome.entry.socketId);
         await onSeatFreed(meetingId); // the seat goes to the next in the lobby if admission is auto
         return ack?.({ ok: false, reason: 'gone' });

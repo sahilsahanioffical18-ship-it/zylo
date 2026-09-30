@@ -418,6 +418,7 @@ function createRoomStore(redis, { serverId }) {
     },
     liveMeetings: () => redis.smembers(LIVE),
     forgetLive: (code) => redis.srem(LIVE, code),
+    markLive: (code) => redis.sadd(LIVE, code),
 
     // Servers
     beat: () => redis.set(`zylo:server:${serverId}`, String(Date.now()), 'PX', HEARTBEAT_TTL_MS),

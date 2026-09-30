@@ -1,7 +1,14 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createRoomStore } = require('../lib/roomStore');
-const { twoServerHarness, waitForEvent, collect, settle } = require('./helpers');
+const { twoServerHarness, insertMeeting, waitForEvent, collect, settle } = require('./helpers');
+
+// Whether `promise` settles within ms: a missing event fails an assertion, not the run.
+const within = (promise, ms) => Promise.race([promise.then(() => true), settle(ms).then(() => false)]);
+
+// Seats held on a server that died: no heartbeat for it exists.
+const deadServerStore = (redis) => createRoomStore(redis, { serverId: 'crashed-server' });
+const deadServerUser = (userId, name) => ({ userId, socketId: `socket-of-${userId}`, name, imageUrl: null, lang: null });
 
 test('chat sent on one server reaches people on the other', async (t) => {
   const { a, b } = await twoServerHarness(t);
@@ -100,7 +107,7 @@ test("a crashed server's seat is held for the grace period, then freed by the sw
 });
 
 test("a live server's seats are left alone by the other server's sweep", async (t) => {
-  const { a, b, meetingId } = await twoServerHarness(t);
+  const { a, b, db, meetingId } = await twoServerHarness(t);
   await a.join('host');
   await b.join('p1');
   await a.handlers.sweep();
@@ -108,6 +115,8 @@ test("a live server's seats are left alone by the other server's sweep", async (
   await a.handlers.sweep();
   assert.equal(await a.store.hasSeat(meetingId, 'p1'), true);
   assert.equal((await a.store.seatFor(meetingId, 'p1')).graceUntil, undefined);
+  const { rows } = await db.query('SELECT ended_at FROM meetings WHERE id = $1', [meetingId]);
+  assert.equal(rows[0].ended_at, null, 'a meeting held by a live server is not ended');
 });
 
 test('a meeting live in Postgres but held by no server is ended by the sweep', async (t) => {
@@ -116,4 +125,146 @@ test('a meeting live in Postgres but held by no server is ended by the sweep', a
   await a.handlers.sweep();
   const { rows } = await db.query('SELECT ended_at FROM meetings WHERE id = $1', [meetingId]);
   assert.notEqual(rows[0].ended_at, null);
+});
+
+test('a meeting live in Postgres but gone from Redis is ended for everyone in it', async (t) => {
+  const { a, b, db, redis, livekit, meetingId } = await twoServerHarness(t);
+  const host = await a.join('host');
+  const p1 = await b.join('p1');
+  await a.store.clearMeeting(meetingId); // Redis loses the room; both tabs stay connected
+  const told = Promise.all([waitForEvent(host, 'meeting:ended'), waitForEvent(p1, 'meeting:ended')]);
+  await a.handlers.sweep();
+  assert.equal(await within(told, 1000), true, 'both people, on both servers, are told');
+  const { rows } = await db.query('SELECT ended_at FROM meetings WHERE id = $1', [meetingId]);
+  assert.notEqual(rows[0].ended_at, null);
+  assert.deepEqual(livekit.callsTo('endRoom'), [[meetingId]]);
+  assert.equal(await redis.exists(`zylo:room:{${meetingId}}:ended`), 1, 'the tombstone refuses a rejoin');
+});
+
+test('a room missing from the live set but alive in Redis is put back, not ended', async (t) => {
+  const { a, db, livekit, meetingId } = await twoServerHarness(t);
+  const host = await a.join('host');
+  await a.store.forgetLive(meetingId);
+  const ended = collect(host, 'meeting:ended');
+  await a.handlers.sweep();
+  await settle(100);
+  assert.deepEqual(await a.store.liveMeetings(), [meetingId]);
+  const { rows } = await db.query('SELECT ended_at FROM meetings WHERE id = $1', [meetingId]);
+  assert.equal(rows[0].ended_at, null);
+  assert.equal(ended.length, 0);
+  assert.equal(livekit.callsTo('endRoom').length, 0);
+});
+
+test('a room that fails in the sweep does not stop the other rooms or the Postgres pass', async (t) => {
+  const { a, db, redis, meetingId } = await twoServerHarness(t);
+  const errors = t.mock.method(console, 'error', () => {});
+  await a.join('host');
+  // A second room with a seat on a dead server, and a third live in Postgres only.
+  await insertMeeting(db, { id: 'sec-ondr-oom', hostId: 'host', maxParticipants: 3 });
+  await insertMeeting(db, { id: 'thi-rdme-eti', hostId: 'host' });
+  await db.query("UPDATE meetings SET started_at = now() WHERE id = 'thi-rdme-eti'");
+  const ghost = deadServerStore(redis);
+  await ghost.initMeta('sec-ondr-oom', { hostId: 'host', admission: 'auto', screenSharePolicy: 'anyone', maxParticipants: 3, mode: 'standard' });
+  await ghost.join('sec-ondr-oom', deadServerUser('p1', 'Priya One'), { isHost: false });
+  // The sweep reaches the failing room first.
+  a.store.liveMeetings = async () => [meetingId, 'sec-ondr-oom'];
+  const listSeats = a.store.listSeats;
+  a.store.listSeats = async (id) => {
+    if (id === meetingId) throw new Error('redis hiccup');
+    return listSeats(id);
+  };
+  await a.handlers.sweep();
+  assert.notEqual((await a.store.seatFor('sec-ondr-oom', 'p1')).graceUntil, undefined, 'the next room was still swept');
+  const { rows } = await db.query("SELECT ended_at FROM meetings WHERE id = 'thi-rdme-eti'");
+  assert.notEqual(rows[0].ended_at, null, 'and so was the Postgres pass');
+  assert.equal(errors.mock.calls.filter((c) => String(c.arguments[0]).startsWith('room sweep failed')).length, 1);
+});
+
+// The host and one member on server A and B, and a seat held by a dead server: the room is
+// full, so a third person on B waits. Freeing the dead seat is what the sweep does next.
+async function fullRoomWithAWaiter(t) {
+  const h = await twoServerHarness(t); // max 3: the host + 2
+  const { a, b, meetingId, redis } = h;
+  t.mock.method(console, 'error', () => {}); // the failures these tests make on purpose
+  await a.join('host');
+  await b.join('p1');
+  await deadServerStore(redis).join(meetingId, deadServerUser('p2', 'Pablo Two'), { isHost: false });
+  const waiter = b.connect('p3');
+  const waiting = waitForEvent(waiter, 'meeting:waiting');
+  waiter.emit('meeting:join-request', { meetingId });
+  await waiting;
+  return { ...h, waiter };
+}
+
+// Two sweeps: the first stamps the dead seat's grace period, the second releases it and
+// offers it to the lobby. beforeRelease runs in between.
+async function sweepAwayTheDeadSeat(a, beforeRelease = () => {}) {
+  await a.handlers.sweep();
+  await settle(100); // graceMs is 60 in tests
+  await beforeRelease();
+  await a.handlers.sweep();
+}
+
+test('a waiter left behind by a failed drain is admitted by the next sweep', async (t) => {
+  const { a, meetingId, waiter } = await fullRoomWithAWaiter(t);
+  const drainQueue = a.store.drainQueue;
+  await sweepAwayTheDeadSeat(a, () => {
+    let failures = 1; // the first drain once a seat is free
+    a.store.drainQueue = async (id) => {
+      if (failures-- > 0) throw new Error('redis hiccup');
+      return drainQueue(id);
+    };
+  });
+  assert.equal(await a.store.queuePosition(meetingId, 'p3'), 1, 'the failed drain left them waiting');
+  const admitted = waitForEvent(waiter, 'meeting:admitted');
+  const presence = waitForEvent(waiter, 'room:presence');
+  await a.handlers.sweep();
+  assert.equal(await within(admitted, 1000), true, 'admitted');
+  assert.deepEqual((await presence).people.map((p) => p.userId).sort(), ['host', 'p1', 'p3']);
+  assert.equal(await a.store.queuePosition(meetingId, 'p3'), null);
+});
+
+test('a waiter is admitted even when the adapter cannot say whether they are connected', async (t) => {
+  const { a, meetingId, waiter } = await fullRoomWithAWaiter(t);
+  const realIn = a.io.in.bind(a.io);
+  a.io.in = (room) => {
+    const op = realIn(room);
+    op.fetchSockets = () => Promise.reject(new Error('timeout reached while waiting for fetchSockets response'));
+    return op;
+  };
+  const admitted = waitForEvent(waiter, 'meeting:admitted');
+  await sweepAwayTheDeadSeat(a);
+  assert.equal(await within(admitted, 1000), true);
+  assert.equal(await a.store.hasSeat(meetingId, 'p3'), true);
+});
+
+test('admitting a waiter asks the adapter only when they are on another live server', async (t) => {
+  const { a, b, redis, meetingId } = await twoServerHarness(t, { admission: 'manual', maxParticipants: 5 });
+  const host = await a.join('host');
+  const local = a.connect('p1');
+  const remote = b.connect('p2');
+  for (const [client, userId] of [[local, 'p1'], [remote, 'p2']]) {
+    const waiting = waitForEvent(client, 'meeting:waiting');
+    client.emit('meeting:join-request', { meetingId });
+    await waiting;
+  }
+  await deadServerStore(redis).join(meetingId, deadServerUser('p3', 'Pia Three'), { isHost: false }); // waits too
+  const asked = [];
+  const realIn = a.io.in.bind(a.io);
+  a.io.in = (room) => {
+    const op = realIn(room);
+    const fetchSockets = op.fetchSockets.bind(op);
+    op.fetchSockets = () => {
+      asked.push(room);
+      return fetchSockets();
+    };
+    return op;
+  };
+  const admit = (userId) => new Promise((resolve) => host.emit('lobby:admit', { userId }, resolve));
+  assert.deepEqual(await admit('p1'), { ok: true });
+  assert.deepEqual(asked, [], 'a socket of ours is in this process');
+  assert.deepEqual(await admit('p3'), { ok: false, reason: 'gone' });
+  assert.deepEqual(asked, [], 'a server that stopped its heartbeat has no sockets');
+  assert.deepEqual(await admit('p2'), { ok: true });
+  assert.deepEqual(asked, [remote.id], 'only a live other server is asked');
 });

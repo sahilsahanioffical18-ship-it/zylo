@@ -1,5 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { SOCKET_POLICIES } = require('../lib/rateLimit');
 const { roomHarness, waitForEvent, collect, settle, insertMeeting, connectClient, takeOverSeat } = require('./helpers');
 
 const caption = (overrides = {}) => ({ id: 'cap-1', text: 'hello there', lang: 'hi', final: true, ...overrides });
@@ -291,4 +292,33 @@ test('no caption leak across meetings', async (t) => {
   await settle();
 
   assert.equal(otherCaptions.length, 0);
+});
+
+// Captions are the busiest event in Zylo, and the room state lives in the shared Redis:
+// a socket that may not caption must stop costing it a read per caption once its bucket
+// is empty, so the limit has to come before any store read.
+test('a flood of captions from someone who may not caption stops reaching the store at the burst', async (t) => {
+  let seatForCalls = 0;
+  const decorateStore = (real) => ({
+    ...real,
+    seatFor: (...args) => {
+      seatForCalls++;
+      return real.seatFor(...args);
+    },
+  });
+  const { meetingId, connect } = await roomHarness(t, { decorateStore }); // a standard meeting: nobody may caption
+
+  const host = connect('host');
+  const admitted = waitForEvent(host, 'meeting:admitted');
+  host.emit('meeting:join-request', { meetingId });
+  await admitted;
+  await settle();
+
+  const { burst } = SOCKET_POLICIES['convo:caption'];
+  seatForCalls = 0;
+  for (let i = 0; i < burst + 20; i++) host.emit('convo:caption', caption({ id: `cap-${i}` }));
+  await settle(200);
+
+  assert.ok(seatForCalls > 0, 'the store is being counted');
+  assert.ok(seatForCalls <= burst, `${seatForCalls} store reads for ${burst + 20} captions`);
 });

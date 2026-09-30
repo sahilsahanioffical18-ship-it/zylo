@@ -301,12 +301,14 @@ function registerRoomHandlers(io, { db, store, livekit = null, graceMs = GRACE_M
     on(socket, 'convo:caption', async (payload) => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
+      // Captions are chatty (interim results, client-throttled to ~4/s); extras past
+      // the bucket are dropped silently, since the next interim replaces them anyway.
+      // Before any store read, so a socket that may not caption costs Redis nothing
+      // beyond the burst.
+      if (!allowEvent(socket, 'convo:caption')) return;
       const [seat, meta] = await Promise.all([store.seatFor(meetingId, userId), store.getMeta(meetingId)]);
       if (!seat || seat.socketId !== socket.id) return;
       if (!meta || meta.mode !== 'translator') return;
-      // Captions are chatty (interim results, client-throttled to ~4/s); extras past
-      // the bucket are dropped silently, since the next interim replaces them anyway.
-      if (!allowEvent(socket, 'convo:caption')) return;
       const clean = validateCaption(payload);
       if (!clean) return;
       socket.to(roomChannel(meetingId)).emit('convo:caption', { userId, name: seat.name, ...clean, ts: Date.now() });

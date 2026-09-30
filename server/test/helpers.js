@@ -126,8 +126,9 @@ async function seedMeeting(
 // short so grace expiry is testable. close() lets in-flight disconnect handling
 // finish, stops the handlers' timers, closes the server, and lets the handling of
 // any socket that closing it disconnected finish too, while Redis is still up.
-async function startRoomServer(db, redis, { serverId = 'server-a', graceMs = 60, livekit = null } = {}) {
-  const store = createRoomStore(redis, { serverId });
+// decorateStore wraps the store the handlers get (a test counting or delaying calls).
+async function startRoomServer(db, redis, { serverId = 'server-a', graceMs = 60, livekit = null, decorateStore = (s) => s } = {}) {
+  const store = decorateStore(createRoomStore(redis, { serverId }));
   let handlers;
   const server = await startSocketServer((io) => {
     io.use(fakeSocketAuth);
@@ -148,14 +149,14 @@ async function startRoomServer(db, redis, { serverId = 'server-a', graceMs = 60,
 
 // The four users, one meeting, and a room server. Brings its own Redis (closed by
 // server.close()) unless one is passed in.
-async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, ...meeting } = {}) {
+async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, decorateStore, ...meeting } = {}) {
   const ownRedis = !redis;
   const conn = redis ?? (await connectTestRedis());
   let room;
   let meetingId;
   try {
     meetingId = await seedMeeting(db, meeting);
-    room = await startRoomServer(db, conn, { serverId, graceMs, livekit });
+    room = await startRoomServer(db, conn, { serverId, graceMs, livekit, decorateStore });
   } catch (err) {
     if (ownRedis) conn.disconnect(); // fail, don't leak
     throw err;

@@ -4,10 +4,14 @@
 // other command in, which is what keeps the last seat, the lobby order and the
 // screen-share lock race-safe across servers (the job "no await between the check
 // and the write" did when this lived in one process's memory).
+// What a caller reads before calling a script can be stale by the time it runs, so
+// a script re-checks what it depends on: drainQueue reads the admission mode itself,
+// join keeps a newcomer behind anyone already waiting (a freed seat and the lobby
+// advancing are two calls), and initMeta renews the room's age for the idle sweep.
 //
 // Keys per meeting. The {code} braces are a Redis Cluster hash tag: all of one
 // meeting's keys land together, so one script may touch them all.
-//   zylo:room:{code}:meta     hash   hostId, admission, screenSharePolicy, maxParticipants, mode, since
+//   zylo:room:{code}:meta     hash   hostId, admission, screenSharePolicy, maxParticipants, mode, since (renewed by every initMeta)
 //   zylo:room:{code}:seats    hash   userId -> { socketId, serverId, name, imageUrl, isHost, lang, seq, graceUntil? }
 //   zylo:room:{code}:queue    hash   userId -> { userId, socketId, serverId, name, imageUrl, lang, seq }
 //   zylo:room:{code}:screen   string { userId, socketId, serverId }
@@ -67,6 +71,13 @@ local function queuePosition(userId)
   return nil
 end
 
+-- Is anyone besides this user waiting in the lobby?
+local function othersQueued(userId)
+  local n = redis.call('HLEN', QUEUE)
+  if redis.call('HEXISTS', QUEUE, userId) == 1 then n = n - 1 end
+  return n > 0
+end
+
 -- A retry refreshes the entry in place; it never costs you your position.
 local function enqueue(entry)
   local existing = getJson(QUEUE, entry.userId)
@@ -90,12 +101,16 @@ end
 const SCRIPTS = {
   // ARGV: hostId, admission, screenSharePolicy, maxParticipants, mode. 0 while the
   // ended tombstone exists: a join that read the meeting row just before "End for
-  // all" committed must not bring the room back.
+  // all" committed must not bring the room back. An existing room keeps its settings
+  // but its age restarts, so the idle sweep cannot delete it between this call and
+  // the join's seat.
   zyloRoomInitMeta: `
 if redis.call('EXISTS', ENDED) == 1 then return 0 end
 if redis.call('EXISTS', META) == 0 then
   redis.call('HSET', META, 'hostId', ARGV[1], 'admission', ARGV[2], 'screenSharePolicy', ARGV[3],
     'maxParticipants', ARGV[4], 'mode', ARGV[5], 'since', tostring(nowMs()))
+else
+  redis.call('HSET', META, 'since', tostring(nowMs()))
 end
 return 1`,
 
@@ -135,6 +150,11 @@ end
 if admission == 'manual' and not isHost then
   return cjson.encode({ result = 'queued', position = enqueue(entry) })
 end
+-- A seat that just freed belongs to the lobby, which drainQueue fills in order. A
+-- newcomer arriving in that gap goes to the back of the line, not into the seat.
+if not isHost and othersQueued(entry.userId) then
+  return cjson.encode({ result = 'queued', position = enqueue(entry) })
+end
 -- The host's seat is always reserved, so everyone else shares max - 1.
 if not isHost and nonHostSeats() >= max - 1 then
   -- A translator convo is a 2-seat link, not a lobby.
@@ -156,9 +176,11 @@ putJson(SEATS, ARGV[1], newSeat(entry, false))
 return cjson.encode({ result = 'admitted', entry = entry })`,
 
   // Seats the lobby in order until the room is full. Serves both "a seat freed" and
-  // "the host switched manual to auto": they are the same operation.
+  // "the host switched manual to auto": they are the same operation. In manual mode
+  // it seats nobody, whatever the caller read a moment ago: the host admits one by one.
   zyloRoomDrain: `
 if redis.call('EXISTS', META) == 0 then return '[]' end
+if redis.call('HGET', META, 'admission') == 'manual' then return '[]' end
 local max = tonumber(redis.call('HGET', META, 'maxParticipants'))
 local taken = nonHostSeats()
 local admitted = {}
@@ -256,8 +278,9 @@ if ARGV[1] == '1' then redis.call('SET', ENDED, '1', 'EX', 3600) end
 if #ids == 0 then return '[]' end
 return cjson.encode(ids)`,
 
-  // ARGV: idleMs. Clears a room nobody is in or waiting for, once it has existed that
-  // long (so a join between initMeta and its seat is never swept away).
+  // ARGV: idleMs. Clears a room nobody is in or waiting for, once it has gone that long
+  // since initMeta last ran on it (so a join between initMeta and its seat is never
+  // swept away, even into a room that is already old).
   zyloRoomClearIfIdle: `
 if redis.call('EXISTS', META) == 0 then return 0 end
 if redis.call('HLEN', SEATS) > 0 or redis.call('HLEN', QUEUE) > 0 then return 0 end

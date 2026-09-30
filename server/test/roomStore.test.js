@@ -257,3 +257,41 @@ test('heartbeats: a server is alive while it beats', async (t) => {
   assert.equal(await store.isServerAlive('server-a'), true);
   assert.ok((await redis.pttl('zylo:server:server-a')) <= 30_000);
 });
+
+test('drainQueue seats nobody while admission is manual, even if the caller read "auto" a moment ago', async (t) => {
+  const store = await room(t, { maxParticipants: 2 });
+  await seat(store, 1);
+  await seat(store, 2); // queued: the room is full
+  await store.setMetaField(CODE, 'admission', 'manual'); // the host, on another server
+  await store.releaseSeat(CODE, 'u1');
+  assert.deepEqual(await store.drainQueue(CODE), [], 'manual: the host decides who comes in');
+  assert.deepEqual((await store.queuedEntries(CODE)).map((e) => e.userId), ['u2']);
+  assert.equal(await store.hasSeat(CODE, 'u2'), false);
+
+  await store.setMetaField(CODE, 'admission', 'auto');
+  assert.deepEqual((await store.drainQueue(CODE)).map((e) => e.userId), ['u2']);
+});
+
+test('a newcomer cannot take a freed seat ahead of someone already in the lobby', async (t) => {
+  const store = await room(t);
+  await seat(store, 1);
+  await seat(store, 2);
+  assert.equal((await seat(store, 3)).position, 1);
+  await store.releaseSeat(CODE, 'u2'); // a seat is free, but u3 was here first
+  assert.deepEqual(await store.join(CODE, person(10), { isHost: false }), {
+    result: 'queued',
+    replacedSocketId: null,
+    position: 2,
+  });
+  assert.equal(await store.hasSeat(CODE, 'u10'), false);
+  assert.deepEqual((await store.drainQueue(CODE)).map((e) => e.userId), ['u3']);
+  assert.equal(await store.queuePosition(CODE, 'u10'), 1);
+});
+
+test('initMeta on a room that already exists renews its age, so the sweeper cannot take it mid-join', async (t) => {
+  const store = await room(t);
+  await settle(80);
+  assert.equal(await store.initMeta(CODE, META), true); // a join into the older, empty room
+  assert.equal(await store.clearIfIdle(CODE, 50), false, 'it is new again');
+  assert.notEqual(await store.getMeta(CODE), null);
+});

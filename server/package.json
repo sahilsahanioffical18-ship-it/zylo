@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test --test-concurrency=1 test/*.test.js"
+    "test": "node --test --test-concurrency=1 --test-timeout=30000 test/*.test.js"
   },
   "dependencies": {
     "@clerk/express": "^2.1.67",

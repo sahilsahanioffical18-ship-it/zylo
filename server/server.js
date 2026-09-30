@@ -32,7 +32,11 @@ async function main() {
   const redis = createRedis();
   if (!redis) console.warn("WARNING: REDIS_URL is not set — rate limits and the translation cache stay in this server's memory.");
   const limiter = createLimiter({ redis });
-  const trustProxy = Number(process.env.TRUST_PROXY) || 0;
+  // Proxy hops to trust for the client IP: a non-negative integer, else 0 (a bad value must not silently pass).
+  const rawTrust = (process.env.TRUST_PROXY || '').trim();
+  const validTrust = /^\d+$/.test(rawTrust);
+  const trustProxy = validTrust ? Number(rawTrust) : 0;
+  if (rawTrust && !validTrust) console.warn(`WARNING: TRUST_PROXY="${rawTrust}" is not a non-negative integer — using 0.`);
 
   if (db) {
     try {

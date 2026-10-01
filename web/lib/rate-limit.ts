@@ -18,3 +18,11 @@ export function connectRetryDelay(err: unknown): number | null {
   const wait = (err as { data?: { retryAfterMs?: unknown } } | null)?.data?.retryAfterMs;
   return typeof wait === 'number' && Number.isFinite(wait) ? Math.max(1000, wait) : null;
 }
+
+// The server couldn't read its room state ('unavailable') while we were already in the
+// call: LiveKit is a separate service and still carries the media, so the join is
+// retried after this many ms instead of ending the call. Any other denial, or an
+// 'unavailable' for someone not yet admitted, is final: null.
+export function joinRetryDelay(reason: string, admitted: boolean): number | null {
+  return reason === 'unavailable' && admitted ? 3000 : null;
+}

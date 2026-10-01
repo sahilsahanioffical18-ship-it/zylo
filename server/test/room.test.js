@@ -9,9 +9,11 @@ const {
   fakeSocketAuth,
   startSocketServer,
   startRoom,
+  roomHarness,
   takeOverSeat,
   connectClient,
   waitForEvent,
+  collect,
   settle,
   insertMeeting,
 } = require('./helpers');
@@ -908,4 +910,94 @@ test('auto mode: the host admitting a tab that already closed hands the seat to 
   assert.deepEqual(ack, { ok: false, reason: 'gone' });
   assert.equal(admitted.length, 1);
   assert.equal(await store.hasSeat(meetingId, 'p3'), true);
+});
+
+// The sweeper's clearIfIdle can run between a join's meta load and its seat script (the
+// join makes two or three Postgres queries in between), so a join must renew an existing
+// room's age, not only a room it creates.
+test('a join into a room that sat idle renews its age, so the sweeper cannot clear it before the seat', async (t) => {
+  let clearedMidJoin;
+  const decorateStore = (real) => ({
+    ...real,
+    join: async (...args) => {
+      clearedMidJoin = await real.clearIfIdle(args[0], 250); // the sweep, just before the seat script
+      return real.join(...args);
+    },
+  });
+  const { meetingId, connect, store } = await roomHarness(t, { decorateStore });
+  // A room with nobody in it, older than the idle limit: a manual meeting whose early guest left.
+  await store.initMeta(meetingId, {
+    hostId: 'host', admission: 'auto', screenSharePolicy: 'anyone', maxParticipants: 3, mode: 'standard',
+  });
+  await settle(300);
+
+  const p1 = connect('p1');
+  const admitted = collect(p1, 'meeting:admitted');
+  const denied = collect(p1, 'meeting:denied');
+  p1.emit('meeting:join-request', { meetingId });
+  await settle(300);
+
+  assert.equal(clearedMidJoin, false);
+  assert.deepEqual(denied, []);
+  assert.equal(admitted.length, 1);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), true);
+});
+
+test('a guest leaving the lobby does not end the meeting for the others still waiting', async (t) => {
+  const { meetingId, connect, store } = await roomHarness(t, { admission: 'manual' }); // no host yet
+  const [w1, w2] = [connect('p1'), connect('p2')];
+  for (const c of [w1, w2]) {
+    const waiting = waitForEvent(c, 'meeting:waiting');
+    c.emit('meeting:join-request', { meetingId });
+    await waiting;
+  }
+  const denied = collect(w2, 'meeting:denied');
+  const waiting = collect(w2, 'meeting:waiting');
+
+  w1.emit('meeting:leave');
+  await settle(200);
+
+  assert.deepEqual(denied, []);
+  assert.deepEqual(waiting, [{ position: 1, manual: true }], 'w2 moves up');
+  assert.notEqual(await store.getMeta(meetingId), null, 'the room is still there');
+  assert.equal(await store.queuePosition(meetingId, 'p2'), 1);
+});
+
+test('the last person leaving tells everyone still in the lobby the meeting ended', async (t) => {
+  const { meetingId, connect, join, store } = await roomHarness(t, { admission: 'manual' });
+  const host = await join('host');
+  const w1 = connect('p1');
+  const waiting = waitForEvent(w1, 'meeting:waiting');
+  w1.emit('meeting:join-request', { meetingId });
+  await waiting;
+  const denied = collect(w1, 'meeting:denied');
+
+  host.emit('meeting:leave');
+  await settle(200);
+
+  assert.deepEqual(denied, [{ reason: 'ended' }]);
+  assert.equal(await store.getMeta(meetingId), null);
+});
+
+// A join can seat someone after the last person's leave has seen an empty room and
+// before the room is cleared; the clear returns every socket it dropped, and each is told.
+test('a join seated between the last person leaving and the room clearing is told, not wiped silently', async (t) => {
+  let late; // the socket whose join lands in that gap
+  const decorateStore = (real) => ({
+    ...real,
+    clearMeeting: async (...args) => {
+      if (late) await real.join(args[0], { userId: 'p2', socketId: late.id, name: 'Pablo Two' }, { isHost: false });
+      return real.clearMeeting(...args);
+    },
+  });
+  const { connect, join } = await roomHarness(t, { decorateStore });
+  const host = await join('host');
+  late = connect('p2');
+  await waitForEvent(late, 'connect');
+  const denied = collect(late, 'meeting:denied');
+
+  host.emit('meeting:leave');
+  await settle(200);
+
+  assert.deepEqual(denied, [{ reason: 'ended' }]);
 });

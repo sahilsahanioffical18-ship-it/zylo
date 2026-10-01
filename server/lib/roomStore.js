@@ -169,6 +169,8 @@ return cjson.encode({ result = 'seated', replacedSocketId = '' })`,
   zyloRoomAdmit: `
 local entry = getJson(QUEUE, ARGV[1])
 if not entry or redis.call('EXISTS', META) == 0 then return cjson.encode({ result = 'gone' }) end
+-- Removed while queued (host:kick reads the seat and the entry in two calls): no seat.
+if redis.call('SISMEMBER', REMOVED, ARGV[1]) == 1 then return cjson.encode({ result = 'gone' }) end
 local max = tonumber(redis.call('HGET', META, 'maxParticipants'))
 if nonHostSeats() >= max - 1 then return cjson.encode({ result = 'full' }) end
 redis.call('HDEL', QUEUE, ARGV[1])
@@ -186,10 +188,13 @@ local taken = nonHostSeats()
 local admitted = {}
 for _, e in ipairs(sortedQueue()) do
   if taken >= max - 1 then break end
-  redis.call('HDEL', QUEUE, e.userId)
-  putJson(SEATS, e.userId, newSeat(e, false))
-  taken = taken + 1
-  admitted[#admitted + 1] = e
+  -- A removed user stays queued but unseated: the kick still finds the entry and tells them.
+  if redis.call('SISMEMBER', REMOVED, e.userId) == 0 then
+    redis.call('HDEL', QUEUE, e.userId)
+    putJson(SEATS, e.userId, newSeat(e, false))
+    taken = taken + 1
+    admitted[#admitted + 1] = e
+  end
 end
 if #admitted == 0 then return '[]' end
 return cjson.encode(admitted)`,

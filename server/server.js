@@ -73,7 +73,13 @@ async function main() {
   io.use(limitConnections(limiter, trustProxy)); // before auth: a flood never reaches token checks
   io.use(clerkSocketAuth({ db }));
   if (db && store) registerRoomHandlers(io, { db, livekit, store });
-  else console.warn('WARNING: DATABASE_URL or REDIS_URL is not set — ZyloRoom sockets will refuse every join request.');
+  else {
+    console.warn('WARNING: DATABASE_URL or REDIS_URL is not set — ZyloRoom sockets will refuse every join request.');
+    // Refuse out loud: with no handler a client would wait on "connecting" for good.
+    io.on('connection', (socket) =>
+      socket.on('meeting:join-request', () => socket.emit('meeting:denied', { reason: 'unavailable' })),
+    );
+  }
 
   httpServer.listen(PORT, () => console.log(`Zylo API listening on :${PORT}`));
 }

@@ -295,3 +295,26 @@ test('initMeta on a room that already exists renews its age, so the sweeper cann
   assert.equal(await store.clearIfIdle(CODE, 50), false, 'it is new again');
   assert.notEqual(await store.getMeta(CODE), null);
 });
+
+// host:kick reads the seat and then the lobby entry; a drain on another server can move
+// the user from one to the other in between. Both scripts therefore check the removed set.
+test('drainQueue skips a removed user and leaves them queued, so the kick can still find them', async (t) => {
+  const store = await room(t, { maxParticipants: 2 });
+  await seat(store, 1);
+  await seat(store, 2); // queued: the room is full
+  await seat(store, 3);
+  await store.addRemoved(CODE, 'u2');
+  await store.releaseSeat(CODE, 'u1');
+  assert.deepEqual((await store.drainQueue(CODE)).map((e) => e.userId), ['u3'], 'the seat goes past the removed user');
+  assert.equal(await store.hasSeat(CODE, 'u2'), false);
+  assert.equal(await store.queueSocketId(CODE, 'u2'), 's2', 'still queued: removeFromQueue finds them');
+});
+
+test('admitFromQueue refuses a removed user: gone, not seated, still queued', async (t) => {
+  const store = await room(t, { admission: 'manual' });
+  await seat(store, 1);
+  await store.addRemoved(CODE, 'u1');
+  assert.deepEqual(await store.admitFromQueue(CODE, 'u1'), { result: 'gone', entry: null });
+  assert.equal(await store.hasSeat(CODE, 'u1'), false);
+  assert.equal(await store.queuePosition(CODE, 'u1'), 1);
+});

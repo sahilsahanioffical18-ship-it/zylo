@@ -36,7 +36,10 @@ function registerRoomHandlers(
 
   async function loadMeetingMeta(meetingId) {
     const live = await store.getMeta(meetingId);
-    if (live) return live;
+    // initMeta on a room that exists only renews its age, so the idle sweep can't
+    // clear it between here and the join script. False: it ended meanwhile; the
+    // database below says so.
+    if (live && (await store.initMeta(meetingId, live))) return live;
     const { rows } = await db.query(
       `SELECT host_id, admission, screen_share_policy, max_participants, mode, ended_at
        FROM meetings WHERE id = $1`,
@@ -217,14 +220,13 @@ function registerRoomHandlers(
     await endEmptyRoom(meetingId);
   }
 
-  // Nobody is seated any more, so the meeting is over. Anyone still in the lobby is
-  // told rather than left spinning.
+  // Nobody is seated any more, so the meeting is over. Whoever the clear drops, a
+  // lobby waiter or a join seated in the gap just before it, is told rather than left spinning.
   async function endEmptyRoom(meetingId) {
-    for (const entry of await store.queuedEntries(meetingId)) {
-      io.to(entry.socketId).emit('meeting:denied', { reason: 'ended' });
-    }
     const { rowCount } = await markEnded(meetingId);
-    await store.clearMeeting(meetingId, { ended: rowCount > 0 });
+    for (const id of await store.clearMeeting(meetingId, { ended: rowCount > 0 })) {
+      io.to(id).emit('meeting:denied', { reason: 'ended' });
+    }
   }
 
   // Every host-only event runs through this. Authorization is a server check:
@@ -455,11 +457,13 @@ function registerRoomHandlers(
       const { meetingId, userId } = socket.data;
       if (!meetingId) return socket.disconnect(true);
       // Only what this socket owns: a replaced tab's leave must not free the new tab's seat.
-      await store.removeFromQueue(meetingId, userId, socket.id);
-      await freeSeat(meetingId, userId, socket.id);
+      const dequeued = await store.removeFromQueue(meetingId, userId, socket.id);
+      const freed = await freeSeat(meetingId, userId, socket.id);
       socket.leave(roomChannel(meetingId));
       socket.data.meetingId = null;
-      await onSeatFreed(meetingId);
+      // A waiter leaving frees no seat: the room is not empty, only the lobby changed.
+      if (freed) await onSeatFreed(meetingId);
+      else if (dequeued) await broadcastLobby(meetingId);
       socket.disconnect(true);
     });
 

@@ -376,39 +376,49 @@ function registerRoomHandlers(
     timers.forEach((timer) => timer.unref());
   }
 
+  async function joinMeeting(socket, meetingId, lang) {
+    const meta = await loadMeetingMeta(meetingId);
+    if (!meta) return socket.emit('meeting:denied', { reason: 'not_found' });
+    if (meta.ended) return socket.emit('meeting:denied', { reason: 'ended' });
+
+    const { userId } = socket.data;
+    if (await isRemoved(meetingId, userId)) return socket.emit('meeting:denied', { reason: 'removed' });
+
+    const isHostUser = meta.hostId === userId;
+    const { name, imageUrl } = await userInfo(userId);
+    // lang only means anything in a translator convo, and only if it is one of
+    // the supported codes; anything else silently becomes null, like chat.
+    const seatLang = meta.mode === 'translator' && isConvoLang(lang) ? lang : null;
+    // One script decides the rest atomically: removed or ended while we awaited,
+    // a reconnect taking its own seat back, the manual lobby, the host's reserved
+    // seat, a full translator convo, a full room's lobby.
+    const outcome = await store.join(
+      meetingId,
+      { userId, socketId: socket.id, name, imageUrl, lang: seatLang },
+      { isHost: isHostUser },
+    );
+    if (outcome.result === 'ended' || outcome.result === 'removed' || outcome.result === 'full') {
+      return socket.emit('meeting:denied', { reason: outcome.result });
+    }
+    socket.data.meetingId = meetingId;
+    if (outcome.result === 'queued') return broadcastLobby(meetingId);
+    await admit(socket.id, meetingId, userId, isHostUser, outcome.replacedSocketId);
+    await broadcastPresence(meetingId, socket.id);
+    // A host arriving needs to see whoever is already waiting for them.
+    if (isHostUser) await broadcastLobby(meetingId);
+  }
+
   io.on('connection', (socket) => {
     on(socket, 'meeting:join-request', async ({ meetingId, lang } = {}) => {
       if (!allowEvent(socket, 'meeting:join-request')) return socket.emit('rate-limited', { event: 'meeting:join-request' });
       if (typeof meetingId !== 'string') return socket.emit('meeting:denied', { reason: 'not_found' });
-      const meta = await loadMeetingMeta(meetingId);
-      if (!meta) return socket.emit('meeting:denied', { reason: 'not_found' });
-      if (meta.ended) return socket.emit('meeting:denied', { reason: 'ended' });
-
-      const { userId } = socket.data;
-      if (await isRemoved(meetingId, userId)) return socket.emit('meeting:denied', { reason: 'removed' });
-
-      const isHostUser = meta.hostId === userId;
-      const { name, imageUrl } = await userInfo(userId);
-      // lang only means anything in a translator convo, and only if it is one of
-      // the supported codes; anything else silently becomes null, like chat.
-      const seatLang = meta.mode === 'translator' && isConvoLang(lang) ? lang : null;
-      // One script decides the rest atomically: removed or ended while we awaited,
-      // a reconnect taking its own seat back, the manual lobby, the host's reserved
-      // seat, a full translator convo, a full room's lobby.
-      const outcome = await store.join(
-        meetingId,
-        { userId, socketId: socket.id, name, imageUrl, lang: seatLang },
-        { isHost: isHostUser },
-      );
-      if (outcome.result === 'ended' || outcome.result === 'removed' || outcome.result === 'full') {
-        return socket.emit('meeting:denied', { reason: outcome.result });
+      try {
+        await joinMeeting(socket, meetingId, lang);
+      } catch (err) {
+        // The store or the database can't be read: never admit anyone blind.
+        console.error('join failed:', err.message);
+        socket.emit('meeting:denied', { reason: 'unavailable' });
       }
-      socket.data.meetingId = meetingId;
-      if (outcome.result === 'queued') return broadcastLobby(meetingId);
-      await admit(socket.id, meetingId, userId, isHostUser, outcome.replacedSocketId);
-      await broadcastPresence(meetingId, socket.id);
-      // A host arriving needs to see whoever is already waiting for them.
-      if (isHostUser) await broadcastLobby(meetingId);
     });
 
     // Translator convos only, and only through the seat this socket holds.

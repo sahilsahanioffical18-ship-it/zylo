@@ -39,6 +39,10 @@ const DENIED_COPY: Record<DeniedReason, { title: string; text: string }> = {
     title: 'This Translator Convo is full',
     text: 'This Translator Convo already has two people.',
   },
+  unavailable: {
+    title: 'Meetings are unavailable for a moment',
+    text: 'Zylo couldn’t reach its meeting service. Reload this page in a few seconds to try again.',
+  },
 };
 
 export function MeetingRoomFlow({ code }: { code: string }) {

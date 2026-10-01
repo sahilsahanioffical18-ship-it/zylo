@@ -14,8 +14,9 @@ import type { Admission, IncomingCaption, OutgoingCaption, ScreenSharePolicy } f
 export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean; lang: string | null };
 export type LobbyEntry = { userId: string; name: string; imageUrl: string | null };
 // 'full' is Translator Convo only: a 2-seat link that's already taken (server: room.js's
-// meeting:join-request, "a translator convo is a 2-seat link, not a lobby").
-export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied' | 'full';
+// meeting:join-request, "a translator convo is a 2-seat link, not a lobby"). 'unavailable':
+// the server couldn't read its live room state (Redis), so it admitted nobody.
+export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied' | 'full' | 'unavailable';
 export type ChatMessage = { userId: string; name: string; text: string; ts: number };
 
 // ponytail: keep the last 200 in memory; nothing is stored anyway, so scrollback has a

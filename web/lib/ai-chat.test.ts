@@ -109,7 +109,7 @@ test('each finished answer is handed out once, for one pop-up each', () => {
 });
 
 test('why Ask AI is off', () => {
-  assert.equal(askAiBlocked(false, true), "AI isn't set up on this server.");
+  assert.equal(askAiBlocked(false, true), 'AI isn’t set up on this server.');
   assert.equal(askAiBlocked(false, false), AI_ERROR_TEXT.not_configured);
   assert.equal(askAiBlocked(true, false), 'The host turned AI off.');
   assert.equal(askAiBlocked(true, true), null);

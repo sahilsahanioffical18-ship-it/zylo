@@ -12,6 +12,7 @@ import { ControlBar, type PanelTab } from '@/components/control-bar';
 import { PeoplePanel } from '@/components/people-panel';
 import { SubtitleOverlay } from '@/components/subtitle-overlay';
 import { VideoStage } from '@/components/video-stage';
+import { AI_NAME, askAiBlocked, newlyDone, type ChatItem } from '@/lib/ai-chat';
 import { brand } from '@/lib/brand';
 import { shouldToast, toastPreview } from '@/lib/chat-toast';
 import { languageFor } from '@/lib/convo-languages';
@@ -19,7 +20,7 @@ import { partnerVolume as partnerVolumeFor, type PartnerVoiceSetting } from '@/l
 import { stageView } from '@/lib/screen-share';
 import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { useLiveKitRoom } from '@/lib/use-livekit-room';
-import type { ChatMessage, LobbyEntry, Person } from '@/lib/use-meeting';
+import type { LobbyEntry, Person } from '@/lib/use-meeting';
 import type { useTranslatorConvo } from '@/lib/use-translator-convo';
 
 // Tailwind's lg: where the Chat/People panel docks beside the stage instead of opening as a Sheet.
@@ -48,6 +49,10 @@ export function RoomShell({
   onEndForAll,
   messages,
   onSendChat,
+  aiAvailable,
+  aiEnabled,
+  onAskAi,
+  onSetAiEnabled,
   convo,
   myLang,
   onChangeLang,
@@ -76,8 +81,12 @@ export function RoomShell({
   onKick: (userId: string) => void;
   onLeave: () => void;
   onEndForAll: () => void;
-  messages: ChatMessage[];
+  messages: ChatItem[];
   onSendChat: (text: string) => void;
+  aiAvailable: boolean;
+  aiEnabled: boolean;
+  onAskAi: (text: string) => void;
+  onSetAiEnabled: (enabled: boolean) => void;
   // Translator Convo only. Its presence IS the mode flag (`translator` below) —
   // every other translator-only prop just below is only ever read once this exists.
   convo?: ReturnType<typeof useTranslatorConvo>;
@@ -118,24 +127,33 @@ export function RoomShell({
     });
   };
 
-  // Toasts a new ZyloChat message while chat isn't on screen. Keyed on the last
-  // message, not messages.length: use-meeting slices the array to MAX_MESSAGES, so
-  // the length stops changing once a room hits that cap.
-  const seenRef = useRef<ChatMessage | undefined>(messages.at(-1));
+  // Toasts a new ZyloChat message, and each Zylo AI answer once it's done, while chat
+  // isn't on screen. Messages are keyed on the last item, not messages.length: the list
+  // is capped (ai-chat.ts's MAX_CHAT_ITEMS), so the length stops changing at the cap.
+  const seenRef = useRef<ChatItem | undefined>(messages.at(-1));
+  // Answer ids already handled. null until the first run, which takes the answers that
+  // finished before mount as history, never toasted.
+  const answersRef = useRef<Set<string> | null>(null);
   useEffect(() => {
-    const last = messages.at(-1);
-    if (!last || last === seenRef.current) return;
-    seenRef.current = last; // seeded at mount, so a remount never re-toasts history
     const chatVisible = tab === 'chat' && (sheetOpen || window.matchMedia(DOCKED_QUERY).matches);
-    if (shouldToast(last, selfUserId, chatVisible)) {
-      toast(last.name, {
+    const pop = (title: string, text: string) =>
+      toast(title, {
         id: 'zylochat', // a burst of messages replaces one toast instead of stacking
-        description: toastPreview(last.text),
+        description: toastPreview(text),
         duration: 4000,
         position: 'top-right', // off the room title and the control bar
         action: { label: 'Open', onClick: () => openPanel('chat') },
       });
+    const firstRun = answersRef.current === null;
+    answersRef.current ??= new Set();
+    for (const answer of newlyDone(messages, answersRef.current)) {
+      if (!firstRun && !chatVisible) pop(AI_NAME, answer.text.trim().split('\n')[0]); // its first line
     }
+    const last = messages.at(-1);
+    if (!last || last === seenRef.current) return;
+    seenRef.current = last; // seeded at mount, so a remount never re-toasts history
+    // A streaming answer is a new last item on every piece: only people's messages toast here.
+    if (last.kind === 'person' && shouldToast(last, selfUserId, chatVisible)) pop(last.name, last.text);
   }, [messages, selfUserId, tab, sheetOpen, openPanel]);
 
   const peoplePanel = (
@@ -157,6 +175,8 @@ export function RoomShell({
       onMute={onMute}
       onStopShare={onStopShare}
       onKick={onKick}
+      aiEnabled={aiEnabled}
+      onSetAiEnabled={onSetAiEnabled}
       translator={translator}
     />
   );
@@ -191,7 +211,12 @@ export function RoomShell({
         </TabsContent>
       )}
       <TabsContent value="chat" className="min-h-0 flex-1">
-        <ChatPanel messages={messages} selfUserId={selfUserId} onSend={onSendChat} />
+        <ChatPanel
+          messages={messages}
+          selfUserId={selfUserId}
+          onSend={onSendChat}
+          ai={translator ? undefined : { onAsk: onAskAi, blockedReason: askAiBlocked(aiAvailable, aiEnabled) }}
+        />
       </TabsContent>
       <TabsContent value="people" className="min-h-0 flex-1">
         {peoplePanel}

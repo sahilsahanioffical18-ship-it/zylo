@@ -37,9 +37,9 @@ export type AiEvent =
 export type AiErrorReason = 'disabled' | 'not_configured';
 
 export const AI_NAME = 'Zylo AI';
-export const AI_FAILED_TEXT = "The AI couldn't answer. Try again.";
+export const AI_FAILED_TEXT = 'The AI couldn’t answer. Try again.';
 export const AI_ERROR_TEXT: Record<AiErrorReason, string> = {
-  not_configured: "AI isn't set up on this server.",
+  not_configured: 'AI isn’t set up on this server.',
   disabled: 'The host turned AI off.',
 };
 

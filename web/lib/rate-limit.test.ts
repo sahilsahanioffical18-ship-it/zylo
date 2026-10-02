@@ -7,7 +7,7 @@ test('each refused event gets its own wording', () => {
   assert.match(rateLimitMessage('meeting:join-request'), /join attempts/);
   assert.match(rateLimitMessage('screen:request'), /sharing your screen/);
   assert.match(rateLimitMessage('host'), /host action/);
-  assert.equal(rateLimitMessage('ai:ask'), "You're asking the AI too often. Wait a moment.");
+  assert.equal(rateLimitMessage('ai:ask'), 'You’re asking the AI too often. Wait a moment.');
 });
 
 test('an event without its own wording gets the general one', () => {

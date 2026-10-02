@@ -97,6 +97,9 @@ export function MeetingRoomFlow({ code }: { code: string }) {
     endMeeting,
     sendCaption,
     setConvoLang,
+    aiEnabled,
+    askAi,
+    setAiEnabled,
   } = useMeeting(joined ? code : null, { lang: translator ? myLang : null, onCaption: (c) => captionSink.current(c) });
   const selfUserId = user?.id ?? '';
   const presenting = sharerUserId !== null && sharerUserId === selfUserId;
@@ -254,6 +257,10 @@ export function MeetingRoomFlow({ code }: { code: string }) {
       onEndForAll={endMeeting}
       messages={messages}
       onSendChat={sendChat}
+      aiAvailable={joined.meeting.aiAvailable}
+      aiEnabled={aiEnabled ?? joined.meeting.aiEnabled}
+      onAskAi={askAi}
+      onSetAiEnabled={setAiEnabled}
       convo={translator ? convo : undefined} // RoomShell reads its presence as the mode flag
       myLang={myLang}
       onChangeLang={handleChangeLang}

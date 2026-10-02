@@ -5,6 +5,7 @@ const MESSAGES: Record<string, string> = {
   'meeting:join-request': 'Too many join attempts. Wait a moment, then try again.',
   'screen:request': 'Wait a moment before sharing your screen again.',
   host: 'Slow down: wait a moment before the next host action.',
+  'ai:ask': "You're asking the AI too often. Wait a moment.",
 };
 
 export function rateLimitMessage(event: string): string {

@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { registerRoomHandlers } = require('../lib/room');
 const { createRoomStore } = require('../lib/roomStore');
+const { createChatHistory } = require('../lib/chatHistory');
 const {
   setupTestDb,
   connectTestRedis,
@@ -153,7 +154,7 @@ test('a dropped seat is still freed when stamping its grace deadline is slower t
   let handlers;
   const server = await startSocketServer((io) => {
     io.use(fakeSocketAuth);
-    handlers = registerRoomHandlers(io, { db, graceMs: 60, store });
+    handlers = registerRoomHandlers(io, { db, graceMs: 60, store, history: createChatHistory(redis) });
   });
   const clients = [];
   t.after(async () => {

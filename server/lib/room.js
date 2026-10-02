@@ -27,9 +27,10 @@ function allowEvent(socket, name) {
 // work with the default in-memory adapter too. socket.data.meetingId is only a hint:
 // every handler that acts checks in the store that this socket holds the seat or
 // lobby entry it acts through.
+// history: each meeting's last 20 chat lines, which Zylo AI reads (chatHistory.js).
 function registerRoomHandlers(
   io,
-  { db, store, livekit = null, graceMs = GRACE_MS, sweepMs = SWEEP_MS, idleRoomMs = IDLE_ROOM_MS },
+  { db, store, history, livekit = null, graceMs = GRACE_MS, sweepMs = SWEEP_MS, idleRoomMs = IDLE_ROOM_MS },
 ) {
   const graceTimers = new Set();
   let stopped = false;
@@ -228,6 +229,17 @@ function registerRoomHandlers(
     for (const id of await store.clearMeeting(meetingId, { ended: rowCount > 0 })) {
       io.to(id).emit('meeting:denied', { reason: 'ended' });
     }
+    await history.clear(meetingId);
+  }
+
+  // A history failure is logged and never holds up the chat or an answer.
+  const remember = (meetingId, entry) =>
+    history.add(meetingId, entry).catch((err) => console.error('chat history failed:', err.message));
+
+  // Every ZyloChat line goes out through here, so the AI's history never misses one.
+  async function relayChat(meetingId, message) {
+    io.to(roomChannel(meetingId)).emit('chat:message', { ...message, ts: Date.now() });
+    await remember(meetingId, { name: message.name, text: message.text });
   }
 
   // Every host-only event runs through this. Authorization is a server check:
@@ -323,7 +335,10 @@ function registerRoomHandlers(
         const seated = queued.length > 0 && (await drainLobby(meetingId));
         if (seatFreed || seated) await onSeatFreed(meetingId);
         else if (lobbyChanged) await broadcastLobby(meetingId);
-        else if (await store.clearIfIdle(meetingId, idleRoomMs)) await markEnded(meetingId);
+        else if (await store.clearIfIdle(meetingId, idleRoomMs)) {
+          await markEnded(meetingId);
+          await history.clear(meetingId);
+        }
       } catch (err) {
         failure ??= err;
       }
@@ -347,6 +362,7 @@ function registerRoomHandlers(
         io.to(roomChannel(id)).emit('meeting:ended');
         await store.clearMeeting(id, { ended: true });
         livekit?.endRoom(id); // never rejects
+        await history.clear(id);
       }
     } catch (err) {
       failure ??= err;
@@ -477,7 +493,7 @@ function registerRoomHandlers(
       if (!seat || seat.socketId !== socket.id) return;
       const clean = validateChatText(text);
       if (!clean) return;
-      io.to(roomChannel(meetingId)).emit('chat:message', { userId, name: seat.name, text: clean, ts: Date.now() });
+      await relayChat(meetingId, { userId, name: seat.name, text: clean });
     });
 
     // ZyloLive. The lock script re-checks the seat and the host-only policy, so two
@@ -666,6 +682,7 @@ function registerRoomHandlers(
         io.to(id).emit('meeting:ended');
       }
       livekit?.endRoom(meetingId); // after the sockets, as in host:kick; never rejects
+      await history.clear(meetingId);
     });
 
     on(socket, 'disconnect', async () => {

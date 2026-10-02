@@ -6,6 +6,7 @@ const { Server } = require('socket.io');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const { io: ioClient } = require('socket.io-client');
 const { createRoomStore } = require('../lib/roomStore');
+const { createChatHistory } = require('../lib/chatHistory');
 const { registerRoomHandlers } = require('../lib/room');
 const { createRedis, whenReady } = require('../lib/redis');
 
@@ -129,13 +130,15 @@ async function seedMeeting(
 // any socket that closing it disconnected finish too, while Redis is still up.
 // decorateStore wraps the store the handlers get (a test counting or delaying calls).
 // adapter: true wires the Socket.IO Redis adapter, so several servers act as one. The
-// sweep timers never run here; tests call handlers.sweep() themselves.
+// sweep timers never run here; tests call handlers.sweep() themselves. The handlers get
+// a chat history on the same Redis, returned for tests to read and seed.
 async function startRoomServer(
   db,
   redis,
   { serverId = 'server-a', graceMs = 60, livekit = null, adapter = false, decorateStore = (s) => s } = {},
 ) {
   const store = decorateStore(createRoomStore(redis, { serverId }));
+  const history = createChatHistory(redis);
   // The adapter's own connections, with the offline queue on (as in server.js).
   // duplicate() copies redis.js's 500 ms commandTimeout / 1 s socketTimeout, which
   // would fail the adapter's SUBSCRIBE while the connection isn't ready yet: cleared.
@@ -150,12 +153,13 @@ async function startRoomServer(
     socketServer = io; // for tests that watch what the handlers ask it
     if (adapter) io.adapter(createAdapter(pubsub[0], pubsub[1]));
     io.use(fakeSocketAuth);
-    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, sweepMs: 0 });
+    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, history, sweepMs: 0 });
   });
   return {
     url: server.url,
     io: socketServer,
     store,
+    history,
     handlers,
     close: async () => {
       await settle();
@@ -188,7 +192,7 @@ async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, de
       if (ownRedis) await conn.quit();
     }
   };
-  return { meetingId, server: { url: room.url, close }, store: room.store, handlers: room.handlers };
+  return { meetingId, server: { url: room.url, close }, store: room.store, history: room.history, handlers: room.handlers };
 }
 
 // Connects userId and resolves once they hold a seat.
@@ -276,7 +280,7 @@ async function shareScreen(client) {
 async function roomHarness(t, options = {}) {
   const db = await setupTestDb();
   const livekit = recordingLivekit();
-  const { meetingId, server, store } = await startRoom(db, { ...options, livekit });
+  const { meetingId, server, store, history, handlers } = await startRoom(db, { ...options, livekit });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
@@ -285,7 +289,7 @@ async function roomHarness(t, options = {}) {
   });
   const connect = (userId) => { const c = connectClient(server.url, userId); clients.push(c); return c; };
   const join = async (userId) => { const c = await seat(server.url, userId, meetingId); clients.push(c); return c; };
-  return { db, livekit, meetingId, server, store, connect, join };
+  return { db, livekit, meetingId, server, store, history, handlers, connect, join };
 }
 
 // Two room servers sharing one Redis and one database, like two API servers behind a

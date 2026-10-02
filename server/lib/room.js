@@ -1,4 +1,6 @@
+const { randomUUID } = require('node:crypto');
 const { validateChatText } = require('./chatRules');
+const { promptFor } = require('./ai');
 const { isConvoLang, validateCaption } = require('./captionRules');
 const { SOCKET_POLICIES, takeToken } = require('./rateLimit');
 const { GRACE_MS } = require('./roomStore');
@@ -8,6 +10,11 @@ const roomChannel = (meetingId) => `meeting:${meetingId}`;
 const SWEEP_MS = 15_000;
 const HEARTBEAT_MS = 10_000;
 const IDLE_ROOM_MS = 60_000;
+// An answer's pieces go out at most once per this many ms, so a fast stream doesn't
+// flood the adapter.
+const AI_CHUNK_MS = 100;
+const AI_NAME = 'Zylo AI';
+const AI_FAILED = "The AI couldn't answer. Try again.";
 
 // Per-socket buckets (SOCKET_POLICIES). A socket lives on one server for its whole
 // life, so these need no Redis round trip; captions are the busiest event in Zylo.
@@ -28,11 +35,25 @@ function allowEvent(socket, name) {
 // every handler that acts checks in the store that this socket holds the seat or
 // lobby entry it acts through.
 // history: each meeting's last 20 chat lines, which Zylo AI reads (chatHistory.js).
+// limiter: the shared rate limits (rateLimit.js); only ai:ask takes from it. ai: the
+// provider client (ai.js), null when this server has no key or model.
 function registerRoomHandlers(
   io,
-  { db, store, history, livekit = null, graceMs = GRACE_MS, sweepMs = SWEEP_MS, idleRoomMs = IDLE_ROOM_MS },
+  {
+    db,
+    store,
+    history,
+    limiter,
+    ai = null,
+    livekit = null,
+    graceMs = GRACE_MS,
+    sweepMs = SWEEP_MS,
+    idleRoomMs = IDLE_ROOM_MS,
+  },
 ) {
   const graceTimers = new Set();
+  // stop() aborts every answer still streaming, so none outlives the handlers.
+  const answers = new AbortController();
   let stopped = false;
 
   async function loadMeetingMeta(meetingId) {
@@ -229,17 +250,59 @@ function registerRoomHandlers(
     for (const id of await store.clearMeeting(meetingId, { ended: rowCount > 0 })) {
       io.to(id).emit('meeting:denied', { reason: 'ended' });
     }
-    await history.clear(meetingId);
+    await forget(meetingId);
   }
 
   // A history failure is logged and never holds up the chat or an answer.
   const remember = (meetingId, entry) =>
     history.add(meetingId, entry).catch((err) => console.error('chat history failed:', err.message));
 
+  // The same for clearing: a Redis failure here must not skip a disconnect, abort the
+  // sweep's Postgres pass, or be logged as a failed handler.
+  const forget = (meetingId) =>
+    history.clear(meetingId).catch((err) => console.error('chat history clear failed:', err.message));
+
   // Every ZyloChat line goes out through here, so the AI's history never misses one.
   async function relayChat(meetingId, message) {
     io.to(roomChannel(meetingId)).emit('chat:message', { ...message, ts: Date.now() });
     await remember(meetingId, { name: message.name, text: message.text });
+  }
+
+  // Streams one answer to the whole room, on whichever servers its people are. ai:done
+  // carries the full text, so a client that missed a piece still ends with the right
+  // answer. Any failure is ai:failed and stays out of the history: never a fake reply.
+  async function answer(meetingId, askedBy, messages) {
+    const id = randomUUID();
+    const toRoom = (event, payload) => io.to(roomChannel(meetingId)).emit(event, payload);
+    toRoom('ai:start', { id, askedBy, ts: Date.now() });
+    let pending = '';
+    let timer = null;
+    const flush = () => {
+      clearTimeout(timer);
+      timer = null;
+      if (pending) toRoom('ai:chunk', { id, delta: pending });
+      pending = '';
+    };
+    let text;
+    try {
+      text = await ai.stream({
+        messages,
+        signal: answers.signal,
+        onDelta: (delta) => {
+          pending += delta;
+          timer ??= setTimeout(flush, AI_CHUNK_MS);
+        },
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      console.error('AI answer failed:', err.message);
+      return toRoom('ai:failed', { id, message: AI_FAILED });
+    }
+    flush(); // the chunks always add up to the full text
+    toRoom('ai:done', { id, text, ts: Date.now() });
+    // ponytail: an answer that finishes after its meeting ended writes this one line
+    // back; the key's 6 h TTL removes it. Check the room first if that ever matters.
+    await remember(meetingId, { name: AI_NAME, text, ai: true });
   }
 
   // Every host-only event runs through this. Authorization is a server check:
@@ -337,7 +400,7 @@ function registerRoomHandlers(
         else if (lobbyChanged) await broadcastLobby(meetingId);
         else if (await store.clearIfIdle(meetingId, idleRoomMs)) {
           await markEnded(meetingId);
-          await history.clear(meetingId);
+          await forget(meetingId);
         }
       } catch (err) {
         failure ??= err;
@@ -362,7 +425,7 @@ function registerRoomHandlers(
         io.to(roomChannel(id)).emit('meeting:ended');
         await store.clearMeeting(id, { ended: true });
         livekit?.endRoom(id); // never rejects
-        await history.clear(id);
+        await forget(id);
       }
     } catch (err) {
       failure ??= err;
@@ -494,6 +557,30 @@ function registerRoomHandlers(
       const clean = validateChatText(text);
       if (!clean) return;
       await relayChat(meetingId, { userId, name: seat.name, text: clean });
+    });
+
+    // Zylo AI. The checks run in the spec's order: the shared per-user limit before any
+    // store read (a flood costs one Redis call each), the chat rule, the seat, the
+    // meeting's setting, then the per-meeting limit that bounds the cost.
+    on(socket, 'ai:ask', async ({ text } = {}) => {
+      const { meetingId, userId } = socket.data;
+      if (!meetingId) return;
+      if (!(await limiter.take('aiUser', userId)).allowed) return socket.emit('rate-limited', { event: 'ai:ask' });
+      const clean = validateChatText(text);
+      if (!clean) return;
+      const seat = await store.seatFor(meetingId, userId);
+      if (!seat || seat.socketId !== socket.id) return;
+      const meta = await store.getMeta(meetingId);
+      if (!meta || meta.mode === 'translator') return;
+      if (!meta.aiEnabled) return socket.emit('ai:error', { reason: 'disabled' });
+      if (!ai) return socket.emit('ai:error', { reason: 'not_configured' });
+      if (!(await limiter.take('aiRoom', meetingId)).allowed) return socket.emit('rate-limited', { event: 'ai:ask' });
+      // Read before the question joins it: the AI gets the 20 lines before it, then the
+      // question. A failed read drops the question before anything is posted.
+      const earlier = await history.recent(meetingId);
+      const askedBy = { userId, name: seat.name };
+      await relayChat(meetingId, { ...askedBy, text: clean, toAi: true });
+      await answer(meetingId, askedBy, promptFor(earlier, { name: seat.name, text: clean }));
     });
 
     // ZyloLive. The lock script re-checks the seat and the host-only policy, so two
@@ -682,7 +769,7 @@ function registerRoomHandlers(
         io.to(id).emit('meeting:ended');
       }
       livekit?.endRoom(meetingId); // after the sockets, as in host:kick; never rejects
-      await history.clear(meetingId);
+      await forget(meetingId);
     });
 
     on(socket, 'disconnect', async () => {
@@ -699,9 +786,11 @@ function registerRoomHandlers(
 
   return {
     sweep: runSweep,
-    // Cancels timers and pending grace periods, and starts no new ones (tests; shutdown later).
+    // Cancels timers, pending grace periods and answers still streaming, and starts no
+    // new timers (tests; shutdown later).
     stop() {
       stopped = true;
+      answers.abort();
       timers.forEach((timer) => clearInterval(timer));
       for (const timer of graceTimers) clearTimeout(timer);
       graceTimers.clear();

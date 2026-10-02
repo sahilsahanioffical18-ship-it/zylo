@@ -7,6 +7,7 @@ const { createAdapter } = require('@socket.io/redis-adapter');
 const { io: ioClient } = require('socket.io-client');
 const { createRoomStore } = require('../lib/roomStore');
 const { createChatHistory } = require('../lib/chatHistory');
+const { createLimiter } = require('../lib/rateLimit');
 const { registerRoomHandlers } = require('../lib/room');
 const { createRedis, whenReady } = require('../lib/redis');
 
@@ -131,11 +132,21 @@ async function seedMeeting(
 // decorateStore wraps the store the handlers get (a test counting or delaying calls).
 // adapter: true wires the Socket.IO Redis adapter, so several servers act as one. The
 // sweep timers never run here; tests call handlers.sweep() themselves. The handlers get
-// a chat history on the same Redis, returned for tests to read and seed.
+// a chat history on the same Redis, returned for tests to read and seed. ai: a provider
+// client (createAi against startFakeAi) or null. limiter: the real shared limits on this
+// Redis unless a test passes its own (only ai:ask takes from it).
 async function startRoomServer(
   db,
   redis,
-  { serverId = 'server-a', graceMs = 60, livekit = null, adapter = false, decorateStore = (s) => s } = {},
+  {
+    serverId = 'server-a',
+    graceMs = 60,
+    livekit = null,
+    adapter = false,
+    decorateStore = (s) => s,
+    ai = null,
+    limiter = createLimiter({ redis, log: quietLog }),
+  } = {},
 ) {
   const store = decorateStore(createRoomStore(redis, { serverId }));
   const history = createChatHistory(redis);
@@ -153,7 +164,7 @@ async function startRoomServer(
     socketServer = io; // for tests that watch what the handlers ask it
     if (adapter) io.adapter(createAdapter(pubsub[0], pubsub[1]));
     io.use(fakeSocketAuth);
-    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, history, sweepMs: 0 });
+    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, history, limiter, ai, sweepMs: 0 });
   });
   return {
     url: server.url,
@@ -173,14 +184,14 @@ async function startRoomServer(
 
 // The four users, one meeting, and a room server. Brings its own Redis (closed by
 // server.close()) unless one is passed in.
-async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, decorateStore, ...meeting } = {}) {
+async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, decorateStore, ai, limiter, ...meeting } = {}) {
   const ownRedis = !redis;
   const conn = redis ?? (await connectTestRedis());
   let room;
   let meetingId;
   try {
     meetingId = await seedMeeting(db, meeting);
-    room = await startRoomServer(db, conn, { serverId, graceMs, livekit, decorateStore });
+    room = await startRoomServer(db, conn, { serverId, graceMs, livekit, decorateStore, ai, limiter });
   } catch (err) {
     if (ownRedis) conn.disconnect(); // fail, don't leak
     throw err;
@@ -294,13 +305,13 @@ async function roomHarness(t, options = {}) {
 
 // Two room servers sharing one Redis and one database, like two API servers behind a
 // load balancer. A client picks its server by which one it connects to.
-async function twoServerHarness(t, meeting = {}) {
+async function twoServerHarness(t, { ai = null, ...meeting } = {}) {
   const db = await setupTestDb();
   const redis = await connectTestRedis();
   const livekit = recordingLivekit();
   const meetingId = await seedMeeting(db, meeting);
-  const a = await startRoomServer(db, redis, { serverId: 'server-a', livekit, adapter: true });
-  const b = await startRoomServer(db, redis, { serverId: 'server-b', livekit, adapter: true });
+  const a = await startRoomServer(db, redis, { serverId: 'server-a', livekit, adapter: true, ai });
+  const b = await startRoomServer(db, redis, { serverId: 'server-b', livekit, adapter: true, ai });
   await Promise.all([a.store.beat(), b.store.beat()]);
   await settle(200); // let both adapters' subscriptions land
   const clients = [];

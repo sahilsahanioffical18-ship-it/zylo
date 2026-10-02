@@ -1,7 +1,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createRoomStore } = require('../lib/roomStore');
-const { twoServerHarness, insertMeeting, waitForEvent, collect, settle } = require('./helpers');
+const { createAi } = require('../lib/ai');
+const { twoServerHarness, insertMeeting, waitForEvent, collect, settle, startFakeAi, aiAnswer } = require('./helpers');
 
 // Whether `promise` settles within ms: a missing event fails an assertion, not the run.
 const within = (promise, ms) => Promise.race([promise.then(() => true), settle(ms).then(() => false)]);
@@ -17,6 +18,25 @@ test('chat sent on one server reaches people on the other', async (t) => {
   const got = waitForEvent(p1, 'chat:message');
   host.emit('chat:message', { text: 'hello from server A' });
   assert.equal((await got).text, 'hello from server A');
+});
+
+test('a question asked on one server streams to people on the other', async (t) => {
+  const provider = await startFakeAi(t, aiAnswer(['From ', 'server A.'], { gapMs: 120 }));
+  const ai = createAi({ baseUrl: provider.baseUrl, apiKey: 'test-key', model: 'test-model' });
+  const { a, b } = await twoServerHarness(t, { ai });
+  const host = await a.join('host');
+  const p1 = await b.join('p1');
+  const question = waitForEvent(p1, 'chat:message');
+  const start = waitForEvent(p1, 'ai:start');
+  const chunks = collect(p1, 'ai:chunk');
+  const done = waitForEvent(p1, 'ai:done');
+  host.emit('ai:ask', { text: 'Which server answers?' });
+  assert.equal((await question).toAi, true);
+  const { id } = await start;
+  assert.equal((await done).text, 'From server A.');
+  assert.equal(chunks.map((c) => c.delta).join(''), 'From server A.');
+  assert.ok(chunks.every((c) => c.id === id));
+  assert.equal(provider.requests.length, 1, "only the asker's server calls the provider");
 });
 
 test('two joins on different servers race for the last seat: exactly one gets it', async (t) => {

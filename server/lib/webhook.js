@@ -1,5 +1,4 @@
 const express = require('express');
-const seats = require('./seats');
 const { isValidCode } = require('./meetingRules');
 
 // POST /livekit/webhook. LiveKit calls this, not a browser, so it is authenticated
@@ -15,7 +14,7 @@ const { isValidCode } = require('./meetingRules');
 // ponytail: they are in the room for one webhook round trip (tens of ms) first.
 // removeParticipant's revokeTokenTs would refuse them at the door; adopt it once
 // it is confirmed on the livekit-server version we deploy.
-function livekitWebhook(livekit) {
+function livekitWebhook(livekit, store) {
   const router = express.Router();
   router.post('/livekit/webhook', express.raw({ type: () => true, limit: '64kb' }), async (req, res) => {
     let event;
@@ -31,7 +30,8 @@ function livekitWebhook(livekit) {
       const userId = event.participant?.identity;
       // Meeting rooms only — which is also what keeps the opt-in live tests (rooms
       // named live-test-*) from being evicted by a dev API server.
-      if (isValidCode(meetingId) && userId && !seats.hasSeat(meetingId, userId)) {
+      // No store means no rooms at all, so nobody holds a seat.
+      if (isValidCode(meetingId) && userId && !(store && (await store.hasSeat(meetingId, userId)))) {
         livekit.evict(meetingId, userId); // never rejects: see lib/livekit.js
       }
     }

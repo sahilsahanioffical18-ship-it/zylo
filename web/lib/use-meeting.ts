@@ -7,14 +7,16 @@ import { toast } from 'sonner';
 import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { validateChatText } from '@/lib/chat-rules';
+import { connectRetryDelay, joinRetryDelay, rateLimitMessage } from '@/lib/rate-limit';
 import { screenDeniedMessage, type ScreenDenial } from '@/lib/screen-share';
 import type { Admission, IncomingCaption, OutgoingCaption, ScreenSharePolicy } from '@/lib/types';
 
 export type Person = { userId: string; name: string; imageUrl: string | null; isHost: boolean; lang: string | null };
 export type LobbyEntry = { userId: string; name: string; imageUrl: string | null };
 // 'full' is Translator Convo only: a 2-seat link that's already taken (server: room.js's
-// meeting:join-request, "a translator convo is a 2-seat link, not a lobby").
-export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied' | 'full';
+// meeting:join-request, "a translator convo is a 2-seat link, not a lobby"). 'unavailable':
+// the server couldn't read its live room state (Redis), so it admitted nobody.
+export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied' | 'full' | 'unavailable';
 export type ChatMessage = { userId: string; name: string; text: string; ts: number };
 
 // ponytail: keep the last 200 in memory; nothing is stored anyway, so scrollback has a
@@ -55,9 +57,12 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
   // no-dependency-array idiom as use-livekit-room.ts's prefsRef.
   const langRef = useRef(opts?.lang ?? null);
   const onCaptionRef = useRef(opts?.onCaption);
+  // Whether we are in the room right now, for the join effect's meeting:denied handler.
+  const admittedRef = useRef(false);
   useEffect(() => {
     langRef.current = opts?.lang ?? null;
     onCaptionRef.current = opts?.onCaption;
+    admittedRef.current = state.status === 'admitted';
   });
 
   useEffect(() => {
@@ -80,19 +85,31 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
       },
     });
     socketRef.current = socket;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let joinTimer: ReturnType<typeof setTimeout> | undefined;
+    let toasted = false; // one notice per outage, not one per retry
 
     // lang rides every join-request, including the one a reconnect re-emits, so a
     // language chosen after the socket already opened isn't lost on a network blip.
-    socket.on('connect', () => socket.emit('meeting:join-request', { meetingId, lang: langRef.current }));
+    const requestJoin = () => socket.emit('meeting:join-request', { meetingId, lang: langRef.current });
+    socket.on('connect', requestJoin);
     // The server is down or the token was refused. Never dress this up as a
     // missing meeting — socket.io keeps retrying, and 'connect' recovers us.
-    socket.on('connect_error', () => setState({ status: 'offline' }));
+    socket.on('connect_error', (err) => {
+      setState({ status: 'offline' });
+      // Refused by the server's connection limit: socket.io won't retry that one.
+      const wait = connectRetryDelay(err);
+      if (wait !== null) retryTimer = setTimeout(() => socket.connect(), wait);
+    });
     socket.on('meeting:waiting', ({ position, manual }: { position: number; manual: boolean }) =>
       setState({ status: 'waiting', position, manual }),
     );
     // room:presence always follows meeting:admitted and carries the roster, so it
     // is what flips us into the room — admitted on its own would render empty.
-    socket.on('room:presence', ({ people }: { people: Person[] }) => setState({ status: 'admitted', people }));
+    socket.on('room:presence', ({ people }: { people: Person[] }) => {
+      toasted = false;
+      setState({ status: 'admitted', people });
+    });
     // Every terminal screen goes through here, so none of them can forget the
     // disconnect. Terminal screen: nothing to reconnect to. Calling disconnect() here is a
     // CLIENT-initiated disconnect, which is what turns off socket.io's automatic
@@ -105,7 +122,16 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
       setState({ status: 'denied', reason });
       socket.disconnect();
     };
-    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => end(reason));
+    socket.on('meeting:denied', ({ reason }: { reason: DeniedReason }) => {
+      // The server can't read its room state, but we are already in the call and the
+      // media doesn't depend on it: stay put and ask again, instead of end().
+      const wait = joinRetryDelay(reason, admittedRef.current);
+      if (wait === null) return end(reason);
+      if (!toasted) toast.error('Meeting server is unavailable for a moment. Your call continues; reconnecting…');
+      toasted = true;
+      clearTimeout(joinTimer);
+      joinTimer = setTimeout(() => socket.connected && requestJoin(), wait);
+    });
     // The spec's contract names: host:kick sends meeting:removed, End for all meeting:ended.
     socket.on('meeting:removed', () => end('removed'));
     socket.on('meeting:ended', () => end('ended'));
@@ -127,12 +153,15 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
     socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));
     socket.on('screen:granted', () => setShareGrant((n) => n + 1));
     socket.on('screen:denied', (denial: ScreenDenial) => toast.error(screenDeniedMessage(denial, brand.live)));
+    socket.on('rate-limited', ({ event }: { event: string }) => toast.error(rateLimitMessage(event)));
     socket.on('screen:state', ({ sharerUserId: id }: { sharerUserId: string | null }) => setSharerUserId(id));
     // Translator Convo only; the server never echoes a caption back to its sender
     // (see room.js's convo:caption — it uses socket.to, not io.to).
     socket.on('convo:caption', (c: IncomingCaption) => onCaptionRef.current?.(c));
 
     return () => {
+      clearTimeout(retryTimer);
+      clearTimeout(joinTimer);
       socket.disconnect();
       socketRef.current = null;
     };

@@ -1,9 +1,10 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../app');
-const { createCache } = require('../lib/cache');
+const { createCache, createRedisCache } = require('../lib/cache');
+const { createLimiter } = require('../lib/rateLimit');
 const { USER_BURST: BURST } = require('../lib/google');
-const { listen, fakeAuth } = require('./helpers');
+const { listen, fakeAuth, setupTestRedis } = require('./helpers');
 
 const fakeDb = { query: async () => ({ rows: [] }) };
 const MP3 = Buffer.from('ID3-fake-mp3-bytes');
@@ -19,8 +20,10 @@ function fakeGoogle(respond = audioResponse) {
   return { fetchUpstream, calls };
 }
 
-async function start(google, opts = {}) {
-  return listen(createApp({ db: fakeDb, auth: fakeAuth, google: { fetchUpstream: google.fetchUpstream, cache: createCache(), ...opts } }));
+async function start(google, { now } = {}) {
+  return listen(
+    createApp({ db: fakeDb, auth: fakeAuth, limiter: createLimiter({ now }), google: { fetchUpstream: google.fetchUpstream, cache: createCache() } }),
+  );
 }
 
 const tts = (base, query, user = 'u1') =>
@@ -154,4 +157,19 @@ test('upstream calls are rate limited per user; cache hits are not', async () =>
   } finally {
     await close();
   }
+});
+
+test('with the Redis cache, a clip fetched through one server is a hit on another', async (t) => {
+  const redis = await setupTestRedis(t);
+  const google = fakeGoogle();
+  const app = () => createApp({ db: fakeDb, auth: fakeAuth, google: { fetchUpstream: google.fetchUpstream, cache: createRedisCache(redis) } });
+  const serverA = await listen(app());
+  const serverB = await listen(app());
+  t.after(serverA.close);
+  t.after(serverB.close);
+  assert.equal((await tts(serverA.base, { lang: 'mr', text: 'नमस्कार' })).headers.get('x-cache'), 'MISS');
+  const res = await tts(serverB.base, { lang: 'mr', text: 'नमस्कार' });
+  assert.equal(res.headers.get('x-cache'), 'HIT');
+  assert.deepEqual(Buffer.from(await res.arrayBuffer()), MP3);
+  assert.equal(google.calls.length, 1);
 });

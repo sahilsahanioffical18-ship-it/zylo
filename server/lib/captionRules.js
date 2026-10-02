@@ -44,37 +44,10 @@ function validateTranslation(translation) {
   return { lang, text: trimmed };
 }
 
-// The first rate limit in Zylo. Captions need one where chat didn't: a client
-// throttles interim results to ~4/s but that's a courtesy, not a guarantee, and
-// Socket.IO enforces no size or rate limit of its own (chatRules' MAX_CHAT_LENGTH
-// is the only other guard, and it caps size, not frequency).
-//
-// A token bucket: refills at RATE tokens/second up to BURST, spends 1 per call.
-const RATE = 8;
-const BURST = 12;
-
-// ponytail: in memory, per socket (bucket lives on socket.data), so a
-// reconnect gets a fresh bucket — fine at 2 seats. Move it to Redis alongside
-// seats.js in Phase 7 if abuse across reconnects becomes a real problem.
-function takeToken(bucket, now, rate = RATE, burst = BURST) {
-  const elapsed = Math.max(0, now - bucket.at) / 1000;
-  bucket.tokens = Math.min(burst, bucket.tokens + elapsed * rate);
-  bucket.at = now;
-  if (bucket.tokens < 1) return false;
-  bucket.tokens -= 1;
-  return true;
-}
-
-const allowCaption = (bucket, now) => takeToken(bucket, now);
-
 module.exports = {
   CONVO_LANGS,
   isConvoLang,
   MAX_CAPTION_LENGTH,
   MAX_TRANSLATION_LENGTH,
   validateCaption,
-  allowCaption,
-  takeToken,
-  RATE,
-  BURST,
 };

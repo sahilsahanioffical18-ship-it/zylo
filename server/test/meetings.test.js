@@ -1,7 +1,7 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../app');
-const { listen, fakeAuth, setupTestDb } = require('./helpers');
+const { listen, fakeAuth, setupTestDb, unlimitedLimiter } = require('./helpers');
 
 const HOUR = 60 * 60 * 1000;
 let db;
@@ -25,7 +25,7 @@ before(async () => {
      ('user_bob', 'bob@example.com', 'Bob'),
      ('user_carol', 'carol@example.com', 'Carol')`,
   );
-  server = await listen(createApp({ db, auth: fakeAuth }));
+  server = await listen(createApp({ db, auth: fakeAuth, limiter: unlimitedLimiter }));
 });
 
 after(async () => {

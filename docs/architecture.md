@@ -199,7 +199,7 @@ session memory, code-collaboration mode. Roadmap bullets only.
 | Signaling + chat | Node.js + Express + Socket.IO, plus `GET /livekit-token` (capacity-checked via `livekit-server-sdk`'s `RoomServiceClient`) | adds judgment-call scanning, save/summary routes |
 | AI | Grok (xAI) API, streamed via SSE, called server-side only | unchanged, adds judgment-call prompt |
 | Speech-to-text | **cut from the project** | **cut** — Phase 4 uses silence + text heuristics instead |
-| Ephemeral state | in-memory (this repo) | Redis with TTL (Phase 3+) |
+| Ephemeral state | Redis: room state (seats, lobby, screen-share lock) changes through Lua scripts in `server/lib/roomStore.js`, so every API server sees the same rooms; Socket.IO Redis adapter, server heartbeat and a sweeper for crashed servers | Redis with TTL (Phase 3+) |
 | Persistent data | none yet | Postgres (Phase 3+) |
 | PDF generation | none yet | Puppeteer/Playwright (Phase 3) |
 | Deployment | local only | Vercel (frontend) + Railway/Fly.io (backend) |

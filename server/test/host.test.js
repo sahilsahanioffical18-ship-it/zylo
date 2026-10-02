@@ -1,6 +1,5 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const seats = require('../lib/seats');
 const {
   roomHarness,
   collect,
@@ -40,7 +39,7 @@ function gateQuery(db, text, param) {
 }
 
 test('a participant sending any host:* event is forbidden and changes nothing', async (t) => {
-  const { db, meetingId, livekit, connect, join } = await roomHarness(t);
+  const { db, meetingId, livekit, connect, join, store } = await roomHarness(t);
   await join('host');
   const p1 = await join('p1');
   const p2 = await join('p2');
@@ -62,8 +61,8 @@ test('a participant sending any host:* event is forbidden and changes nothing', 
   }
 
   assert.equal(livekit.calls.length, baselineCalls);
-  assert.equal(seats.screenSharer(meetingId)?.userId, 'p2');
-  assert.equal(seats.hasSeat(meetingId, 'p2'), true);
+  assert.equal((await store.screenSharer(meetingId))?.userId, 'p2');
+  assert.equal(await store.hasSeat(meetingId, 'p2'), true);
 
   const { rows } = await db.query('SELECT ended_at, screen_share_policy FROM meetings WHERE id = $1', [meetingId]);
   assert.equal(rows[0].ended_at, null);
@@ -99,7 +98,7 @@ test('the host stopping a ZyloLive share ends it and revokes it', async (t) => {
 });
 
 test("a stop aimed at someone who is no longer sharing ends nobody else's share", async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   const host = await join('host');
   await join('p1');
   const p2 = await join('p2');
@@ -108,7 +107,7 @@ test("a stop aimed at someone who is no longer sharing ends nobody else's share"
   host.emit('host:stop-share', { userId: 'p1' });
   await settle();
 
-  assert.equal(seats.screenSharer(meetingId)?.userId, 'p2');
+  assert.equal((await store.screenSharer(meetingId))?.userId, 'p2');
   assert.equal(livekit.callsTo('revokeScreenShare').length, 0);
 });
 
@@ -137,7 +136,7 @@ test("switching ZyloLive to host_only ends a participant's share and is saved", 
 });
 
 test("switching to host_only leaves the host's own share running", async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   const host = await join('host');
   await join('p1');
 
@@ -145,12 +144,12 @@ test("switching to host_only leaves the host's own share running", async (t) => 
   host.emit('host:set-screen-policy', { policy: 'host_only' });
   await settle();
 
-  assert.equal(seats.screenSharer(meetingId)?.userId, 'host');
+  assert.equal((await store.screenSharer(meetingId))?.userId, 'host');
   assert.equal(livekit.callsTo('revokeScreenShare').length, 0);
 });
 
 test('the host kicks someone: they are told, evicted, blocked in the database and refused on rejoin', async (t) => {
-  const { db, meetingId, livekit, connect, join } = await roomHarness(t);
+  const { db, meetingId, livekit, connect, join, store } = await roomHarness(t);
   const host = await join('host');
   const p1 = await join('p1');
 
@@ -164,7 +163,7 @@ test('the host kicks someone: they are told, evicted, blocked in the database an
     presence.at(-1).people.map((p) => p.userId),
     ['host'],
   );
-  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), false);
   assert.deepEqual(livekit.callsTo('evict'), [[meetingId, 'p1']]);
 
   const { rows } = await db.query(
@@ -179,8 +178,25 @@ test('the host kicks someone: they are told, evicted, blocked in the database an
   assert.deepEqual(await denied, { reason: 'removed' });
 });
 
+test('kicking someone in a full room hands their seat to the next in the lobby', async (t) => {
+  const { meetingId, connect, join, store } = await roomHarness(t, { maxParticipants: 2 });
+  const host = await join('host');
+  await join('p1');
+  const p2 = connect('p2');
+  const waiting = waitForEvent(p2, 'meeting:waiting');
+  p2.emit('meeting:join-request', { meetingId });
+  await waiting;
+
+  const admitted = waitForEvent(p2, 'meeting:admitted');
+  host.emit('host:kick', { userId: 'p1' });
+  await admitted;
+
+  assert.equal(await store.hasSeat(meetingId, 'p2'), true);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), false);
+});
+
 test('kicking the presenter ends their share', async (t) => {
-  const { meetingId, livekit, join } = await roomHarness(t);
+  const { meetingId, livekit, join, store } = await roomHarness(t);
   const host = await join('host');
   const p1 = await join('p1');
 
@@ -190,7 +206,7 @@ test('kicking the presenter ends their share', async (t) => {
   await settle();
 
   assert.deepEqual(states.at(-1), { sharerUserId: null });
-  assert.equal(seats.screenSharer(meetingId), null);
+  assert.equal(await store.screenSharer(meetingId), null);
   assert.deepEqual(livekit.callsTo('evict'), [[meetingId, 'p1']]);
 });
 
@@ -214,13 +230,12 @@ test('a join that lands mid-kick is refused, and the kick still works', async (t
   const raw = await setupTestDb();
   const livekit = recordingLivekit();
   const { db, arm, paused, release } = gateQuery(raw, 'SELECT name, image_url FROM users WHERE id = $1', 'p1');
-  const { meetingId, server } = await startRoom(db, { livekit });
+  const { meetingId, server, store } = await startRoom(db, { livekit });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await settle();
     await server.close();
-    seats.clearMeeting(meetingId);
     await raw.close();
   });
 
@@ -243,14 +258,14 @@ test('a join that lands mid-kick is refused, and the kick still works', async (t
   await paused; // rejoin is stuck awaiting userInfo, past its own isRemoved check
 
   host.emit('host:kick', { userId: 'p1' });
-  await settle(); // host:kick's in-memory mark and its DB commit both land while paused
+  await settle(); // host:kick's removed mark in the store and its DB commit both land while paused
 
   release();
   await settle();
 
   assert.deepEqual(denied, [{ reason: 'removed' }]);
   assert.deepEqual(admitted, []);
-  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), false);
 
   const { rows } = await raw.query(
     'SELECT removed_at FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2',
@@ -263,13 +278,12 @@ test('a join that lands mid-end-for-all is refused', async (t) => {
   const raw = await setupTestDb();
   const livekit = recordingLivekit();
   const { db, arm, paused, release } = gateQuery(raw, 'SELECT name, image_url FROM users WHERE id = $1', 'p1');
-  const { meetingId, server } = await startRoom(db, { livekit });
+  const { meetingId, server, store } = await startRoom(db, { livekit });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await settle();
     await server.close();
-    seats.clearMeeting(meetingId);
     await raw.close();
   });
 
@@ -285,25 +299,24 @@ test('a join that lands mid-end-for-all is refused', async (t) => {
   await paused; // p1 is stuck awaiting userInfo, past its own isRemoved check
 
   host.emit('host:end-meeting');
-  await settle(); // markEnded commits, sockets are told, liveMeetings.delete runs
+  await settle(); // markEnded commits, sockets are told, the room is cleared in the store
 
   release();
   await settle();
 
   assert.deepEqual(denied, [{ reason: 'ended' }]);
   assert.deepEqual(admitted, []);
-  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), false);
 });
 
 test('without LiveKit configured the host can still kick', async (t) => {
   const db = await setupTestDb();
-  const { meetingId, server } = await startRoom(db); // livekit defaults to null
+  const { meetingId, server, store } = await startRoom(db); // livekit defaults to null
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
     await settle();
     await server.close();
-    seats.clearMeeting(meetingId);
     await db.close();
   });
 
@@ -317,7 +330,7 @@ test('without LiveKit configured the host can still kick', async (t) => {
   await removed;
   await settle();
 
-  assert.equal(seats.hasSeat(meetingId, 'p1'), false);
+  assert.equal(await store.hasSeat(meetingId, 'p1'), false);
   const { rows } = await db.query(
     'SELECT removed_at FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2',
     [meetingId, 'p1'],
@@ -326,13 +339,13 @@ test('without LiveKit configured the host can still kick', async (t) => {
 });
 
 test('the host cannot kick themselves', async (t) => {
-  const { db, meetingId, livekit, join } = await roomHarness(t);
+  const { db, meetingId, livekit, join, store } = await roomHarness(t);
   const host = await join('host');
 
   host.emit('host:kick', { userId: 'host' });
   await settle();
 
-  assert.equal(seats.hasSeat(meetingId, 'host'), true);
+  assert.equal(await store.hasSeat(meetingId, 'host'), true);
   const { rows } = await db.query(
     'SELECT removed_at FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2',
     [meetingId, 'host'],
@@ -359,7 +372,7 @@ test("host:mute mutes a seated participant's microphone, and nobody else's", asy
 });
 
 test('ending the meeting for everyone tells everyone, ends it, and closes the LiveKit room', async (t) => {
-  const { db, meetingId, livekit, connect, join } = await roomHarness(t, { maxParticipants: 2 });
+  const { db, meetingId, livekit, connect, join, store } = await roomHarness(t, { maxParticipants: 2 });
   const host = await join('host');
   const p1 = await join('p1');
   const p2 = connect('p2');
@@ -375,7 +388,7 @@ test('ending the meeting for everyone tells everyone, ends it, and closes the Li
   await settle();
 
   assert.deepEqual(livekit.callsTo('endRoom'), [[meetingId]]);
-  assert.deepEqual(seats.listSeats(meetingId), []);
+  assert.deepEqual(await store.listSeats(meetingId), []);
 
   const { rows } = await db.query('SELECT ended_at FROM meetings WHERE id = $1', [meetingId]);
   assert.notEqual(rows[0].ended_at, null);

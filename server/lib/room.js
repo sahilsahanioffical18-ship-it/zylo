@@ -1,24 +1,52 @@
-const seats = require('./seats');
 const { validateChatText } = require('./chatRules');
-const { isConvoLang, validateCaption, allowCaption, BURST } = require('./captionRules');
+const { isConvoLang, validateCaption } = require('./captionRules');
+const { SOCKET_POLICIES, takeToken } = require('./rateLimit');
+const { GRACE_MS } = require('./roomStore');
 
 const roomChannel = (meetingId) => `meeting:${meetingId}`;
 
-function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS } = {}) {
-  // Settings for every meeting that is currently live, so the host check and the
-  // seat cap never wait on the DB inside a seat-grab path.
-  const liveMeetings = new Map();
+const SWEEP_MS = 15_000;
+const HEARTBEAT_MS = 10_000;
+const IDLE_ROOM_MS = 60_000;
+
+// Per-socket buckets (SOCKET_POLICIES). A socket lives on one server for its whole
+// life, so these need no Redis round trip; captions are the busiest event in Zylo.
+// The per-IP connection limit (limitConnections) stops a reconnect from buying a
+// fresh bucket.
+function allowEvent(socket, name) {
+  const { rate, burst } = SOCKET_POLICIES[name];
+  const now = Date.now();
+  const buckets = (socket.data.buckets ??= {});
+  return takeToken((buckets[name] ??= { tokens: burst, at: now }), now, rate, burst);
+}
+
+// Seats, the lobby, the screen-share lock and live settings live in the room store
+// (Redis), shared by every API server. A socket may live on another server, so
+// sockets are reached by id: io.to(id) sends, io.in(id).socketsJoin/socketsLeave
+// moves it, io.in(id).fetchSockets() asks whether it's still connected. All of these
+// work with the default in-memory adapter too. socket.data.meetingId is only a hint:
+// every handler that acts checks in the store that this socket holds the seat or
+// lobby entry it acts through.
+function registerRoomHandlers(
+  io,
+  { db, store, livekit = null, graceMs = GRACE_MS, sweepMs = SWEEP_MS, idleRoomMs = IDLE_ROOM_MS },
+) {
+  const graceTimers = new Set();
+  let stopped = false;
 
   async function loadMeetingMeta(meetingId) {
-    const cached = liveMeetings.get(meetingId);
-    if (cached) return cached;
+    const live = await store.getMeta(meetingId);
+    // initMeta on a room that exists only renews its age, so the idle sweep can't
+    // clear it between here and the join script. False: it ended meanwhile; the
+    // database below says so.
+    if (live && (await store.initMeta(meetingId, live))) return live;
     const { rows } = await db.query(
       `SELECT host_id, admission, screen_share_policy, max_participants, mode, ended_at
        FROM meetings WHERE id = $1`,
       [meetingId],
     );
     if (rows.length === 0) return null;
-    if (rows[0].ended_at) return { ended: true }; // never cached: it is over
+    if (rows[0].ended_at) return { ended: true };
     const meta = {
       hostId: rows[0].host_id,
       admission: rows[0].admission,
@@ -26,7 +54,9 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       maxParticipants: rows[0].max_participants,
       mode: rows[0].mode,
     };
-    liveMeetings.set(meetingId, meta);
+    // Refused for an hour after the meeting ended: a join that read the row just
+    // before "End for all" committed must not bring the room back.
+    if (!(await store.initMeta(meetingId, meta))) return { ended: true };
     return meta;
   }
 
@@ -61,132 +91,178 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
       [meetingId, userId, isHostUser ? 'host' : 'participant'],
     );
 
-  // Every seat release in this file goes through here, so none of them can forget
-  // LiveKit: the seat is the only thing that authorizes media, so losing it ends the
-  // media session too. A token outlives its seat by up to 10 minutes; a reconnect
-  // with one is evicted by lib/webhook.js. The seats release below calls onExpire
-  // for an immediate release as well as at grace expiry, so wrapping it covers both.
-  function freeSeat(meetingId, userId, { onExpire, ...rest } = {}) {
-    seats.releaseSeat(meetingId, userId, {
-      ...rest,
-      onExpire: () => {
-        livekit?.evict(meetingId, userId); // never rejects
-        onExpire?.();
-      },
-    });
+  // Asks as little as it can: a socket of ours is in this process, a server whose
+  // heartbeat lapsed has none, and only a live other server is asked over the adapter.
+  // That ask can time out (the adapter counts a dead server until its connection
+  // drops); then we can't tell, and treat it as connected: a tab that is gone is
+  // released by its own disconnect, or by the sweep, but a wrong "gone" loses a waiter.
+  const isConnected = async (socketId, serverId) => {
+    if (serverId === store.serverId) return io.sockets.sockets.has(socketId);
+    if (!(await store.isServerAlive(serverId))) return false;
+    try {
+      return (await io.in(socketId).fetchSockets()).length > 0;
+    } catch {
+      return true;
+    }
+  };
+
+  // Every seat release goes through here, so none can forget LiveKit: the seat is
+  // the only thing that authorizes media. socketId: release only if that socket
+  // still holds the seat; null for the host acting on someone.
+  async function freeSeat(meetingId, userId, socketId = null) {
+    const released = await store.releaseSeat(meetingId, userId, socketId);
+    if (released) livekit?.evict(meetingId, userId); // never rejects
+    return released;
   }
 
-  function broadcastPresence(meetingId) {
-    io.to(roomChannel(meetingId)).emit('room:presence', {
-      people: seats
-        .listSeats(meetingId)
-        .map(({ userId, name, imageUrl, isHost, lang }) => ({ userId, name, imageUrl, isHost, lang: lang ?? null })),
-    });
+  async function presenceOf(meetingId) {
+    return (await store.listSeats(meetingId)).map(({ userId, name, imageUrl, isHost, lang }) => ({
+      userId,
+      name,
+      imageUrl,
+      isHost,
+      lang: lang ?? null,
+    }));
+  }
+
+  // exceptSocketId: someone who was just sent the roster by admit() and needs no second copy.
+  async function broadcastPresence(meetingId, exceptSocketId = null) {
+    const people = await presenceOf(meetingId);
+    io.to(roomChannel(meetingId)).except(exceptSocketId ?? []).emit('room:presence', { people });
   }
 
   // One call refreshes both sides of the lobby: the host's list, and every waiting
-  // person's position (the spec promises everyone a new position when the queue
-  // moves). Callers only ever have to remember this one function.
-  function broadcastLobby(meetingId) {
-    const meta = liveMeetings.get(meetingId);
-    const waiting = seats.queuedEntries(meetingId);
-    const host = seats.listSeats(meetingId).find((seat) => seat.isHost);
-    const hostSocket = host ? io.sockets.sockets.get(host.socketId) : null;
-    if (hostSocket) {
-      hostSocket.emit('lobby:update', {
+  // person's position.
+  async function broadcastLobby(meetingId) {
+    const [meta, waiting, seated] = await Promise.all([
+      store.getMeta(meetingId),
+      store.queuedEntries(meetingId),
+      store.listSeats(meetingId),
+    ]);
+    const host = seated.find((seat) => seat.isHost);
+    if (host) {
+      io.to(host.socketId).emit('lobby:update', {
         waiting: waiting.map(({ userId, name, imageUrl }) => ({ userId, name, imageUrl })),
       });
     }
     waiting.forEach((entry, index) => {
-      io.sockets.sockets
-        .get(entry.socketId)
-        ?.emit('meeting:waiting', { position: index + 1, manual: meta?.admission === 'manual' });
+      io.to(entry.socketId).emit('meeting:waiting', { position: index + 1, manual: meta?.admission === 'manual' });
     });
   }
 
-  // The one place the room hears who is presenting, so the lock and what every
-  // client believes cannot drift apart.
-  function broadcastScreen(meetingId) {
-    io.to(roomChannel(meetingId)).emit('screen:state', { sharerUserId: seats.screenSharer(meetingId)?.userId ?? null });
+  // The one place the room hears who is presenting.
+  async function broadcastScreen(meetingId) {
+    const sharer = await store.screenSharer(meetingId);
+    io.to(roomChannel(meetingId)).emit('screen:state', { sharerUserId: sharer?.userId ?? null });
   }
 
-  // Ends a share if `holderSocketId` holds the lock: release (synchronously, so a
-  // request racing this sees it gone), revoke at LiveKit (fire and forget; never
-  // rejects), tell the room.
-  function releaseScreen(meetingId, holderSocketId) {
-    const released = seats.releaseScreenLock(meetingId, holderSocketId);
+  // Ends a share if `holderSocketId` holds the lock: release (one script, so a
+  // request racing this sees it gone), revoke at LiveKit, tell the room.
+  async function releaseScreen(meetingId, holderSocketId) {
+    const released = await store.releaseScreenLock(meetingId, holderSocketId);
     if (!released) return;
     livekit?.revokeScreenShare(meetingId, released.userId);
-    broadcastScreen(meetingId);
+    await broadcastScreen(meetingId);
   }
 
-  // Presence and lobby are NOT broadcast here: callers admitting several people at
-  // once broadcast one time at the end instead of once per person.
-  async function admit(socket, meetingId, isHostUser, result) {
-    // A share belongs to the page that started it. When a newer page takes this seat,
-    // the old page's share ends now — before the awaits below, so it cannot keep
-    // presenting while the DB catches up — and the new page never inherits it.
-    if (result.replacedSocketId) releaseScreen(meetingId, result.replacedSocketId);
-    await upsertParticipant(meetingId, socket.data.userId, isHostUser);
+  // Runs the admission side effects for a socket that already holds its seat, on
+  // whichever server it lives. Room-wide presence and lobby broadcasts are the caller's.
+  async function admit(socketId, meetingId, userId, isHostUser, replacedSocketId) {
+    // A share belongs to the page that started it: a newer page taking this seat
+    // ends the old page's share, and never inherits it.
+    if (replacedSocketId) await releaseScreen(meetingId, replacedSocketId);
+    await upsertParticipant(meetingId, userId, isHostUser);
     await markStarted(meetingId);
-    if (result.replacedSocketId) {
-      const old = io.sockets.sockets.get(result.replacedSocketId);
-      if (old) {
-        old.data.meetingId = null;
-        old.leave(roomChannel(meetingId));
-        old.emit('meeting:replaced');
-      }
+    if (replacedSocketId) {
+      io.in(replacedSocketId).socketsLeave(roomChannel(meetingId));
+      io.to(replacedSocketId).emit('meeting:replaced');
     }
-    socket.data.meetingId = meetingId;
-    socket.join(roomChannel(meetingId));
-    socket.emit('meeting:admitted');
-    // Arriving mid-presentation: say who is presenting; later changes arrive by broadcastScreen.
-    socket.emit('screen:state', { sharerUserId: seats.screenSharer(meetingId)?.userId ?? null });
+    io.in(socketId).socketsJoin(roomChannel(meetingId));
+    // Read first, then send all three back to back: the client holds the roster and
+    // who is presenting by the time it has handled "admitted", as it did when this
+    // all lived in one process. Straight to this socket: on another server the room
+    // join above can land after the caller's room-wide broadcast.
+    const [people, sharer] = await Promise.all([presenceOf(meetingId), store.screenSharer(meetingId)]);
+    io.to(socketId).emit('meeting:admitted');
+    io.to(socketId).emit('room:presence', { people });
+    io.to(socketId).emit('screen:state', { sharerUserId: sharer?.userId ?? null });
   }
 
-  // drainQueue already took the seat; this only runs the admission side effects.
+  // drainQueue already took the seat; a tab that closed meanwhile hands it straight back.
   async function admitDrained(entry, meetingId) {
-    const socket = io.sockets.sockets.get(entry.socketId);
-    if (!socket) {
-      // Their tab is gone: hand the seat straight back rather than leak it.
-      freeSeat(meetingId, entry.userId, { immediate: true });
+    if (!(await isConnected(entry.socketId, entry.serverId))) {
+      await freeSeat(meetingId, entry.userId, entry.socketId);
       return;
     }
-    await admit(socket, meetingId, false, { replacedSocketId: null });
+    await admit(entry.socketId, meetingId, entry.userId, false, null);
+  }
+
+  // Seats everyone the lobby has room for (nobody while admission is manual). A seat
+  // handed back by a closed tab is offered again, so it is asked until a round seats no
+  // one. Resolves to whether anyone was seated.
+  async function drainLobby(meetingId) {
+    let seated = false;
+    for (;;) {
+      const drained = await store.drainQueue(meetingId);
+      if (drained.length === 0) return seated;
+      seated = true;
+      for (const entry of drained) await admitDrained(entry, meetingId);
+    }
   }
 
   async function onSeatFreed(meetingId) {
-    const meta = liveMeetings.get(meetingId);
-    if (!meta) return;
-    if (meta.admission === 'auto') {
-      for (const entry of seats.drainQueue(meetingId, meta.maxParticipants)) {
-        await admitDrained(entry, meetingId);
-      }
+    if (!(await store.getMeta(meetingId))) return;
+    await drainLobby(meetingId);
+    await broadcastPresence(meetingId);
+    await broadcastScreen(meetingId); // a released seat drops the lock with it
+    await broadcastLobby(meetingId);
+    if ((await store.listSeats(meetingId)).length > 0) return;
+    await endEmptyRoom(meetingId);
+  }
+
+  // Nobody is seated any more, so the meeting is over. Whoever the clear drops, a
+  // lobby waiter or a join seated in the gap just before it, is told rather than left spinning.
+  async function endEmptyRoom(meetingId) {
+    const { rowCount } = await markEnded(meetingId);
+    for (const id of await store.clearMeeting(meetingId, { ended: rowCount > 0 })) {
+      io.to(id).emit('meeting:denied', { reason: 'ended' });
     }
-    broadcastPresence(meetingId);
-    broadcastScreen(meetingId); // releaseSeat drops the lock with the seat
-    broadcastLobby(meetingId);
-    if (seats.listSeats(meetingId).length > 0) return;
-    // Nobody is seated any more, so the meeting is over. Anyone still in the
-    // lobby is told rather than left spinning.
-    for (const entry of seats.queuedEntries(meetingId)) {
-      io.sockets.sockets.get(entry.socketId)?.emit('meeting:denied', { reason: 'ended' });
-    }
-    await markEnded(meetingId);
-    seats.clearMeeting(meetingId);
-    liveMeetings.delete(meetingId);
   }
 
   // Every host-only event runs through this. Authorization is a server check:
-  // whether the client renders the button is irrelevant.
-  function hostGuard(socket) {
+  // whether the client renders the button is irrelevant. The host's seat must be
+  // held by this very socket: a replaced tab keeps a stale meetingId.
+  async function hostGuard(socket) {
+    if (!allowEvent(socket, 'host')) {
+      socket.emit('rate-limited', { event: 'host' });
+      return null;
+    }
     const { meetingId, userId } = socket.data;
-    const meta = meetingId ? liveMeetings.get(meetingId) : null;
-    if (!meta || meta.hostId !== userId) {
+    const meta = meetingId ? await store.getMeta(meetingId) : null;
+    const seat = meta && meta.hostId === userId ? await store.seatFor(meetingId, userId) : null;
+    if (!seat || seat.socketId !== socket.id) {
       socket.emit('error:forbidden');
       return null;
     }
     return { meetingId, meta };
+  }
+
+  // Started only after markGrace resolved, so it can't fire before the deadline
+  // Redis stamped. Does nothing if the person came back on any server.
+  function startGraceTimer(meetingId, userId, socketId) {
+    if (stopped) return;
+    const timer = setTimeout(() => {
+      graceTimers.delete(timer);
+      expireGrace(meetingId, userId, socketId).catch((err) => console.error('seat release failed:', err.message));
+    }, graceMs);
+    timer.unref(); // a held seat must never keep the process alive
+    graceTimers.add(timer);
+  }
+
+  async function expireGrace(meetingId, userId, socketId) {
+    if (!(await store.releaseIfStale(meetingId, userId, socketId))) return;
+    livekit?.evict(meetingId, userId);
+    await onSeatFreed(meetingId);
   }
 
   // Socket.IO does not catch rejections from async handlers, and one unhandled
@@ -198,316 +274,371 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
         .catch((err) => console.error(`socket ${event} failed:`, err.message)),
     );
 
+  // Crash recovery, run by every server every sweepMs. Each step is a script that
+  // checks before it changes anything, so servers sweeping at once is harmless.
+  // ponytail: walks every live meeting with a few round trips each; fine for hundreds
+  // of rooms. Split the live set per server if that ever stops being true.
+  async function sweep() {
+    const alive = new Map();
+    // Gone: its server's heartbeat stopped, or it is ours and not connected here.
+    const gone = async ({ serverId, socketId }) => {
+      if (serverId === store.serverId) return !io.sockets.sockets.has(socketId);
+      if (!alive.has(serverId)) alive.set(serverId, await store.isServerAlive(serverId));
+      return !alive.get(serverId);
+    };
+    // One room failing must not skip the rest: keep going, then report the first error.
+    let failure = null;
+    for (const meetingId of await store.liveMeetings()) {
+      try {
+        if (!(await store.getMeta(meetingId))) {
+          await store.forgetLive(meetingId);
+          continue;
+        }
+        let seatFreed = false;
+        let lobbyChanged = false;
+        for (const seat of await store.listSeats(meetingId)) {
+          if (seat.graceUntil) {
+            if (seat.serverId === store.serverId && io.sockets.sockets.has(seat.socketId)) {
+              // Stamped by another server while our heartbeat had lapsed; we're still here.
+              await store.keepSeat(meetingId, seat.userId, seat.socketId);
+            } else if (await store.releaseIfStale(meetingId, seat.userId, seat.socketId)) {
+              livekit?.evict(meetingId, seat.userId);
+              seatFreed = true;
+            }
+          } else if (await gone(seat)) {
+            // Released on a later sweep, unless they come back first.
+            await store.markGrace(meetingId, seat.userId, seat.socketId, graceMs);
+          }
+        }
+        const queued = await store.queuedEntries(meetingId);
+        for (const entry of queued) {
+          if ((await gone(entry)) && (await store.removeFromQueue(meetingId, entry.userId, entry.socketId))) lobbyChanged = true;
+        }
+        const sharer = await store.screenSharer(meetingId);
+        if (sharer && (await gone(sharer))) await releaseScreen(meetingId, sharer.socketId);
+        // Anyone still waiting is offered a seat on every pass, not only the one that freed
+        // one: an earlier drain may have failed halfway. One script call, and it seats no
+        // one when there is nothing to do (or admission is manual).
+        const seated = queued.length > 0 && (await drainLobby(meetingId));
+        if (seatFreed || seated) await onSeatFreed(meetingId);
+        else if (lobbyChanged) await broadcastLobby(meetingId);
+        else if (await store.clearIfIdle(meetingId, idleRoomMs)) await markEnded(meetingId);
+      } catch (err) {
+        failure ??= err;
+      }
+    }
+    // Live in Postgres but held by no server: a crash, or Redis lost its data.
+    try {
+      const { rows } = await db.query('SELECT id FROM meetings WHERE started_at IS NOT NULL AND ended_at IS NULL');
+      const live = new Set(rows.length > 0 ? await store.liveMeetings() : []);
+      for (const { id } of rows) {
+        if (live.has(id)) continue;
+        // Its code may only have dropped out of the live set: put it back, don't end it.
+        if (await store.getMeta(id)) {
+          await store.markLive(id);
+          continue;
+        }
+        // Ended as "End for all" does: the row, then whoever is still in the room, the
+        // tombstone that refuses a rejoin, and LiveKit. Only the server that changed the
+        // row does the rest, so two sweeps don't both do it.
+        const { rowCount } = await markEnded(id);
+        if (rowCount === 0) continue;
+        io.to(roomChannel(id)).emit('meeting:ended');
+        await store.clearMeeting(id, { ended: true });
+        livekit?.endRoom(id); // never rejects
+      }
+    } catch (err) {
+      failure ??= err;
+    }
+    if (failure) throw failure;
+  }
+
+  let sweeping = false;
+  let sweepFailing = false;
+  async function runSweep() {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      await sweep();
+      sweepFailing = false;
+    } catch (err) {
+      if (!sweepFailing) console.error('room sweep failed:', err.message); // once per outage
+      sweepFailing = true;
+    } finally {
+      sweeping = false;
+    }
+  }
+
+  // Redis being down is already logged once by redis.js; a missed beat just retries.
+  const beat = () => store.beat().catch(() => {});
+  const timers = [];
+  if (sweepMs > 0) {
+    beat();
+    timers.push(setInterval(beat, HEARTBEAT_MS), setInterval(runSweep, sweepMs));
+    timers.forEach((timer) => timer.unref());
+  }
+
+  async function joinMeeting(socket, meetingId, lang) {
+    const meta = await loadMeetingMeta(meetingId);
+    if (!meta) return socket.emit('meeting:denied', { reason: 'not_found' });
+    if (meta.ended) return socket.emit('meeting:denied', { reason: 'ended' });
+
+    const { userId } = socket.data;
+    if (await isRemoved(meetingId, userId)) return socket.emit('meeting:denied', { reason: 'removed' });
+
+    const isHostUser = meta.hostId === userId;
+    const { name, imageUrl } = await userInfo(userId);
+    // lang only means anything in a translator convo, and only if it is one of
+    // the supported codes; anything else silently becomes null, like chat.
+    const seatLang = meta.mode === 'translator' && isConvoLang(lang) ? lang : null;
+    // One script decides the rest atomically: removed or ended while we awaited,
+    // a reconnect taking its own seat back, the manual lobby, the host's reserved
+    // seat, a full translator convo, a full room's lobby.
+    const outcome = await store.join(
+      meetingId,
+      { userId, socketId: socket.id, name, imageUrl, lang: seatLang },
+      { isHost: isHostUser },
+    );
+    if (outcome.result === 'ended' || outcome.result === 'removed' || outcome.result === 'full') {
+      return socket.emit('meeting:denied', { reason: outcome.result });
+    }
+    socket.data.meetingId = meetingId;
+    if (outcome.result === 'queued') return broadcastLobby(meetingId);
+    await admit(socket.id, meetingId, userId, isHostUser, outcome.replacedSocketId);
+    await broadcastPresence(meetingId, socket.id);
+    // A host arriving needs to see whoever is already waiting for them.
+    if (isHostUser) await broadcastLobby(meetingId);
+  }
+
   io.on('connection', (socket) => {
     on(socket, 'meeting:join-request', async ({ meetingId, lang } = {}) => {
+      if (!allowEvent(socket, 'meeting:join-request')) return socket.emit('rate-limited', { event: 'meeting:join-request' });
       if (typeof meetingId !== 'string') return socket.emit('meeting:denied', { reason: 'not_found' });
-      const meta = await loadMeetingMeta(meetingId);
-      if (!meta) return socket.emit('meeting:denied', { reason: 'not_found' });
-      if (meta.ended) return socket.emit('meeting:denied', { reason: 'ended' });
-
-      const { userId } = socket.data;
-      if (await isRemoved(meetingId, userId)) return socket.emit('meeting:denied', { reason: 'removed' });
-
-      const isHostUser = meta.hostId === userId;
-      const { name, imageUrl } = await userInfo(userId);
-      // host:end-meeting (or the last seat emptying) can land during the awaits above,
-      // and so can host:kick — the DB check above ran before either.
-      if (!liveMeetings.has(meetingId)) return socket.emit('meeting:denied', { reason: 'ended' });
-      if (meta.removed?.has(userId)) return socket.emit('meeting:denied', { reason: 'removed' });
-      // lang only means anything in a translator convo, and only if it is one of
-      // the supported codes — anything else silently becomes null, like chat.
-      const seatLang = meta.mode === 'translator' && isConvoLang(lang) ? lang : null;
-      const entry = { userId, socketId: socket.id, name, imageUrl, lang: seatLang };
-
-      // Every DB read is done. From here down nothing awaits until the seat is
-      // written, which is what makes the last-seat race safe.
-      // Someone who already holds a seat is reconnecting, so they skip the lobby.
-      if (meta.admission === 'manual' && !isHostUser && !seats.hasSeat(meetingId, userId)) {
-        seats.enqueue(meetingId, entry);
-        socket.data.meetingId = meetingId;
-        return broadcastLobby(meetingId);
+      try {
+        await joinMeeting(socket, meetingId, lang);
+      } catch (err) {
+        // The store or the database can't be read: never admit anyone blind.
+        console.error('join failed:', err.message);
+        socket.emit('meeting:denied', { reason: 'unavailable' });
       }
-      const result = seats.tryTakeSeat(meetingId, {
-        ...entry,
-        isHost: isHostUser,
-        max: meta.maxParticipants,
-      });
-      if (!result.ok) {
-        // A translator convo is a 2-seat link, not a lobby: a 3rd person is told
-        // straight away instead of joining a queue nobody will ever drain from.
-        if (meta.mode === 'translator') return socket.emit('meeting:denied', { reason: 'full' });
-        seats.enqueue(meetingId, entry);
-        socket.data.meetingId = meetingId;
-        return broadcastLobby(meetingId);
-      }
-      await admit(socket, meetingId, isHostUser, result);
-      broadcastPresence(meetingId);
-      // A host arriving needs to see whoever is already waiting for them.
-      if (isHostUser) broadcastLobby(meetingId);
     });
 
-    // Translator convos only. Requires the seat this socket actually holds (not
-    // the lobby, not a replaced or stale tab — same rule as chat/screen below),
-    // so nobody can set a language for a meeting they aren't seated in.
-    on(socket, 'convo:set-lang', ({ lang } = {}) => {
+    // Translator convos only, and only through the seat this socket holds.
+    on(socket, 'convo:set-lang', async ({ lang } = {}) => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
-      const seat = seats.seatFor(meetingId, userId);
-      if (!seat || seat.socketId !== socket.id) return;
-      const meta = liveMeetings.get(meetingId);
-      if (!meta || meta.mode !== 'translator') return;
+      if (!allowEvent(socket, 'convo:set-lang')) return;
       if (!isConvoLang(lang)) return;
-      seats.setSeatLang(meetingId, userId, lang);
-      broadcastPresence(meetingId);
+      const meta = await store.getMeta(meetingId);
+      if (!meta || meta.mode !== 'translator') return;
+      if (!(await store.setSeatLang(meetingId, userId, socket.id, lang))) return;
+      await broadcastPresence(meetingId);
     });
 
-    // Translator convos only. Same authorization shape as chat:message above —
-    // the seat this socket actually holds is the only thing that proves anything
-    // (not the lobby, not a replaced or stale tab) — plus two checks chat
-    // doesn't need: the meeting must be in translator mode, and the sender must
-    // still have tokens in its bucket. Identity (userId, name) comes from the
-    // seat, never the payload, for the same reason chat does it: nobody can
-    // caption as someone else. socket.to (not io.to) excludes the sender — it
-    // already rendered its own caption locally the instant it recognized it, so
-    // echoing it back would just be wasted bandwidth and a second render.
-    on(socket, 'convo:caption', (payload) => {
+    // Translator convos only. Identity comes from the seat, never the payload.
+    // socket.to (not io.to) excludes the sender, which already rendered its own caption.
+    on(socket, 'convo:caption', async (payload) => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
-      const seat = seats.seatFor(meetingId, userId);
+      // Captions are chatty (interim results, client-throttled to ~4/s); extras past
+      // the bucket are dropped silently, since the next interim replaces them anyway.
+      // Before any store read, so a socket that may not caption costs Redis nothing
+      // beyond the burst.
+      if (!allowEvent(socket, 'convo:caption')) return;
+      const [seat, meta] = await Promise.all([store.seatFor(meetingId, userId), store.getMeta(meetingId)]);
       if (!seat || seat.socketId !== socket.id) return;
-      const meta = liveMeetings.get(meetingId);
       if (!meta || meta.mode !== 'translator') return;
-      // Captions are chatty (interim results, client-throttled to ~4/s) and
-      // Socket.IO has no rate guard of its own — this is the first rate limit
-      // in Zylo. The bucket lives on the socket, so it's per-connection.
-      const now = Date.now();
-      if (!allowCaption((socket.data.captionBucket ??= { tokens: BURST, at: now }), now)) return;
       const clean = validateCaption(payload);
-      if (!clean) return; // a client bug or a probe; see chat:message above
+      if (!clean) return;
       socket.to(roomChannel(meetingId)).emit('convo:caption', { userId, name: seat.name, ...clean, ts: Date.now() });
     });
 
     on(socket, 'meeting:leave', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return socket.disconnect(true);
-      seats.removeFromQueue(meetingId, userId);
-      freeSeat(meetingId, userId, { immediate: true });
+      // Only what this socket owns: a replaced tab's leave must not free the new tab's seat.
+      const dequeued = await store.removeFromQueue(meetingId, userId, socket.id);
+      const freed = await freeSeat(meetingId, userId, socket.id);
       socket.leave(roomChannel(meetingId));
       socket.data.meetingId = null;
-      await onSeatFreed(meetingId);
+      // A waiter leaving frees no seat: the room is not empty, only the lobby changed.
+      if (freed) await onSeatFreed(meetingId);
+      else if (dequeued) await broadcastLobby(meetingId);
       socket.disconnect(true);
     });
 
-    // ZyloChat. roomChannel holds exactly the seated members — a socket joins it only
-    // inside admit() — so joining it is both the authorization scope and the delivery
-    // scope. But socket.data.meetingId is also set for people still in the lobby, so
-    // it proves nothing on its own: the seat lookup is the real check. The name comes
-    // from the seat, never the payload, so nobody can speak as someone else.
-    on(socket, 'chat:message', ({ text } = {}) => {
+    // ZyloChat. The name comes from the seat, never the payload.
+    on(socket, 'chat:message', async ({ text } = {}) => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
-      const seat = seats.seatFor(meetingId, userId);
+      if (!allowEvent(socket, 'chat:message')) return socket.emit('rate-limited', { event: 'chat:message' });
+      const seat = await store.seatFor(meetingId, userId);
       if (!seat || seat.socketId !== socket.id) return;
       const clean = validateChatText(text);
-      if (!clean) return; // a client bug or a probe; see host:set-admission below
+      if (!clean) return;
       io.to(roomChannel(meetingId)).emit('chat:message', { userId, name: seat.name, text: clean, ts: Date.now() });
     });
 
-    // ZyloLive. From the seat check to tryTakeScreenLock nothing awaits, so two
-    // people pressing ZyloLive together cannot both win: Node finishes one
-    // handler's synchronous run before starting the other's.
+    // ZyloLive. The lock script re-checks the seat and the host-only policy, so two
+    // people pressing ZyloLive together (on any servers) cannot both win.
     on(socket, 'screen:request', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
-      const seat = seats.seatFor(meetingId, userId);
+      if (!allowEvent(socket, 'screen:request')) return socket.emit('rate-limited', { event: 'screen:request' });
+      const seat = await store.seatFor(meetingId, userId);
       if (!seat || seat.socketId !== socket.id) return; // lobby or replaced tab: ignored, like chat
-      const meta = liveMeetings.get(meetingId);
-      if (!meta) return;
       if (!livekit) return socket.emit('screen:denied', { reason: 'unavailable' });
-      if (meta.screenSharePolicy === 'host_only' && meta.hostId !== userId) {
-        return socket.emit('screen:denied', { reason: 'host_only' });
-      }
-      const lock = seats.tryTakeScreenLock(meetingId, { userId, socketId: socket.id });
+      const lock = await store.takeScreenLock(meetingId, { userId, socketId: socket.id });
+      if (lock.reason === 'noseat') return;
+      if (lock.reason === 'host_only') return socket.emit('screen:denied', { reason: 'host_only' });
       if (!lock.ok) {
-        const sharerName = seats.seatFor(meetingId, lock.sharerUserId)?.name ?? 'someone';
+        const sharerName = (await store.seatFor(meetingId, lock.sharerUserId))?.name ?? 'someone';
         return socket.emit('screen:denied', { reason: 'busy', sharerName });
       }
       try {
         await livekit.grantScreenShare(meetingId, userId);
       } catch (err) {
         console.error('screen share grant failed:', err.message);
-        seats.releaseScreenLock(meetingId, socket.id);
-        livekit.revokeScreenShare(meetingId, userId); // never rejects; the grant may have applied before it failed
+        await store.releaseScreenLock(meetingId, socket.id);
+        livekit.revokeScreenShare(meetingId, userId); // never rejects; the grant may have applied
         return socket.emit('screen:denied', { reason: 'unavailable' });
       }
       // The lock can be released while the grant is in flight (host stop, policy
-      // switch, this tab closing), and that path's revoke may have reached LiveKit
-      // before our grant did. Revoke again rather than leave a permission with no lock.
-      if (seats.screenSharer(meetingId)?.socketId !== socket.id) {
+      // switch, this tab closing). Revoke again rather than leave a permission with no lock.
+      if ((await store.screenSharer(meetingId))?.socketId !== socket.id) {
         livekit.revokeScreenShare(meetingId, userId);
         return;
       }
       socket.emit('screen:granted');
-      broadcastScreen(meetingId);
+      await broadcastScreen(meetingId);
     });
 
-    on(socket, 'screen:stop', () => {
+    on(socket, 'screen:stop', async () => {
       const { meetingId } = socket.data;
-      if (meetingId) releaseScreen(meetingId, socket.id); // only the holder's socket releases
+      if (meetingId) await releaseScreen(meetingId, socket.id); // only the holder's socket releases
     });
 
     on(socket, 'lobby:admit', async ({ userId } = {}, ack) => {
-      const guard = hostGuard(socket);
-      if (!guard) return;
-      const { meetingId, meta } = guard;
-      const entry = seats.queuedEntries(meetingId).find((e) => e.userId === userId);
-      if (!entry) return ack?.({ ok: false, reason: 'gone' });
-
-      const result = seats.tryTakeSeat(meetingId, { ...entry, isHost: false, max: meta.maxParticipants });
-      // Full: the host is told, and the person keeps their place in the lobby so
-      // they can be admitted when a seat frees.
-      if (!result.ok) return ack?.({ ok: false, reason: 'full' });
-
-      seats.removeFromQueue(meetingId, userId);
-      const waiting = io.sockets.sockets.get(entry.socketId);
-      if (!waiting) {
-        freeSeat(meetingId, userId, { immediate: true });
-        broadcastLobby(meetingId);
-        return ack?.({ ok: false, reason: 'gone' });
-      }
-      await admit(waiting, meetingId, false, result);
-      ack?.({ ok: true });
-      broadcastPresence(meetingId);
-      broadcastLobby(meetingId);
-    });
-
-    on(socket, 'lobby:deny', ({ userId } = {}) => {
-      const guard = hostGuard(socket);
+      const guard = await hostGuard(socket);
       if (!guard) return;
       const { meetingId } = guard;
-      const entry = seats.queuedEntries(meetingId).find((e) => e.userId === userId);
-      if (!entry) return;
-      seats.removeFromQueue(meetingId, userId);
-      const waiting = io.sockets.sockets.get(entry.socketId);
-      if (waiting) {
-        waiting.data.meetingId = null;
-        waiting.emit('meeting:denied', { reason: 'denied' });
+      if (typeof userId !== 'string') return ack?.({ ok: false, reason: 'gone' });
+      // One script: still waiting, a seat free, then seated and out of the lobby.
+      const outcome = await store.admitFromQueue(meetingId, userId);
+      if (outcome.result === 'gone') return ack?.({ ok: false, reason: 'gone' });
+      // Full: the host is told, and the person keeps their place in the lobby.
+      if (outcome.result === 'full') return ack?.({ ok: false, reason: 'full' });
+      if (!(await isConnected(outcome.entry.socketId, outcome.entry.serverId))) {
+        await freeSeat(meetingId, userId, outcome.entry.socketId);
+        await onSeatFreed(meetingId); // the seat goes to the next in the lobby if admission is auto
+        return ack?.({ ok: false, reason: 'gone' });
       }
-      broadcastLobby(meetingId);
+      await admit(outcome.entry.socketId, meetingId, userId, false, null);
+      ack?.({ ok: true });
+      await broadcastPresence(meetingId);
+      await broadcastLobby(meetingId);
+    });
+
+    on(socket, 'lobby:deny', async ({ userId } = {}) => {
+      const guard = await hostGuard(socket);
+      if (!guard) return;
+      const { meetingId } = guard;
+      if (typeof userId !== 'string') return;
+      const socketId = await store.queueSocketId(meetingId, userId);
+      if (!socketId || !(await store.removeFromQueue(meetingId, userId, socketId))) return;
+      io.to(socketId).emit('meeting:denied', { reason: 'denied' });
+      await broadcastLobby(meetingId);
     });
 
     on(socket, 'host:set-admission', async ({ mode } = {}) => {
-      const guard = hostGuard(socket);
+      const guard = await hostGuard(socket);
       if (!guard) return;
       const { meetingId, meta } = guard;
-      // A translator convo is a 2-seat link convo: it is always auto admission,
-      // so there is no lobby to switch to manual — a silent no-op, like an
-      // unrecognized mode below.
+      // A translator convo is always auto admission: a silent no-op.
       if (meta.mode === 'translator') return;
-      // The host is authenticated, so a malformed payload is a client bug, not an
-      // authorization failure: ignore it rather than emit error:forbidden.
+      // A malformed payload from an authenticated host is a client bug: ignore it.
       if (mode !== 'auto' && mode !== 'manual') return;
-
-      meta.admission = mode;
+      await store.setMetaField(meetingId, 'admission', mode);
       await db.query('UPDATE meetings SET admission = $1 WHERE id = $2', [mode, meetingId]);
-      io.to(roomChannel(meetingId)).emit('meeting:settings', {
-        admission: mode,
-        screenSharePolicy: meta.screenSharePolicy,
-      });
+      io.to(roomChannel(meetingId)).emit('meeting:settings', { admission: mode, screenSharePolicy: meta.screenSharePolicy });
       if (mode === 'auto') {
-        for (const entry of seats.drainQueue(meetingId, meta.maxParticipants)) {
-          await admitDrained(entry, meetingId);
-        }
-        broadcastPresence(meetingId);
+        await drainLobby(meetingId);
+        await broadcastPresence(meetingId);
       }
-      broadcastLobby(meetingId);
+      await broadcastLobby(meetingId);
     });
 
     on(socket, 'host:set-screen-policy', async ({ policy } = {}) => {
-      const guard = hostGuard(socket);
+      const guard = await hostGuard(socket);
       if (!guard) return;
       const { meetingId, meta } = guard;
       if (policy !== 'anyone' && policy !== 'host_only') return; // client bug; see host:set-admission
-      // Before the first await: screen:request reads meta, so a request racing this
-      // already sees the new policy, and a participant's share ends now.
-      meta.screenSharePolicy = policy;
-      const sharer = seats.screenSharer(meetingId);
-      if (policy === 'host_only' && sharer && sharer.userId !== meta.hostId) releaseScreen(meetingId, sharer.socketId);
+      // Written first: the lock script checks the policy, so no participant can take
+      // the lock after this line, and one who took it just before loses it below.
+      await store.setMetaField(meetingId, 'screenSharePolicy', policy);
+      const sharer = await store.screenSharer(meetingId);
+      if (policy === 'host_only' && sharer && sharer.userId !== meta.hostId) await releaseScreen(meetingId, sharer.socketId);
       io.to(roomChannel(meetingId)).emit('meeting:settings', { admission: meta.admission, screenSharePolicy: policy });
       await db.query('UPDATE meetings SET screen_share_policy = $1 WHERE id = $2', [policy, meetingId]);
     });
 
-    on(socket, 'host:stop-share', ({ userId } = {}) => {
-      const guard = hostGuard(socket);
+    on(socket, 'host:stop-share', async ({ userId } = {}) => {
+      const guard = await hostGuard(socket);
       if (!guard) return;
       // Named, not "whoever is sharing": a click aimed at Priya's share must not end
       // Raj's if the lock changed hands while the menu was open.
-      const sharer = seats.screenSharer(guard.meetingId);
-      if (sharer && sharer.userId === userId) releaseScreen(guard.meetingId, sharer.socketId);
+      const sharer = await store.screenSharer(guard.meetingId);
+      if (sharer && sharer.userId === userId) await releaseScreen(guard.meetingId, sharer.socketId);
     });
 
-    on(socket, 'host:mute', ({ userId } = {}) => {
-      const guard = hostGuard(socket);
+    on(socket, 'host:mute', async ({ userId } = {}) => {
+      const guard = await hostGuard(socket);
       if (!guard) return;
-      if (typeof userId !== 'string' || !seats.hasSeat(guard.meetingId, userId)) return;
+      if (typeof userId !== 'string' || !(await store.hasSeat(guard.meetingId, userId))) return;
       livekit?.muteMic(guard.meetingId, userId); // never rejects; they can unmute themselves
     });
 
     on(socket, 'host:kick', async ({ userId } = {}) => {
-      const guard = hostGuard(socket);
+      const guard = await hostGuard(socket);
       if (!guard) return;
       const { meetingId, meta } = guard;
       if (typeof userId !== 'string' || userId === meta.hostId) return;
-      // Mark the target on the cached meta before the DB await below: a join already
-      // past its own isRemoved check can still be awaiting userInfo when this commits,
-      // and liveMeetings.has alone only catches the meeting ending, not this.
-      (meta.removed ??= new Set()).add(userId);
-      // The DB first: once this commits, a rejoin (isRemoved) and a token request
-      // are refused, and it survives a restart. Anyone ever admitted has a row, so
-      // someone who left a second before the click is still blocked.
+      // In the store before the DB await below: the join script checks this set, so a
+      // join already past its own isRemoved check can't seat them after this line.
+      await store.addRemoved(meetingId, userId);
+      // The DB next: once this commits, a rejoin (isRemoved) and a token request are
+      // refused, and it survives a restart.
       const { rowCount } = await db.query(
         `UPDATE meeting_participants SET removed_at = now()
          WHERE meeting_id = $1 AND user_id = $2 AND removed_at IS NULL`,
         [meetingId, userId],
       );
-      // Never admitted, or already removed — unless a seat or queue entry still
-      // needs freeing (the in-flight-join race this guards against).
-      if (rowCount === 0 && !seats.hasSeat(meetingId, userId) && !seats.queueSocketId(meetingId, userId)) return;
-      const seatSocketId = seats.seatSocketId(meetingId, userId);
-      const queuedSocketId = seats.queueSocketId(meetingId, userId);
-      seats.removeFromQueue(meetingId, userId);
-      for (const id of new Set([seatSocketId, queuedSocketId])) {
-        const target = id && io.sockets.sockets.get(id);
-        if (!target) continue;
-        target.data.meetingId = null;
-        target.leave(roomChannel(meetingId));
+      const seat = await store.seatFor(meetingId, userId);
+      const queuedSocketId = await store.queueSocketId(meetingId, userId);
+      if (rowCount === 0 && !seat && !queuedSocketId) return;
+      await store.removeFromQueue(meetingId, userId);
+      for (const id of new Set([seat?.socketId, queuedSocketId])) {
+        if (!id) continue;
+        io.in(id).socketsLeave(roomChannel(meetingId));
         // Before LiveKit hears anything, so the client tears media down on its
         // "removed" screen instead of first seeing a media error.
-        target.emit('meeting:removed');
+        io.to(id).emit('meeting:removed');
       }
-      if (seatSocketId) freeSeat(meetingId, userId, { immediate: true }); // evicts; drops the lock
+      if (seat) await freeSeat(meetingId, userId); // evicts; drops the lock
       await onSeatFreed(meetingId);
     });
 
     on(socket, 'host:end-meeting', async () => {
-      const guard = hostGuard(socket);
+      const guard = await hostGuard(socket);
       if (!guard) return;
       const { meetingId } = guard;
       // The DB first, so from the moment anyone is told, a rejoin reads ended_at and
-      // is refused — and the meeting is already in everyone's Previous list.
+      // is refused, and the meeting is already in everyone's Previous list.
       await markEnded(meetingId);
-      const socketIds = [
-        ...seats.listSeats(meetingId).map((s) => s.socketId),
-        ...seats.queuedEntries(meetingId).map((e) => e.socketId),
-      ];
-      seats.clearMeeting(meetingId); // seats, queue, grace timers and the ZyloLive lock
-      liveMeetings.delete(meetingId);
+      const socketIds = await store.clearMeeting(meetingId, { ended: true });
       for (const id of socketIds) {
-        const target = io.sockets.sockets.get(id);
-        if (!target) continue;
-        target.data.meetingId = null;
-        target.leave(roomChannel(meetingId));
-        target.emit('meeting:ended');
+        io.in(id).socketsLeave(roomChannel(meetingId));
+        io.to(id).emit('meeting:ended');
       }
       livekit?.endRoom(meetingId); // after the sockets, as in host:kick; never rejects
     });
@@ -515,30 +646,25 @@ function registerRoomHandlers(io, { db, livekit = null, graceMs = seats.GRACE_MS
     on(socket, 'disconnect', async () => {
       const { meetingId, userId } = socket.data;
       if (!meetingId) return;
-      // A share never outlives the page that started it: closing the tab or losing the
-      // socket ends it now, not when the seat's 30 s grace runs out (Deviation 1).
-      releaseScreen(meetingId, socket.id);
-      // A newer connection may already hold this queue entry (two tabs). Never
-      // pull it out from under them.
-      if (seats.queueSocketId(meetingId, userId) === socket.id && seats.removeFromQueue(meetingId, userId)) {
-        broadcastLobby(meetingId);
-      }
-      // Same guard for the seat itself.
-      if (seats.seatSocketId(meetingId, userId) !== socket.id) return;
-      freeSeat(meetingId, userId, {
-        graceMs,
-        onExpire: () => {
-          onSeatFreed(meetingId).catch((err) => console.error('seat release failed:', err.message));
-        },
-      });
+      // A share never outlives the page that started it.
+      await releaseScreen(meetingId, socket.id);
+      // A newer connection may hold this lobby entry or seat (two tabs): only ours.
+      if (await store.removeFromQueue(meetingId, userId, socket.id)) await broadcastLobby(meetingId);
+      if (!(await store.markGrace(meetingId, userId, socket.id, graceMs))) return;
+      startGraceTimer(meetingId, userId, socket.id);
     });
   });
+
+  return {
+    sweep: runSweep,
+    // Cancels timers and pending grace periods, and starts no new ones (tests; shutdown later).
+    stop() {
+      stopped = true;
+      timers.forEach((timer) => clearInterval(timer));
+      for (const timer of graceTimers) clearTimeout(timer);
+      graceTimers.clear();
+    },
+  };
 }
 
-// Seat state lives in memory, so anything still marked started-but-not-ended
-// belongs to a process that is gone. Run once on boot.
-async function closeStaleMeetings(db) {
-  await db.query('UPDATE meetings SET ended_at = now() WHERE started_at IS NOT NULL AND ended_at IS NULL');
-}
-
-module.exports = { registerRoomHandlers, closeStaleMeetings, roomChannel };
+module.exports = { registerRoomHandlers, roomChannel };

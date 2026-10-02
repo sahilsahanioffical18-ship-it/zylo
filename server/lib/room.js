@@ -41,7 +41,7 @@ function registerRoomHandlers(
     // database below says so.
     if (live && (await store.initMeta(meetingId, live))) return live;
     const { rows } = await db.query(
-      `SELECT host_id, admission, screen_share_policy, max_participants, mode, ended_at
+      `SELECT host_id, admission, screen_share_policy, max_participants, mode, ai_enabled, ended_at
        FROM meetings WHERE id = $1`,
       [meetingId],
     );
@@ -53,6 +53,7 @@ function registerRoomHandlers(
       screenSharePolicy: rows[0].screen_share_policy,
       maxParticipants: rows[0].max_participants,
       mode: rows[0].mode,
+      aiEnabled: rows[0].ai_enabled,
     };
     // Refused for an hour after the meeting ended: a join that read the row just
     // before "End for all" committed must not bring the room back.
@@ -560,7 +561,11 @@ function registerRoomHandlers(
       if (mode !== 'auto' && mode !== 'manual') return;
       await store.setMetaField(meetingId, 'admission', mode);
       await db.query('UPDATE meetings SET admission = $1 WHERE id = $2', [mode, meetingId]);
-      io.to(roomChannel(meetingId)).emit('meeting:settings', { admission: mode, screenSharePolicy: meta.screenSharePolicy });
+      io.to(roomChannel(meetingId)).emit('meeting:settings', {
+        admission: mode,
+        screenSharePolicy: meta.screenSharePolicy,
+        aiEnabled: meta.aiEnabled,
+      });
       if (mode === 'auto') {
         await drainLobby(meetingId);
         await broadcastPresence(meetingId);
@@ -578,8 +583,28 @@ function registerRoomHandlers(
       await store.setMetaField(meetingId, 'screenSharePolicy', policy);
       const sharer = await store.screenSharer(meetingId);
       if (policy === 'host_only' && sharer && sharer.userId !== meta.hostId) await releaseScreen(meetingId, sharer.socketId);
-      io.to(roomChannel(meetingId)).emit('meeting:settings', { admission: meta.admission, screenSharePolicy: policy });
+      io.to(roomChannel(meetingId)).emit('meeting:settings', {
+        admission: meta.admission,
+        screenSharePolicy: policy,
+        aiEnabled: meta.aiEnabled,
+      });
       await db.query('UPDATE meetings SET screen_share_policy = $1 WHERE id = $2', [policy, meetingId]);
+    });
+
+    // AI in chat. An answer already streaming finishes; new questions are refused.
+    on(socket, 'host:set-ai', async ({ enabled } = {}) => {
+      const guard = await hostGuard(socket);
+      if (!guard) return;
+      const { meetingId, meta } = guard;
+      if (typeof enabled !== 'boolean') return; // client bug; see host:set-admission
+      if (meta.mode === 'translator') return; // no Ask AI in a translator convo: a silent no-op
+      await store.setMetaField(meetingId, 'aiEnabled', enabled ? '1' : '0');
+      await db.query('UPDATE meetings SET ai_enabled = $1 WHERE id = $2', [enabled, meetingId]);
+      io.to(roomChannel(meetingId)).emit('meeting:settings', {
+        admission: meta.admission,
+        screenSharePolicy: meta.screenSharePolicy,
+        aiEnabled: enabled,
+      });
     });
 
     on(socket, 'host:stop-share', async ({ userId } = {}) => {

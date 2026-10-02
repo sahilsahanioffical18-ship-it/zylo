@@ -19,7 +19,18 @@ async function reachable(probe) {
 
 // `google` is only ever set by tests (a fake Google + a fresh cache) and server.js
 // (the Redis cache). Without a `limiter`, one is made on `redis` (memory without it).
-function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ redis }), trustProxy = 0, google = {}, store = null }) {
+// `ai` (lib/ai.js; null when not configured) only feeds /health and the cards' aiAvailable.
+function createApp({
+  db,
+  auth,
+  livekit,
+  redis = null,
+  limiter = createLimiter({ redis }),
+  trustProxy = 0,
+  google = {},
+  store = null,
+  ai = null,
+}) {
   const app = express();
   // TRUST_PROXY hops: behind our load balancer req.ip must be the client, not the
   // balancer, or every user would share one per-IP bucket.
@@ -43,7 +54,8 @@ function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ 
       reachable(livekit ? () => livekit.ping() : null),
       reachable(redis ? () => redis.ping() : null),
     ]);
-    res.json({ ok: true, db: dbOk, livekit: livekitOk, redis: redisOk });
+    // ai is the one that means "configured", not "reachable": asking the provider costs money.
+    res.json({ ok: true, db: dbOk, livekit: livekitOk, redis: redisOk, ai: Boolean(ai) });
   });
 
   app.use('/api', (_req, res, next) => {
@@ -55,7 +67,7 @@ function createApp({ db, auth, livekit, redis = null, limiter = createLimiter({ 
   app.use('/api', limitRequests(limiter, 'api', (req) => req.userId));
 
   app.use('/api', googleRouter({ ...google, limiter })); // /api/tts and /api/translate
-  if (db) app.use('/api', meetingsRouter(db, livekit, limiter, store));
+  if (db) app.use('/api', meetingsRouter(db, livekit, limiter, store, Boolean(ai)));
 
   app.use((err, _req, res, _next) => {
     const status = err.status || err.statusCode || 500;

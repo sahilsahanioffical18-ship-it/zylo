@@ -491,7 +491,7 @@ test('switching manual to auto drains the lobby in order until seats run out', a
   const lobby = waitForEvent(host, 'lobby:update');
   host.emit('host:set-admission', { mode: 'auto' });
 
-  assert.deepEqual(await settings, { admission: 'auto', screenSharePolicy: 'anyone' });
+  assert.deepEqual(await settings, { admission: 'auto', screenSharePolicy: 'anyone', aiEnabled: true });
   await Promise.all([first, second]);
   assert.deepEqual(await stillWaiting, { position: 1, manual: false });
   assert.deepEqual((await lobby).waiting.map((w) => w.userId), ['p3']);

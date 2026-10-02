@@ -11,7 +11,7 @@
 //
 // Keys per meeting. The {code} braces are a Redis Cluster hash tag: all of one
 // meeting's keys land together, so one script may touch them all.
-//   zylo:room:{code}:meta     hash   hostId, admission, screenSharePolicy, maxParticipants, mode, since (renewed by every initMeta)
+//   zylo:room:{code}:meta     hash   hostId, admission, screenSharePolicy, maxParticipants, mode, aiEnabled ('1'|'0'), since (renewed by every initMeta)
 //   zylo:room:{code}:seats    hash   userId -> { socketId, serverId, name, imageUrl, isHost, lang, seq, graceUntil? }
 //   zylo:room:{code}:queue    hash   userId -> { userId, socketId, serverId, name, imageUrl, lang, seq }
 //   zylo:room:{code}:screen   string { userId, socketId, serverId }
@@ -99,7 +99,7 @@ end
 `;
 
 const SCRIPTS = {
-  // ARGV: hostId, admission, screenSharePolicy, maxParticipants, mode. 0 while the
+  // ARGV: hostId, admission, screenSharePolicy, maxParticipants, mode, aiEnabled ('1'|'0'). 0 while the
   // ended tombstone exists: a join that read the meeting row just before "End for
   // all" committed must not bring the room back. An existing room keeps its settings
   // but its age restarts, so the idle sweep cannot delete it between this call and
@@ -108,7 +108,7 @@ const SCRIPTS = {
 if redis.call('EXISTS', ENDED) == 1 then return 0 end
 if redis.call('EXISTS', META) == 0 then
   redis.call('HSET', META, 'hostId', ARGV[1], 'admission', ARGV[2], 'screenSharePolicy', ARGV[3],
-    'maxParticipants', ARGV[4], 'mode', ARGV[5], 'since', tostring(nowMs()))
+    'maxParticipants', ARGV[4], 'mode', ARGV[5], 'aiEnabled', ARGV[6], 'since', tostring(nowMs()))
 else
   redis.call('HSET', META, 'since', tostring(nowMs()))
 end
@@ -318,8 +318,9 @@ function createRoomStore(redis, { serverId }) {
     serverId,
 
     // Settings
-    async initMeta(code, { hostId, admission, screenSharePolicy, maxParticipants, mode }) {
-      const ok = (await run('zyloRoomInitMeta', code, hostId, admission, screenSharePolicy, String(maxParticipants), mode)) === 1;
+    async initMeta(code, { hostId, admission, screenSharePolicy, maxParticipants, mode, aiEnabled = true }) {
+      const ok =
+        (await run('zyloRoomInitMeta', code, hostId, admission, screenSharePolicy, String(maxParticipants), mode, aiEnabled ? '1' : '0')) === 1;
       if (ok) await redis.sadd(LIVE, code);
       return ok;
     },
@@ -332,6 +333,8 @@ function createRoomStore(redis, { serverId }) {
         screenSharePolicy: m.screenSharePolicy,
         maxParticipants: Number(m.maxParticipants),
         mode: m.mode,
+        // Missing on a room set up by a server from before AI existed: on, like the column default.
+        aiEnabled: m.aiEnabled !== '0',
       };
     },
     async setMetaField(code, field, value) {

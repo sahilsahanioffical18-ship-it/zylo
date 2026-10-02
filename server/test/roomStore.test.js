@@ -318,3 +318,17 @@ test('admitFromQueue refuses a removed user: gone, not seated, still queued', as
   assert.equal(await store.hasSeat(CODE, 'u1'), false);
   assert.equal(await store.queuePosition(CODE, 'u1'), 1);
 });
+
+test('aiEnabled: on unless told otherwise, read as a boolean, changed with setMetaField', async (t) => {
+  const redis = await setupTestRedis(t);
+  const store = createRoomStore(redis, { serverId: 'server-a' });
+  await store.initMeta(CODE, META); // META says nothing about AI
+  assert.equal((await store.getMeta(CODE)).aiEnabled, true);
+  await store.setMetaField(CODE, 'aiEnabled', '0');
+  assert.equal((await store.getMeta(CODE)).aiEnabled, false);
+  // A room set up by a server from before AI existed has no such field: on.
+  await redis.hdel(`zylo:room:{${CODE}}:meta`, 'aiEnabled');
+  assert.equal((await store.getMeta(CODE)).aiEnabled, true);
+  await store.initMeta('off-offo-off', { ...META, aiEnabled: false });
+  assert.equal((await store.getMeta('off-offo-off')).aiEnabled, false);
+});

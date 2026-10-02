@@ -17,7 +17,7 @@ const CARD_SELECT = `
 
 const iso = (date) => (date ? date.toISOString() : null);
 
-function toCard(row, userId) {
+function toCard(row, userId, aiAvailable) {
   return {
     id: row.id,
     title: row.title,
@@ -29,18 +29,21 @@ function toCard(row, userId) {
     screenSharePolicy: row.screen_share_policy,
     maxParticipants: row.max_participants,
     mode: row.mode,
+    aiEnabled: row.ai_enabled,
+    aiAvailable,
     host: { name: row.host_name },
     isHost: row.host_id === userId,
     participants: row.participants,
   };
 }
 
-async function getCard(db, id, userId) {
+async function getCard(db, id, userId, aiAvailable) {
   const { rows } = await db.query(`${CARD_SELECT} WHERE m.id = $2`, [userId, id]);
-  return rows[0] ? toCard(rows[0], userId) : null;
+  return rows[0] ? toCard(rows[0], userId, aiAvailable) : null;
 }
 
-function meetingsRouter(db, livekit, limiter, store) {
+// aiAvailable: whether this server has AI configured, stamped on every card it returns.
+function meetingsRouter(db, livekit, limiter, store, aiAvailable = false) {
   const router = express.Router();
   // Per user, on top of the app-wide 'api' limit: creating can spam, lookups can
   // guess codes, and every token request makes a call to LiveKit.
@@ -64,7 +67,7 @@ function meetingsRouter(db, livekit, limiter, store) {
     const upcoming = [];
     const previous = [];
     for (const row of rows) {
-      const card = toCard(row, req.userId);
+      const card = toCard(row, req.userId, aiAvailable);
       if (row.started_at && !row.ended_at) live.push(card);
       else if (!row.started_at && !row.ended_at && row.scheduled_for && row.scheduled_for.getTime() >= now - HOUR_MS) {
         upcoming.push(card);
@@ -93,7 +96,7 @@ function meetingsRouter(db, livekit, limiter, store) {
           [id, req.userId, value.title, value.admission, value.screenSharePolicy, value.maxParticipants,
             value.scheduledFor, value.inviteEmails, value.mode],
         );
-        return res.status(201).json({ meeting: await getCard(db, id, req.userId) });
+        return res.status(201).json({ meeting: await getCard(db, id, req.userId, aiAvailable) });
       } catch (err) {
         if (err.code === '23505' && attempt === 0) continue; // meeting code collision: retry once
         throw err;
@@ -103,7 +106,7 @@ function meetingsRouter(db, livekit, limiter, store) {
 
   router.get('/meetings/:id', perUser('lookup'), async (req, res) => {
     if (!isValidCode(req.params.id)) return res.status(400).json({ error: 'That is not a valid meeting code.' });
-    const meeting = await getCard(db, req.params.id, req.userId);
+    const meeting = await getCard(db, req.params.id, req.userId, aiAvailable);
     if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
     res.json({ meeting, isHost: meeting.isHost });
   });

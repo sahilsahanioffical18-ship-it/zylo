@@ -224,6 +224,46 @@ function recordingLivekit() {
   };
 }
 
+// Stands in for an OpenAI-compatible chat API (xAI, NVIDIA): a local http server that
+// records every request ({ url, headers, body }) and answers with respond(res, request).
+// Closed when the test ends, cutting any answer still hanging.
+async function startFakeAi(t, respond = aiAnswer(['Hello', ' there.'])) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const part of req) raw += part;
+    const request = { url: req.url, headers: req.headers, body: JSON.parse(raw) };
+    requests.push(request);
+    await respond(res, request);
+  });
+  server.listen(0);
+  await new Promise((resolve) => server.once('listening', resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  return { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, requests };
+}
+
+// One streamed piece of an answer, as these APIs send it.
+const aiPiece = (content) => ({ choices: [{ index: 0, delta: { content } }] });
+
+// A respond function: 200, then each event as a server-sent `data:` line (objects as
+// JSON, strings as they are), gapMs apart, then the end of the body.
+function sseReply(events, { gapMs = 0 } = {}) {
+  return async (res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const event of events) {
+      res.write(`data: ${typeof event === 'string' ? event : JSON.stringify(event)}\n\n`);
+      if (gapMs) await settle(gapMs);
+    }
+    res.end();
+  };
+}
+
+// The usual answer: the pieces, then [DONE].
+const aiAnswer = (pieces, options) => sseReply([...pieces.map(aiPiece), '[DONE]'], options);
+
 // Takes ZyloLive for `client`, then lets the grant's broadcast settle.
 async function shareScreen(client) {
   const granted = waitForEvent(client, 'screen:granted');
@@ -317,6 +357,10 @@ module.exports = {
   collect,
   settle,
   recordingLivekit,
+  startFakeAi,
+  aiPiece,
+  sseReply,
+  aiAnswer,
   roomHarness,
   twoServerHarness,
   shareScreen,

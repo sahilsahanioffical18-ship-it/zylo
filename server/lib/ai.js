@@ -15,13 +15,15 @@ const SYSTEM_PROMPT = [
 ].join(' ');
 
 // The chat so far as one transcript, oldest first, "Name: text" per line (answers are
-// "Zylo AI: ..."), then the question. Whitespace runs become one space, so a message
-// can't fake a line from someone else. Earlier lines are cut to 500 characters; the
-// question (at most 2,000, the chat rule) is kept whole.
+// "Zylo AI: ..."), then the question. Whitespace runs in a name or a message become one
+// space, so neither can fake a line from someone else. Earlier lines are cut to 500
+// characters (an emoji cut in half becomes U+FFFD, never a lone surrogate); the question
+// (at most 2,000, the chat rule) is kept whole.
 function promptFor(history, question) {
-  const line = ({ name, text }) => `${name}: ${text.replace(/\s+/g, ' ').trim()}`;
+  const flat = (value) => value.replace(/\s+/g, ' ').trim();
+  const line = ({ name, text }) => `${flat(name)}: ${flat(text)}`;
   const lines = [...history.map((entry) => line(entry).slice(0, MAX_LINE)), line(question)];
-  return [{ role: 'user', content: lines.join('\n') }];
+  return [{ role: 'user', content: lines.join('\n').toWellFormed() }];
 }
 
 // One server-sent line: the answer text it adds, '' for anything to skip, null at

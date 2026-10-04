@@ -92,6 +92,28 @@ test('a meeting saved with AI off starts with it off, and every settings broadca
   ]);
 });
 
+test('someone admitted from the lobby is sent the settings as they are now, before "admitted"', async (t) => {
+  const { meetingId, connect, join } = await roomHarness(t, { admission: 'manual' });
+  const host = await join('host');
+  const p1 = connect('p1');
+  const waiting = waitForEvent(p1, 'meeting:waiting');
+  p1.emit('meeting:join-request', { meetingId });
+  await waiting;
+  host.emit('host:set-ai', { enabled: false }); // while p1 sits in the lobby
+  await settle();
+
+  const order = [];
+  p1.on('meeting:settings', (s) => order.push(['meeting:settings', s]));
+  p1.on('meeting:admitted', () => order.push(['meeting:admitted']));
+  const admitted = waitForEvent(p1, 'meeting:admitted');
+  host.emit('lobby:admit', { userId: 'p1' });
+  await admitted;
+  assert.deepEqual(order, [
+    ['meeting:settings', { admission: 'manual', screenSharePolicy: 'anyone', aiEnabled: false }],
+    ['meeting:admitted'],
+  ]);
+});
+
 // ── The chat history the AI reads ────────────────────────────────────────────
 
 test('every chat line joins the history, and a history failure never blocks the chat', async (t) => {

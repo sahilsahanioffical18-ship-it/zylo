@@ -201,11 +201,20 @@ function registerRoomHandlers(
       io.to(replacedSocketId).emit('meeting:replaced');
     }
     io.in(socketId).socketsJoin(roomChannel(meetingId));
-    // Read first, then send all three back to back: the client holds the roster and
+    // Read first, then send all four back to back: the client holds the roster and
     // who is presenting by the time it has handled "admitted", as it did when this
     // all lived in one process. Straight to this socket: on another server the room
-    // join above can land after the caller's room-wide broadcast.
-    const [people, sharer] = await Promise.all([presenceOf(meetingId), store.screenSharer(meetingId)]);
+    // join above can land after the caller's room-wide broadcast. The settings come
+    // first: the host may have changed one since this person loaded the meeting card
+    // (pre-join, lobby, reconnect), and the page would keep the old value.
+    const [people, sharer, meta] = await Promise.all([presenceOf(meetingId), store.screenSharer(meetingId), store.getMeta(meetingId)]);
+    if (meta) {
+      io.to(socketId).emit('meeting:settings', {
+        admission: meta.admission,
+        screenSharePolicy: meta.screenSharePolicy,
+        aiEnabled: meta.aiEnabled,
+      });
+    }
     io.to(socketId).emit('meeting:admitted');
     io.to(socketId).emit('room:presence', { people });
     io.to(socketId).emit('screen:state', { sharerUserId: sharer?.userId ?? null });

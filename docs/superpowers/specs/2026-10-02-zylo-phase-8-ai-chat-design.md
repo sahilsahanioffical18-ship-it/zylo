@@ -44,7 +44,7 @@ Three variables in `server/.env`:
    6. AI configured, else `ai:error { reason: 'not_configured' }` to the asker.
    7. Shared rate limit `aiRoom` (per meeting; rate 0.1/s, burst 6). Refused → `rate-limited { event: 'ai:ask' }`.
 3. The question is posted to the room as a normal chat message with a marker: `chat:message { userId, name, text, ts, toAi: true }`, and added to the chat history (§4).
-4. The server reads the history (which now ends with the question), emits `ai:start { id, askedBy: { userId, name }, ts }` to the room, and calls the provider with streaming on.
+4. Before step 3, the server reads the 20 earlier history lines (a failed read drops the question before anything is posted); the AI gets those lines plus the question last. It emits `ai:start { id, askedBy: { userId, name }, ts }` to the room and calls the provider with streaming on.
 5. Each text piece → `ai:chunk { id, delta }` to the room. Pieces are batched to at most one emit per 100 ms per answer, so a fast stream doesn't flood the adapter.
 6. When the stream ends → `ai:done { id, text, ts }` to the room (`text` is the full answer, so a client that missed pieces still ends with the right text), and the answer is added to the history as `{ name: 'Zylo AI', text, ai: true }`.
 7. On a provider error, a non-200 answer, an empty answer or the 30-second timeout → `ai:failed { id, message: "The AI couldn't answer. Try again." }` to the room. Nothing is added to the history. The provider's error is logged on the server only.

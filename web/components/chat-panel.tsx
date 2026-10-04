@@ -91,10 +91,12 @@ export function ChatPanel({
   const tail = messages.at(-1);
 
   // DOM write, not a setState — lint-clean under react-hooks/set-state-in-effect. Keyed
-  // on the last item, so a streaming answer stays in view as it grows.
+  // on the last item, so a streaming answer stays in view as it grows, unless the reader
+  // has scrolled up (more than 120 px from the bottom); a new person message always scrolls.
   useEffect(() => {
     const viewport = containerRef.current?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]');
     if (!viewport) return;
+    if (tail?.kind === 'ai' && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 120) return;
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: reduceMotion ? 'auto' : 'smooth' });
   }, [tail]);

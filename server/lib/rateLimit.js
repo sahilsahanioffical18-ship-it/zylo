@@ -17,8 +17,8 @@ const POLICIES = Object.freeze({
   google: { rate: 2, burst: 10 }, //      Google upstream calls, per user (cache hits are free)
   googleAll: { rate: 20, burst: 40 }, //  Google upstream calls, whole deployment
   connect: { rate: 1, burst: 10 }, //     Socket.IO connections, per client IP
-  aiUser: { rate: 0.1, burst: 3 }, //     Phase 8 ai:message, per user
-  aiRoom: { rate: 0.1, burst: 6 }, //     Phase 8 ai:message, per meeting (6 a minute)
+  aiUser: { rate: 0.1, burst: 3 }, //     ai:ask, per user
+  aiRoom: { rate: 0.1, burst: 6 }, //     ai:ask, per meeting (6 a minute)
 });
 
 // Per-socket limits, kept in memory on the socket (room.js): a socket lives on one

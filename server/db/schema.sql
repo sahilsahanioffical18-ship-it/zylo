@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS meetings (
   screen_share_policy TEXT NOT NULL DEFAULT 'anyone' CHECK (screen_share_policy IN ('host_only','anyone')),
   max_participants INT NOT NULL DEFAULT 20 CHECK (max_participants BETWEEN 2 AND 20),
   mode TEXT NOT NULL DEFAULT 'standard' CHECK (mode IN ('standard','translator')),
+  ai_enabled BOOLEAN NOT NULL DEFAULT true,
   scheduled_for TIMESTAMPTZ,
   started_at TIMESTAMPTZ,
   ended_at TIMESTAMPTZ,
@@ -20,9 +21,10 @@ CREATE TABLE IF NOT EXISTS meetings (
 );
 -- There is no migration system: server.js runs this whole file at every boot
 -- (and test/helpers.js's setupTestDb runs it before every test file), so a
--- database created before `mode` existed is upgraded here with an idempotent
+-- database created before `mode` or `ai_enabled` existed is upgraded here with an idempotent
 -- ALTER rather than a separate migration step.
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'standard' CHECK (mode IN ('standard','translator'));
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS ai_enabled BOOLEAN NOT NULL DEFAULT true;
 CREATE TABLE IF NOT EXISTS meeting_invites (
   meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
   email TEXT NOT NULL,

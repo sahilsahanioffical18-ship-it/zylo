@@ -17,6 +17,12 @@ export const SCREEN_POLICY_OPTIONS: { value: ScreenSharePolicy; label: string; h
   { value: 'host_only', label: 'Host only', hint: 'Only you can present.' },
 ];
 
+// In-room only: the host's "AI in chat" setting.
+export const AI_OPTIONS: { value: 'on' | 'off'; label: string; hint: string }[] = [
+  { value: 'on', label: 'On', hint: 'Anyone here can ask Zylo AI.' },
+  { value: 'off', label: 'Off', hint: 'Nobody can ask Zylo AI.' },
+];
+
 export function ChoiceGroup<T extends string>({
   legend,
   name,

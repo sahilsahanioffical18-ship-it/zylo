@@ -16,6 +16,8 @@ const { limitConnections } = require('./lib/limitMiddleware');
 const { createCache, createRedisCache } = require('./lib/cache');
 const { clerkAuth, clerkSocketAuth } = require('./lib/auth');
 const { registerRoomHandlers } = require('./lib/room');
+const { createAi } = require('./lib/ai');
+const { createChatHistory } = require('./lib/chatHistory');
 
 const PORT = Number(process.env.PORT) || 4000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:3000';
@@ -35,6 +37,8 @@ async function main() {
   const redis = createRedis();
   if (!redis) console.warn("WARNING: REDIS_URL is not set — rate limits and the translation cache stay in this server's memory.");
   const limiter = createLimiter({ redis });
+  const ai = createAi({ baseUrl: process.env.AI_BASE_URL, apiKey: process.env.AI_API_KEY, model: process.env.AI_MODEL });
+  if (!ai) console.warn('WARNING: AI_API_KEY or AI_MODEL is not set — Ask AI is off.');
   // One id per process: seats and the screen lock record which server holds them.
   const store = redis ? createRoomStore(redis, { serverId: randomUUID() }) : null;
   // Proxy hops to trust for the client IP: a non-negative integer, else 0 (a bad value must not silently pass).
@@ -52,7 +56,7 @@ async function main() {
   }
 
   const app = createApp({
-    db, auth: clerkAuth({ db }), livekit, redis, limiter, trustProxy, store,
+    db, auth: clerkAuth({ db }), livekit, redis, limiter, trustProxy, store, ai,
     google: { cache: redis ? createRedisCache(redis) : createCache() },
   });
   const httpServer = http.createServer(app);
@@ -72,7 +76,7 @@ async function main() {
   }
   io.use(limitConnections(limiter, trustProxy)); // before auth: a flood never reaches token checks
   io.use(clerkSocketAuth({ db }));
-  if (db && store) registerRoomHandlers(io, { db, livekit, store });
+  if (db && store) registerRoomHandlers(io, { db, livekit, store, history: createChatHistory(redis), limiter, ai });
   else {
     console.warn('WARNING: DATABASE_URL or REDIS_URL is not set — ZyloRoom sockets will refuse every join request.');
     // Refuse out loud: with no handler a client would wait on "connecting" for good.

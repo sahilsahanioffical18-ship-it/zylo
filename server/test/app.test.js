@@ -27,7 +27,7 @@ test('GET /health reports db:false and livekit:false when neither is configured'
   const { base, close } = await listen(createApp({ db: null, auth: (_req, _res, next) => next() }));
   const res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false, redis: false });
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false, redis: false, ai: false });
   await close();
 });
 
@@ -37,7 +37,17 @@ test('GET /health reports livekit:true when LiveKit answers', async () => {
   );
   const res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: true, redis: false });
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: true, redis: false, ai: false });
+  await close();
+});
+
+test('GET /health reports ai:true when AI is configured, without calling the provider', async () => {
+  let calls = 0;
+  const ai = { model: 'test-model', stream: async () => { calls += 1; return 'unused'; } };
+  const { base, close } = await listen(createApp({ db: null, auth: (_req, _res, next) => next(), ai }));
+  const body = await (await fetch(`${base}/health`)).json();
+  assert.equal(body.ai, true);
+  assert.equal(calls, 0);
   await close();
 });
 
@@ -55,7 +65,7 @@ test('GET /health reports livekit:false when LiveKit is configured but unreachab
   );
   const res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false, redis: false });
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false, redis: false, ai: false });
   await close();
 });
 
@@ -72,7 +82,7 @@ test('GET /health reports db:false when the database is configured but failing',
   );
   const res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false, redis: false });
+  assert.deepEqual(await res.json(), { ok: true, db: false, livekit: false, redis: false, ai: false });
   await close();
 });
 

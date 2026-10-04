@@ -122,7 +122,7 @@ test("switching ZyloLive to host_only ends a participant's share and is saved", 
   host.emit('host:set-screen-policy', { policy: 'host_only' });
   await settle();
 
-  assert.deepEqual(settings, [{ admission: 'auto', screenSharePolicy: 'host_only' }]);
+  assert.deepEqual(settings, [{ admission: 'auto', screenSharePolicy: 'host_only', aiEnabled: true }]);
   assert.deepEqual(states, [{ sharerUserId: null }]);
   assert.deepEqual(livekit.callsTo('revokeScreenShare'), [[meetingId, 'p1']]);
 

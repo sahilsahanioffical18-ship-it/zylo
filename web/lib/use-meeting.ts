@@ -4,6 +4,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import { io, type Socket } from 'socket.io-client';
 import { toast } from 'sonner';
+import {
+  AI_ERROR_TEXT,
+  addMessage,
+  applyAi,
+  failStalled,
+  type AiErrorReason,
+  type AiEvent,
+  type ChatItem,
+  type PersonMessage,
+} from '@/lib/ai-chat';
 import { SERVER_URL } from '@/lib/api';
 import { brand } from '@/lib/brand';
 import { validateChatText } from '@/lib/chat-rules';
@@ -17,11 +27,10 @@ export type LobbyEntry = { userId: string; name: string; imageUrl: string | null
 // meeting:join-request, "a translator convo is a 2-seat link, not a lobby"). 'unavailable':
 // the server couldn't read its live room state (Redis), so it admitted nobody.
 export type DeniedReason = 'not_found' | 'ended' | 'removed' | 'denied' | 'full' | 'unavailable';
-export type ChatMessage = { userId: string; name: string; text: string; ts: number };
 
-// ponytail: keep the last 200 in memory; nothing is stored anyway, so scrollback has a
-// floor. Raise it or virtualise if a long meeting ever loses history people wanted.
-const MAX_MESSAGES = 200;
+// How often the stall rule (ai-chat.ts) is checked: a dead answer fails 45 to 50 s after
+// its last piece.
+const STALL_CHECK_MS = 5_000;
 
 export type MeetingState =
   | { status: 'connecting' }
@@ -43,12 +52,14 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
   const [state, setState] = useState<MeetingState>({ status: 'connecting' });
   const [lobby, setLobby] = useState<LobbyEntry[]>([]);
   const [admission, setAdmission] = useState<Admission | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatItem[]>([]);
   const [sharerUserId, setSharerUserId] = useState<string | null>(null);
   // Bumped once per screen:granted. A counter, not a flag — see use-livekit-room.ts's
   // capture effect for why.
   const [shareGrant, setShareGrant] = useState(0);
   const [screenPolicy, setScreenPolicy] = useState<ScreenSharePolicy | null>(null);
+  // The host's "AI in chat" setting once it changes in this meeting; until then the card's.
+  const [aiEnabled, setAiSetting] = useState<boolean | null>(null);
 
   // Translator Convo only. Refs (not deps of the join effect below) so a language
   // change or a new onCaption closure never tears down and reopens the socket —
@@ -146,11 +157,31 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
       socket.disconnect();
     });
     socket.on('lobby:update', ({ waiting }: { waiting: LobbyEntry[] }) => setLobby(waiting));
-    socket.on('meeting:settings', (s: { admission: Admission; screenSharePolicy: ScreenSharePolicy }) => {
+    socket.on('meeting:settings', (s: { admission: Admission; screenSharePolicy: ScreenSharePolicy; aiEnabled: boolean }) => {
       setAdmission(s.admission);
       setScreenPolicy(s.screenSharePolicy);
+      setAiSetting(s.aiEnabled);
     });
-    socket.on('chat:message', (m: ChatMessage) => setMessages((prev) => [...prev, m].slice(-MAX_MESSAGES)));
+    socket.on('chat:message', (m: Omit<PersonMessage, 'kind'>) => setMessages((prev) => addMessage(prev, m)));
+    // Zylo AI's answers, streamed to everyone; ai-chat.ts applies them to the same list.
+    // The clock is read here, not inside the updater: React may run an updater twice.
+    const applyEvent = (event: AiEvent) => {
+      const now = Date.now();
+      setMessages((prev) => applyAi(prev, event, now));
+    };
+    socket.on('ai:start', ({ id, askedBy, ts }: { id: string; askedBy: { userId: string; name: string }; ts: number }) =>
+      applyEvent({ type: 'start', id, askedBy, ts }),
+    );
+    socket.on('ai:chunk', ({ id, delta }: { id: string; delta: string }) => applyEvent({ type: 'chunk', id, delta }));
+    socket.on('ai:done', ({ id, text }: { id: string; text: string }) => applyEvent({ type: 'done', id, text }));
+    socket.on('ai:failed', ({ id }: { id: string }) => applyEvent({ type: 'failed', id }));
+    // Only the asker hears this: AI is off for this meeting, or not set up on the server.
+    socket.on('ai:error', ({ reason }: { reason: AiErrorReason }) => toast.error(AI_ERROR_TEXT[reason]));
+    // If the asker's server dies mid-answer nothing more arrives: the stall rule fails it.
+    const stallTimer = setInterval(() => {
+      const now = Date.now();
+      setMessages((prev) => failStalled(prev, now));
+    }, STALL_CHECK_MS);
     socket.on('screen:granted', () => setShareGrant((n) => n + 1));
     socket.on('screen:denied', (denial: ScreenDenial) => toast.error(screenDeniedMessage(denial, brand.live)));
     socket.on('rate-limited', ({ event }: { event: string }) => toast.error(rateLimitMessage(event)));
@@ -162,6 +193,7 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
     return () => {
       clearTimeout(retryTimer);
       clearTimeout(joinTimer);
+      clearInterval(stallTimer);
       socket.disconnect();
       socketRef.current = null;
     };
@@ -197,6 +229,14 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
     socketRef.current?.emit('chat:message', { text: clean });
   }, []);
 
+  // Same rule as sendChat: the server posts the question as a chat message from the
+  // seat, then streams the answer to everyone.
+  const askAi = useCallback((text: string) => {
+    const clean = validateChatText(text);
+    if (clean === null) return;
+    socketRef.current?.emit('ai:ask', { text: clean });
+  }, []);
+
   const requestScreen = useCallback(() => {
     socketRef.current?.emit('screen:request');
   }, []);
@@ -219,6 +259,10 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
 
   const setScreenPolicyMode = useCallback((policy: ScreenSharePolicy) => {
     socketRef.current?.emit('host:set-screen-policy', { policy });
+  }, []);
+
+  const setAiEnabled = useCallback((enabled: boolean) => {
+    socketRef.current?.emit('host:set-ai', { enabled });
   }, []);
 
   const endMeeting = useCallback(() => {
@@ -260,5 +304,8 @@ export function useMeeting(meetingId: string | null, opts?: { lang?: string | nu
     endMeeting,
     sendCaption,
     setConvoLang,
+    aiEnabled,
+    askAi,
+    setAiEnabled,
   };
 }

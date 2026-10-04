@@ -104,6 +104,25 @@ test('GET /meetings/:id is available to any signed-in user; 404 unknown, 400 mal
   assert.equal((await api('user_carol', 'GET', '/meetings/NOT_A_CODE')).status, 400);
 });
 
+test('cards say whether AI is on for the meeting and set up on this server', async () => {
+  const created = (await api('user_alice', 'POST', '/meetings', {})).body.meeting;
+  assert.equal(created.aiEnabled, true);
+  assert.equal(created.aiAvailable, false); // this suite's app was made without AI
+
+  await db.query('UPDATE meetings SET ai_enabled = false WHERE id = $1', [created.id]);
+  const withAi = await listen(
+    createApp({ db, auth: fakeAuth, limiter: unlimitedLimiter, ai: { model: 'test-model', stream: async () => 'unused' } }),
+  );
+  try {
+    const res = await fetch(`${withAi.base}/api/meetings/${created.id}`, { headers: { 'x-test-user': 'user_bob' } });
+    const { meeting } = await res.json();
+    assert.equal(meeting.aiEnabled, false);
+    assert.equal(meeting.aiAvailable, true);
+  } finally {
+    await withAi.close();
+  }
+});
+
 test('DELETE /meetings/:id — only the host, only before it starts', async () => {
   const id = (await api('user_alice', 'POST', '/meetings', {})).body.meeting.id;
   assert.equal((await api('user_bob', 'DELETE', `/meetings/${id}`)).status, 403);

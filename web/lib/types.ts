@@ -13,6 +13,8 @@ export interface MeetingCard {
   screenSharePolicy: ScreenSharePolicy;
   maxParticipants: number;
   mode: 'standard' | 'translator';
+  aiEnabled: boolean; // the host's "AI in chat" setting
+  aiAvailable: boolean; // the server has an AI key and model
   host: { name: string };
   isHost: boolean;
   participants: { name: string; imageUrl: string | null }[];

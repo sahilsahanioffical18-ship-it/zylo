@@ -23,14 +23,14 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { ADMISSION_OPTIONS, ChoiceGroup, SCREEN_POLICY_OPTIONS } from '@/components/choice-group';
+import { ADMISSION_OPTIONS, AI_OPTIONS, ChoiceGroup, SCREEN_POLICY_OPTIONS } from '@/components/choice-group';
 import { initials } from '@/lib/format';
 import { hostActionsFor, type HostAction } from '@/lib/host-actions';
 import { brand } from '@/lib/brand';
 import type { Admission, ScreenSharePolicy } from '@/lib/types';
 import type { LobbyEntry, Person } from '@/lib/use-meeting';
 
-// Side by side without hints below lg (the phone Sheet), so the host's two settings
+// Side by side without hints below lg (the phone Sheet), so the host's settings
 // don't push "In the meeting" off screen; stacked with hints in the docked panel.
 const ROOM_SETTING_GRID = 'grid grid-cols-2 gap-2 lg:grid-cols-1 max-lg:[&_[data-hint]]:hidden';
 
@@ -181,6 +181,8 @@ export function PeoplePanel({
   onMute,
   onStopShare,
   onKick,
+  aiEnabled,
+  onSetAiEnabled,
   translator = false,
 }: {
   people: Person[];
@@ -200,6 +202,8 @@ export function PeoplePanel({
   onMute: (userId: string) => void;
   onStopShare: (userId: string) => void;
   onKick: (userId: string) => void;
+  aiEnabled: boolean;
+  onSetAiEnabled: (enabled: boolean) => void;
   // A translator convo is always auto (link-shared, 2 seats) and the server ignores
   // this setting for it, so it's hidden here rather than shown but inert.
   translator?: boolean;
@@ -227,6 +231,18 @@ export function PeoplePanel({
           value={screenPolicy}
           onChange={onSetScreenPolicy}
           options={SCREEN_POLICY_OPTIONS}
+          className={ROOM_SETTING_GRID}
+        />
+      )}
+
+      {/* No Ask AI in a translator convo, so no setting for it either. */}
+      {isHost && !translator && (
+        <ChoiceGroup
+          legend="AI in chat"
+          name="room-ai"
+          value={aiEnabled ? 'on' : 'off'}
+          onChange={(value) => onSetAiEnabled(value === 'on')}
+          options={AI_OPTIONS}
           className={ROOM_SETTING_GRID}
         />
       )}

@@ -6,6 +6,8 @@ const { Server } = require('socket.io');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const { io: ioClient } = require('socket.io-client');
 const { createRoomStore } = require('../lib/roomStore');
+const { createChatHistory } = require('../lib/chatHistory');
+const { createLimiter } = require('../lib/rateLimit');
 const { registerRoomHandlers } = require('../lib/room');
 const { createRedis, whenReady } = require('../lib/redis');
 
@@ -129,13 +131,25 @@ async function seedMeeting(
 // any socket that closing it disconnected finish too, while Redis is still up.
 // decorateStore wraps the store the handlers get (a test counting or delaying calls).
 // adapter: true wires the Socket.IO Redis adapter, so several servers act as one. The
-// sweep timers never run here; tests call handlers.sweep() themselves.
+// sweep timers never run here; tests call handlers.sweep() themselves. The handlers get
+// a chat history on the same Redis, returned for tests to read and seed. ai: a provider
+// client (createAi against startFakeAi) or null. limiter: the real shared limits on this
+// Redis unless a test passes its own (only ai:ask takes from it).
 async function startRoomServer(
   db,
   redis,
-  { serverId = 'server-a', graceMs = 60, livekit = null, adapter = false, decorateStore = (s) => s } = {},
+  {
+    serverId = 'server-a',
+    graceMs = 60,
+    livekit = null,
+    adapter = false,
+    decorateStore = (s) => s,
+    ai = null,
+    limiter = createLimiter({ redis, log: quietLog }),
+  } = {},
 ) {
   const store = decorateStore(createRoomStore(redis, { serverId }));
+  const history = createChatHistory(redis);
   // The adapter's own connections, with the offline queue on (as in server.js).
   // duplicate() copies redis.js's 500 ms commandTimeout / 1 s socketTimeout, which
   // would fail the adapter's SUBSCRIBE while the connection isn't ready yet: cleared.
@@ -150,12 +164,13 @@ async function startRoomServer(
     socketServer = io; // for tests that watch what the handlers ask it
     if (adapter) io.adapter(createAdapter(pubsub[0], pubsub[1]));
     io.use(fakeSocketAuth);
-    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, sweepMs: 0 });
+    handlers = registerRoomHandlers(io, { db, graceMs, livekit, store, history, limiter, ai, sweepMs: 0 });
   });
   return {
     url: server.url,
     io: socketServer,
     store,
+    history,
     handlers,
     close: async () => {
       await settle();
@@ -169,14 +184,14 @@ async function startRoomServer(
 
 // The four users, one meeting, and a room server. Brings its own Redis (closed by
 // server.close()) unless one is passed in.
-async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, decorateStore, ...meeting } = {}) {
+async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, decorateStore, ai, limiter, ...meeting } = {}) {
   const ownRedis = !redis;
   const conn = redis ?? (await connectTestRedis());
   let room;
   let meetingId;
   try {
     meetingId = await seedMeeting(db, meeting);
-    room = await startRoomServer(db, conn, { serverId, graceMs, livekit, decorateStore });
+    room = await startRoomServer(db, conn, { serverId, graceMs, livekit, decorateStore, ai, limiter });
   } catch (err) {
     if (ownRedis) conn.disconnect(); // fail, don't leak
     throw err;
@@ -188,7 +203,7 @@ async function startRoom(db, { redis, serverId, graceMs = 60, livekit = null, de
       if (ownRedis) await conn.quit();
     }
   };
-  return { meetingId, server: { url: room.url, close }, store: room.store, handlers: room.handlers };
+  return { meetingId, server: { url: room.url, close }, store: room.store, history: room.history, handlers: room.handlers };
 }
 
 // Connects userId and resolves once they hold a seat.
@@ -224,6 +239,46 @@ function recordingLivekit() {
   };
 }
 
+// Stands in for an OpenAI-compatible chat API (xAI, NVIDIA): a local http server that
+// records every request ({ url, headers, body }) and answers with respond(res, request).
+// Closed when the test ends, cutting any answer still hanging.
+async function startFakeAi(t, respond = aiAnswer(['Hello', ' there.'])) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const part of req) raw += part;
+    const request = { url: req.url, headers: req.headers, body: JSON.parse(raw) };
+    requests.push(request);
+    await respond(res, request);
+  });
+  server.listen(0);
+  await new Promise((resolve) => server.once('listening', resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  return { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, requests };
+}
+
+// One streamed piece of an answer, as these APIs send it.
+const aiPiece = (content) => ({ choices: [{ index: 0, delta: { content } }] });
+
+// A respond function: 200, then each event as a server-sent `data:` line (objects as
+// JSON, strings as they are), gapMs apart, then the end of the body.
+function sseReply(events, { gapMs = 0 } = {}) {
+  return async (res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const event of events) {
+      res.write(`data: ${typeof event === 'string' ? event : JSON.stringify(event)}\n\n`);
+      if (gapMs) await settle(gapMs);
+    }
+    res.end();
+  };
+}
+
+// The usual answer: the pieces, then [DONE].
+const aiAnswer = (pieces, options) => sseReply([...pieces.map(aiPiece), '[DONE]'], options);
+
 // Takes ZyloLive for `client`, then lets the grant's broadcast settle.
 async function shareScreen(client) {
   const granted = waitForEvent(client, 'screen:granted');
@@ -236,7 +291,7 @@ async function shareScreen(client) {
 async function roomHarness(t, options = {}) {
   const db = await setupTestDb();
   const livekit = recordingLivekit();
-  const { meetingId, server, store } = await startRoom(db, { ...options, livekit });
+  const { meetingId, server, store, history, handlers } = await startRoom(db, { ...options, livekit });
   const clients = [];
   t.after(async () => {
     clients.forEach((c) => c.disconnect());
@@ -245,18 +300,18 @@ async function roomHarness(t, options = {}) {
   });
   const connect = (userId) => { const c = connectClient(server.url, userId); clients.push(c); return c; };
   const join = async (userId) => { const c = await seat(server.url, userId, meetingId); clients.push(c); return c; };
-  return { db, livekit, meetingId, server, store, connect, join };
+  return { db, livekit, meetingId, server, store, history, handlers, connect, join };
 }
 
 // Two room servers sharing one Redis and one database, like two API servers behind a
 // load balancer. A client picks its server by which one it connects to.
-async function twoServerHarness(t, meeting = {}) {
+async function twoServerHarness(t, { ai = null, ...meeting } = {}) {
   const db = await setupTestDb();
   const redis = await connectTestRedis();
   const livekit = recordingLivekit();
   const meetingId = await seedMeeting(db, meeting);
-  const a = await startRoomServer(db, redis, { serverId: 'server-a', livekit, adapter: true });
-  const b = await startRoomServer(db, redis, { serverId: 'server-b', livekit, adapter: true });
+  const a = await startRoomServer(db, redis, { serverId: 'server-a', livekit, adapter: true, ai });
+  const b = await startRoomServer(db, redis, { serverId: 'server-b', livekit, adapter: true, ai });
   await Promise.all([a.store.beat(), b.store.beat()]);
   await settle(200); // let both adapters' subscriptions land
   const clients = [];
@@ -317,6 +372,10 @@ module.exports = {
   collect,
   settle,
   recordingLivekit,
+  startFakeAi,
+  aiPiece,
+  sseReply,
+  aiAnswer,
   roomHarness,
   twoServerHarness,
   shareScreen,

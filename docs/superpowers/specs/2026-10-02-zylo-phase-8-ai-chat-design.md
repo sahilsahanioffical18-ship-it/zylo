@@ -79,7 +79,7 @@ Parsing the stream (server-sent events): read `data:` lines; skip `[DONE]`, unpa
 
 - Postgres: `ALTER TABLE meetings ADD COLUMN IF NOT EXISTS ai_enabled BOOLEAN NOT NULL DEFAULT true` (idempotent, in `server/db/schema.sql`, same pattern as `mode`).
 - Room store: the meta hash gains `aiEnabled` (`'1'`/`'0'`); `initMeta` takes it from the meeting row; `getMeta` returns a boolean. Only the init script changes.
-- `host:set-ai { enabled: boolean }` behind `hostGuard` (which also rate-limits host events): non-boolean → ignored; translator meeting → ignored; writes Redis meta then Postgres; broadcasts `meeting:settings { admission, screenSharePolicy, aiEnabled }`. The two existing `meeting:settings` emits also gain `aiEnabled`.
+- `host:set-ai { enabled: boolean }` behind `hostGuard` (which also rate-limits host events): non-boolean → ignored; translator meeting → ignored; writes Redis meta then Postgres; broadcasts `meeting:settings { admission, screenSharePolicy, aiEnabled }`. The two existing `meeting:settings` emits also gain `aiEnabled`. Admission also sends the current `meeting:settings` to the person being admitted, before `meeting:admitted`, so a setting changed while they were on pre-join, in the lobby or reconnecting isn't stale.
 - An answer already streaming finishes; new questions are refused with `ai:error { reason: 'disabled' }`.
 - The meeting card (`GET /api/meetings/:id` and the dashboard cards) gains `aiEnabled: boolean` and `aiAvailable: boolean` (server configured), so the room knows the button's state before any socket event.
 

@@ -99,8 +99,9 @@ test('someone admitted from the lobby is sent the settings as they are now, befo
   const waiting = waitForEvent(p1, 'meeting:waiting');
   p1.emit('meeting:join-request', { meetingId });
   await waiting;
+  const off = waitForEvent(host, 'meeting:settings');
   host.emit('host:set-ai', { enabled: false }); // while p1 sits in the lobby
-  await settle();
+  await off;
 
   const order = [];
   p1.on('meeting:settings', (s) => order.push(['meeting:settings', s]));
